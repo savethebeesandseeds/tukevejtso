@@ -1,0 +1,15 @@
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Logs and local scratch
+*.log
+*.tmp
+*.bak
+
+# PowerShell transient files
+*.ps1xml
+
+# Editors
+.vscode/
+.idea/
