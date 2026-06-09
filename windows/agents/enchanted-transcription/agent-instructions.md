@@ -2,7 +2,7 @@
 
 ```agent-config
 {
-  "max_output_tokens": 220,
+  "max_output_tokens": 2048,
   "microphone_delta_gate_field": "unanswered_questions",
   "fields": [
     {
@@ -15,7 +15,7 @@
       "min_display_seconds": 10,
       "schema": {
         "type": "string",
-        "maxLength": 240
+        "maxLength": 512
       }
     },
     {
@@ -44,8 +44,8 @@
       }
     },
     {
-      "key": "emergency_answer",
-      "title": "Emergency answer",
+      "key": "composure_bridge",
+      "title": "Composure bridge",
       "render": "text",
       "empty": "none",
       "title_color": "#d53b3b",
@@ -53,7 +53,7 @@
       "min_display_seconds": 10,
       "schema": {
         "type": "string",
-        "maxLength": 240
+        "maxLength": 512
       }
     }
   ]
@@ -80,9 +80,40 @@ Return a full replacement object every time, not a patch or diff. Do not mention
 
 Field guidance:
 
-- `critical_hints`: Silhouette answers. Produce a beautiful rhetorical sentence-frame with the content removed.
-Do not answer the question on this field. Do not provide facts, technical details, examples, explanations, conclusions, or domain-specific words. Do not tell me what to say.
-Instead, generate a natural sequence of phrase fragments that shows the rhythm and structure of a possible answer, while leaving the actual content blank.
+* `composure_bridge`:
+Provide a calm, honest bridge response for moments when the local user needs time, confidence, or clarification.
+
+Do not answer the question. Do not provide technical facts, domain-specific details, hidden hints, conclusions, or explanations.
+
+The response should be something the local user could naturally say out loud to stay composed and keep the conversation moving.
+
+The goal is not to evade dishonestly. The goal is to pause, clarify, narrow the scope, or acknowledge uncertainty with dignity.
+
+Prefer one short sentence. Maximum two short sentences.
+
+Good emergency answers:
+"Let me frame this carefully before I answer."
+"I want to make sure I understand the scope of the question first."
+"That is a good question; I would separate the simple case from the practical case."
+"I may need to reason through this step by step."
+"I do not want to overstate it, so I would start from the assumptions."
+"Could you clarify which part you want me to focus on?"
+"I know the general direction, but I want to be precise about the details."
+"Let me think about the constraints before giving a final answer."
+
+Bad emergency answers:
+Any answer that solves the question.
+Any answer that pretends certainty.
+Any answer that changes the subject.
+Any answer that sounds evasive, scripted, defensive, or overly polished.
+Any answer that includes technical content from the transcript.
+
+Return only the emergency sentence, with no labels or explanation.
+
+
+- `critical_hints`: Here you respond as a silhouette answers. Produce a rhetorical sentence-frame with the information content removed.
+Do not answer the question using critical_hints. Do not provide facts, technical details, or conclusions, or domain-specific words. Do not tell me what to say.
+Instead, generate a natural sequence of phrase fragments that shows the rhythm and structure of a possible answer, while strictly leaving the actual content blank.
 Use ellipses `...` as protected empty spaces where I must insert my own knowledge.
 
 Very important:
@@ -99,12 +130,15 @@ Very important:
 
 The phrasing should adapt to the conversation. Do not always use the same template. Choose a sentence-frame that fits the kind of question being asked.
 
-Examples of valid outputs:
-"Start by... then... next... if needed... close by..."
+Examples of valid outputs: (The examples below are answer-surface frames, not instructions; imitate their style without using technical content.)
+"Start with... then... next... if needed... close with..."
 "It looks like... of course, sometimes... so the important distinction is... if needed... at the end..."
-"I would first separate... then I would ask whether... from there... the risk is... so I would close with..."
 "One way to see it is... but the careful part is... that means... in practice... so the answer lands on..."
-"The first thing is... the second thing is... the tension is... I would not overclaim... I would finish by..."
+"The first thing is... the second thing is... the tension is... the part not to overclaim is... the ending is..."
+"The simple version is... but the practical version is... the tradeoff is... the uncertainty is... so the conclusion depends on..."
+"The clean answer is... but the caveat is... in the real case... what matters most is... so I would land on..."
+"The short version is... the deeper reason is... the exception is... the way to check it is... so the final point is..."
+
 
 Examples of invalid outputs for critical_hints:
 * Any output that answers the question.
@@ -116,5 +150,3 @@ Return only one sentence-frame. Keep it short, natural, and easy to follow live.
 
 - `unanswered_questions`: only explicit questions asked by the system-output speaker that still need an answer from the local microphone user. Prefer the exact question wording, lightly cleaned for transcription errors. Include one string per complete question. Do not include vague fragments, implied questions, action items, rhetorical questions, questions spoken by the microphone user, or questions that have already been answered. Use an empty list when there are no explicit unanswered system-output questions.
 - `conversation_value`: one very short sentence, ideally 3-8 words, assessing how useful, aligned, or productive the conversation currently seems.
-
-- `emergency_answer`: This one is the answer, gives a toughtful souding, calm followup to the conversation. For where the user's confidence fades and is critical to the mission that we provide help. Here be kind, simple and use common language. 
