@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$path = "C:\Users\santi\OneDrive\Documents\codex_cookbook.html"
+$path = Join-Path (Split-Path -Parent $PSScriptRoot) "codex_cookbook.html"
 
 if (-not (Test-Path -LiteralPath $path)) {
     throw "Cookbook file was not found: $path"

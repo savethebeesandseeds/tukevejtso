@@ -645,6 +645,29 @@ function Write-TuiHelp {
     Write-Host (Get-TuiHelpLine)
 }
 
+function Get-TuiHeaderLines {
+    param(
+        [string] $Title,
+        [string] $Subtitle = ""
+    )
+
+    $rule = "=" * [Math]::Min(25, (Get-TuiWidth))
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add((Format-TuiAnsiText -Text $rule -Foreground "#008b8b"))
+    $lines.Add(
+        (Format-TuiAnsiText -Text " tukevejtso" -Foreground "#5dd9e8" -Bold) +
+        (Format-TuiAnsiText -Text (" / " + $Title) -Foreground "#f8fbff")
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Subtitle)) {
+        $lines.Add((Format-TuiAnsiText -Text (" " + $Subtitle) -Foreground "#777777"))
+    }
+
+    $lines.Add((Format-TuiAnsiText -Text $rule -Foreground "#008b8b"))
+    $lines.Add("")
+    return [string[]]$lines
+}
+
 function Get-TuiHelpLine {
     return (
         " " +
@@ -659,6 +682,32 @@ function Get-TuiHelpLine {
         (Format-TuiAnsiText -Text "Q/Esc" -Foreground "#5dd9e8" -Bold) +
         (Format-TuiAnsiText -Text " quit" -Foreground "#777777")
     )
+}
+
+function Write-TuiFrame {
+    param(
+        [string[]] $Lines,
+        [switch] $Initial
+    )
+
+    if (Test-TuiAnsi -and -not [Console]::IsOutputRedirected) {
+        $esc = Get-TuiEsc
+        $prefix = if ($Initial) { "$esc[?25l$esc[2J$esc[H" } else { "$esc[H" }
+        [Console]::Write($prefix + ($Lines -join "`r`n") + "$esc[J")
+        return
+    }
+
+    Clear-Host
+    foreach ($line in $Lines) {
+        [Console]::WriteLine((Remove-TuiAnsi -Text $line))
+    }
+}
+
+function Show-TuiCursor {
+    if (Test-TuiAnsi -and -not [Console]::IsOutputRedirected) {
+        $esc = Get-TuiEsc
+        [Console]::Write("$esc[?25h")
+    }
 }
 
 function Select-TuiItem {
@@ -677,111 +726,132 @@ function Select-TuiItem {
     }
 
     $selected = 0
+    $renderedOnce = $false
 
-    while ($true) {
-        if ($ShowLogo -and $null -ne $FormatStyledItem) {
-            Write-TuiHeader -Title $Title -Subtitle $Subtitle
-
-            $logoPath = Get-TuiResourcePath -Name "waajacamaya.png"
-            $logo = New-TuiImageRender -Path $logoPath -WidthCells 34 -MaxHeightRows 18
-            $gap = 5
-            $totalWidth = Get-TuiWidth
-            $leftWidth = [Math]::Min(72, [Math]::Max(48, $totalWidth - $gap - $(if ($null -eq $logo) { 0 } else { $logo.WidthCells })))
-
-            $leftLines = New-Object System.Collections.Generic.List[string]
-            for ($i = 0; $i -lt $Items.Count; $i++) {
-                $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
-                $leftLines.Add((& $FormatStyledItem $Items[$i] $i ($i -eq $selected) $number))
-            }
-
-            $rightLines = if ($null -eq $logo) { @() } else { $logo.Lines }
-            $rowCount = [Math]::Max($leftLines.Count, $rightLines.Count)
-
-            for ($row = 0; $row -lt $rowCount; $row++) {
-                $left = if ($row -lt $leftLines.Count) { $leftLines[$row] } else { "" }
-                $right = if ($row -lt $rightLines.Count) { $rightLines[$row] } else { "" }
-                Write-Host (Pad-TuiAnsiRight -Text $left -Width $leftWidth) -NoNewline
-                if (-not [string]::IsNullOrEmpty($right)) {
-                    Write-Host (" " * $gap) -NoNewline
-                    Write-Host $right
+    try {
+        while ($true) {
+            if ($ShowLogo -and $null -ne $FormatStyledItem) {
+                $frameLines = New-Object System.Collections.Generic.List[string]
+                foreach ($line in (Get-TuiHeaderLines -Title $Title -Subtitle $Subtitle)) {
+                    $frameLines.Add($line)
                 }
-                else {
-                    Write-Host ""
+
+                $logoPath = Get-TuiResourcePath -Name "waajacamaya.png"
+                $logo = New-TuiImageRender -Path $logoPath -WidthCells 34 -MaxHeightRows 18
+                $gap = 5
+                $totalWidth = Get-TuiWidth
+                $leftWidth = [Math]::Min(72, [Math]::Max(48, $totalWidth - $gap - $(if ($null -eq $logo) { 0 } else { $logo.WidthCells })))
+
+                $leftLines = New-Object System.Collections.Generic.List[string]
+                for ($i = 0; $i -lt $Items.Count; $i++) {
+                    $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
+                    $leftLines.Add((& $FormatStyledItem $Items[$i] $i ($i -eq $selected) $number))
                 }
+
+                $rightLines = if ($null -eq $logo) { @() } else { $logo.Lines }
+                $rowCount = [Math]::Max($leftLines.Count, $rightLines.Count)
+
+                for ($row = 0; $row -lt $rowCount; $row++) {
+                    $left = if ($row -lt $leftLines.Count) { $leftLines[$row] } else { "" }
+                    $right = if ($row -lt $rightLines.Count) { $rightLines[$row] } else { "" }
+                    $line = Pad-TuiAnsiRight -Text $left -Width $leftWidth
+                    if (-not [string]::IsNullOrEmpty($right)) {
+                        $line += (" " * $gap) + $right
+                    }
+                    $frameLines.Add($line)
+                }
+
+                $frameLines.Add("")
+                $frameLines.Add((Get-TuiHelpLine))
+                Write-TuiFrame -Lines ([string[]]$frameLines) -Initial:(-not $renderedOnce)
+                $renderedOnce = $true
             }
+            elseif ($null -eq $RenderItem) {
+                $frameLines = New-Object System.Collections.Generic.List[string]
+                foreach ($line in (Get-TuiHeaderLines -Title $Title -Subtitle $Subtitle)) {
+                    $frameLines.Add($line)
+                }
 
-            Write-Host ""
-            Write-Host (Get-TuiHelpLine)
-        }
-        else {
-            Write-TuiHeader -Title $Title -Subtitle $Subtitle -ShowLogo:$ShowLogo
+                for ($i = 0; $i -lt $Items.Count; $i++) {
+                    $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
+                    $isSelected = $i -eq $selected
+                    $text = & $FormatItem $Items[$i]
 
-            for ($i = 0; $i -lt $Items.Count; $i++) {
-                $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
-                $isSelected = $i -eq $selected
+                    if ($isSelected) {
+                        $frameLines.Add((Format-TuiAnsiText -Text ("  {0,-3} {1}" -f $number, $text).PadRight(52) -Foreground "#000000" -Background "#5dd9e8"))
+                    }
+                    else {
+                        $frameLines.Add(
+                            (Format-TuiAnsiText -Text ("  {0,-3} " -f $number) -Foreground "#777777") +
+                            $text
+                        )
+                    }
+                }
 
-                if ($null -ne $RenderItem) {
+                $frameLines.Add("")
+                $frameLines.Add((Get-TuiHelpLine))
+                Write-TuiFrame -Lines ([string[]]$frameLines) -Initial:(-not $renderedOnce)
+                $renderedOnce = $true
+            }
+            else {
+                Write-TuiHeader -Title $Title -Subtitle $Subtitle -ShowLogo:$ShowLogo
+
+                for ($i = 0; $i -lt $Items.Count; $i++) {
+                    $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
+                    $isSelected = $i -eq $selected
                     & $RenderItem $Items[$i] $i $isSelected $number
-                    continue
                 }
 
-                $text = & $FormatItem $Items[$i]
-
-                if ($isSelected) {
-                    Write-Host ("  {0,-3} {1}" -f $number, $text) -ForegroundColor Black -BackgroundColor Cyan
-                }
-                else {
-                    Write-Host ("  {0,-3} " -f $number) -NoNewline -ForegroundColor DarkGray
-                    Write-Host $text
-                }
+                Write-TuiHelp
             }
 
-            Write-TuiHelp
-        }
-
-        if ([Console]::IsInputRedirected) {
-            return $null
-        }
-
-        try {
-            $key = [Console]::ReadKey($true)
-        }
-        catch {
-            return $null
-        }
-
-        switch ($key.Key) {
-            "UpArrow" {
-                $selected--
-                if ($selected -lt 0) { $selected = $Items.Count - 1 }
-            }
-            "DownArrow" {
-                $selected++
-                if ($selected -ge $Items.Count) { $selected = 0 }
-            }
-            "Home" {
-                $selected = 0
-            }
-            "End" {
-                $selected = $Items.Count - 1
-            }
-            "Enter" {
-                return $Items[$selected]
-            }
-            "Escape" {
+            if ([Console]::IsInputRedirected) {
                 return $null
             }
-            "Q" {
+
+            try {
+                $key = [Console]::ReadKey($true)
+            }
+            catch {
                 return $null
             }
-            default {
-                if ($key.KeyChar -match "^[1-9]$") {
-                    $index = [int]::Parse($key.KeyChar.ToString()) - 1
-                    if ($index -lt $Items.Count) {
-                        return $Items[$index]
+
+            switch ($key.Key) {
+                "UpArrow" {
+                    $selected--
+                    if ($selected -lt 0) { $selected = $Items.Count - 1 }
+                }
+                "DownArrow" {
+                    $selected++
+                    if ($selected -ge $Items.Count) { $selected = 0 }
+                }
+                "Home" {
+                    $selected = 0
+                }
+                "End" {
+                    $selected = $Items.Count - 1
+                }
+                "Enter" {
+                    return $Items[$selected]
+                }
+                "Escape" {
+                    return $null
+                }
+                "Q" {
+                    return $null
+                }
+                default {
+                    if ($key.KeyChar -match "^[1-9]$") {
+                        $index = [int]::Parse($key.KeyChar.ToString()) - 1
+                        if ($index -lt $Items.Count) {
+                            return $Items[$index]
+                        }
                     }
                 }
             }
         }
+    }
+    finally {
+        Show-TuiCursor
     }
 }

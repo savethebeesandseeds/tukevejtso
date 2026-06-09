@@ -6,6 +6,8 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+.secrets/
+windows/.secrets/
 
 # PowerShell transient files
 *.ps1xml

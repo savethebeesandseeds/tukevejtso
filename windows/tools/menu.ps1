@@ -11,6 +11,7 @@ function Get-MenuCategoryColor {
         "Security" { return "#ff6b63" }
         "Windows" { return "#37d99e" }
         "Terminal" { return "#d65cff" }
+        "Agent" { return "#37d99e" }
         default { return "#777777" }
     }
 }
@@ -62,6 +63,31 @@ $items = @(
         Label = "Docker"
         Detail = "cuwacunu-dev shell"
         ExitCode = 20
+    },
+    @{
+        Label = "Docker"
+        Detail = "robotics-learning shell"
+        ExitCode = 21
+    },
+    @{
+        Label = "Terminal"
+        Detail = "Transparency"
+        ExitCode = 22
+    },
+    @{
+        Label = "Agent"
+        Detail = "Enchanted transcription"
+        ExitCode = 23
+    },
+    @{
+        Label = "Agent"
+        Detail = "Set OpenAI API key"
+        ExitCode = 24
+    },
+    @{
+        Label = "Security"
+        Detail = "Password generator"
+        ExitCode = 25
     },
     @{
         Label = "Open"

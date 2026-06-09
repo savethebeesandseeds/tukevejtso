@@ -1,6 +1,13 @@
 $ErrorActionPreference = "Stop"
 
-$containerName = "cuwacunu-dev"
+$containerName = "robotics-learning-dev"
+$oneDriveRoot = if ([string]::IsNullOrWhiteSpace($env:OneDrive)) {
+    Join-Path $env:USERPROFILE "OneDrive"
+}
+else {
+    $env:OneDrive
+}
+$composeProjectPath = Join-Path $oneDriveRoot "Documents\Search Jobs\robotics-learning"
 $dockerDesktopTimeoutSeconds = 90
 $dockerTerminalEnv = @(
     "-e", "TERM=xterm-256color",
@@ -82,24 +89,48 @@ function Start-DockerDesktopIfNeeded {
     throw "Docker Desktop was started, but the Docker daemon did not become ready within $dockerDesktopTimeoutSeconds seconds."
 }
 
+function Get-ContainerId {
+    try {
+        $id = docker ps -a --filter "name=^/$containerName$" --format "{{.ID}}"
+    }
+    catch {
+        throw "Could not query Docker containers. Details: $($_.Exception.Message)"
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker ps failed with exit code $LASTEXITCODE. Check that Docker Desktop is running."
+    }
+
+    return $id
+}
+
+function Start-RoboticsLearningComposeIfNeeded {
+    $containerId = Get-ContainerId
+    if (-not [string]::IsNullOrWhiteSpace($containerId)) {
+        return
+    }
+
+    if (-not (Test-Path $composeProjectPath)) {
+        throw "Container not found: $containerName. Compose project path was also not found: $composeProjectPath"
+    }
+
+    Write-Host "Container not found. Building and starting robotics-learning from $composeProjectPath..."
+    & docker compose --project-directory $composeProjectPath up -d --build
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "docker compose up failed for $composeProjectPath with exit code $LASTEXITCODE."
+    }
+
+    $containerId = Get-ContainerId
+    if ([string]::IsNullOrWhiteSpace($containerId)) {
+        throw "Container still not found after compose start: $containerName"
+    }
+}
+
 Test-DockerCommand
 Start-DockerDesktopIfNeeded
 Set-ConsoleUtf8IfPossible
-
-try {
-    $containerId = docker ps -a --filter "name=^/$containerName$" --format "{{.ID}}"
-}
-catch {
-    throw "Could not query Docker containers. Details: $($_.Exception.Message)"
-}
-
-if ($LASTEXITCODE -ne 0) {
-    throw "docker ps failed with exit code $LASTEXITCODE. Check that Docker Desktop is running."
-}
-
-if ([string]::IsNullOrWhiteSpace($containerId)) {
-    throw "Container not found: $containerName"
-}
+Start-RoboticsLearningComposeIfNeeded
 
 try {
     $state = docker inspect -f "{{.State.Running}}" $containerName
@@ -133,4 +164,3 @@ if ($LASTEXITCODE -ne 0) {
         throw "Could not open /bin/bash or /bin/sh in $containerName. Last exit code: $LASTEXITCODE."
     }
 }
-
