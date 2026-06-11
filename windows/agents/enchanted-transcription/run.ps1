@@ -28,9 +28,15 @@ $TempDir = Join-Path $AgentRoot ".temp"
 $TransparencyTool = Join-Path $WindowsRoot "tools\terminal-transparency.ps1"
 $OpenAiKeyTool = Join-Path $WindowsRoot "tools\openai-api-key.ps1"
 $OpenAiKeyPath = Join-Path $env:APPDATA "tukevejtso\secrets\openai-api-key.dpapi"
+$SettingsPath = Join-Path $env:APPDATA "tukevejtso\enchanted-transcription-settings.json"
+$RestartExitCode = 75
 
 $transparencyOpacityProvided = $PSBoundParameters.ContainsKey("TransparencyOpacity")
 $modelProvided = $PSBoundParameters.ContainsKey("Model")
+$languageProvided = $PSBoundParameters.ContainsKey("Language")
+$fadeSecondsProvided = $PSBoundParameters.ContainsKey("FadeSeconds")
+$agentModelProvided = $PSBoundParameters.ContainsKey("AgentModel")
+$noAgentProvided = $PSBoundParameters.ContainsKey("NoAgent")
 
 function Update-CurrentProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -310,27 +316,122 @@ function ConvertTo-WhisperLanguage {
     }
 }
 
-function Read-LanguageOption {
-    while ($true) {
-        $raw = Read-Host "Language code [en, use auto for auto-detect]"
-        $language = ConvertTo-WhisperLanguage -Value $raw
-        if ($language -eq "auto" -or $language -match "^[a-z]{2,3}(-[a-z0-9]+)?$") {
-            return $language
-        }
-        Write-Host "Use a Whisper language code like en or es, or auto." -ForegroundColor Yellow
+function Test-WhisperModelName {
+    param([string]$Name)
+
+    return @("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en") -contains $Name
+}
+
+function Get-DefaultTranscriptionSettings {
+    [pscustomobject]@{
+        sources = @("microphone", "system-output")
+        language = "en"
+        model = "medium.en"
+        chunk_seconds = 12
+        fade_seconds = 70
+        agent_enabled = $true
+        agent_model = "gpt-5.4-nano"
+        include_microphone = $false
     }
 }
 
+function Read-TranscriptionSettings {
+    $settings = Get-DefaultTranscriptionSettings
+    if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
+        return $settings
+    }
+
+    try {
+        $saved = Get-Content -Raw -LiteralPath $SettingsPath | ConvertFrom-Json
+        if ($saved.language) {
+            $settings.language = ConvertTo-WhisperLanguage -Value ([string]$saved.language)
+        }
+        if ($saved.model -and (Test-WhisperModelName -Name ([string]$saved.model))) {
+            $settings.model = [string]$saved.model
+        }
+        if ($null -ne $saved.fade_seconds -and [int]$saved.fade_seconds -ge 5 -and [int]$saved.fade_seconds -le 180) {
+            $settings.fade_seconds = [int]$saved.fade_seconds
+        }
+        if ($null -ne $saved.agent_enabled) {
+            $settings.agent_enabled = [bool]$saved.agent_enabled
+        }
+        if ($saved.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$saved.agent_model)) {
+            $settings.agent_model = [string]$saved.agent_model
+        }
+    }
+    catch {
+        Write-Host "Ignoring unreadable transcription settings: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    return $settings
+}
+
 function Resolve-LanguageOption {
-    if (-not [string]::IsNullOrWhiteSpace($Language)) {
+    param($Settings)
+
+    if ($languageProvided -and -not [string]::IsNullOrWhiteSpace($Language)) {
         return ConvertTo-WhisperLanguage -Value $Language
     }
 
-    if ($Mode -eq "Transcription" -and -not [Console]::IsInputRedirected) {
-        return Read-LanguageOption
+    if ($Settings -and $Settings.language) {
+        return ConvertTo-WhisperLanguage -Value ([string]$Settings.language)
     }
 
     return "en"
+}
+
+function Resolve-ModelOption {
+    param(
+        $Settings,
+        [string]$LanguageName
+    )
+
+    if ($modelProvided) {
+        return $Model
+    }
+    if ($Settings -and $Settings.model -and (Test-WhisperModelName -Name ([string]$Settings.model))) {
+        return [string]$Settings.model
+    }
+    return Resolve-DefaultModelForLanguage -LanguageName $LanguageName
+}
+
+function Resolve-FadeSecondsOption {
+    param($Settings)
+
+    if ($fadeSecondsProvided) {
+        return $FadeSeconds
+    }
+    if ($Settings -and $null -ne $Settings.fade_seconds) {
+        $value = [int]$Settings.fade_seconds
+        if ($value -ge 5 -and $value -le 180) {
+            return $value
+        }
+    }
+    return 70
+}
+
+function Resolve-AgentModelOption {
+    param($Settings)
+
+    if ($agentModelProvided) {
+        return $AgentModel
+    }
+    if ($Settings -and $Settings.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$Settings.agent_model)) {
+        return [string]$Settings.agent_model
+    }
+    return "gpt-5.4-nano"
+}
+
+function Resolve-AgentDisabledOption {
+    param($Settings)
+
+    if ($noAgentProvided) {
+        return [bool]$NoAgent
+    }
+    if ($Settings -and $null -ne $Settings.agent_enabled) {
+        return -not [bool]$Settings.agent_enabled
+    }
+    return $false
 }
 
 function Resolve-DefaultModelForLanguage {
@@ -421,47 +522,6 @@ function Resolve-Model {
     }
 }
 
-function Read-BooleanOption {
-    param(
-        [string]$Prompt,
-        [bool]$Default
-    )
-
-    $suffix = if ($Default) { "[Y/n]" } else { "[y/N]" }
-    while ($true) {
-        $raw = Read-Host "$Prompt $suffix"
-        $value = $raw.Trim().ToLowerInvariant()
-        if ([string]::IsNullOrWhiteSpace($value)) {
-            return $Default
-        }
-        if ($value -in @("y", "yes")) {
-            return $true
-        }
-        if ($value -in @("n", "no")) {
-            return $false
-        }
-        Write-Host "Please answer y or n." -ForegroundColor Yellow
-    }
-}
-
-function Read-OpacityOption {
-    param([int]$Default)
-
-    while ($true) {
-        $raw = Read-Host "Transparency opacity percent opaque [$Default]"
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            return $Default
-        }
-
-        $value = 0
-        if ([int]::TryParse($raw, [ref]$value) -and $value -ge 5 -and $value -le 95) {
-            return $value
-        }
-
-        Write-Host "Use a whole number from 5 to 95." -ForegroundColor Yellow
-    }
-}
-
 function ConvertFrom-SecureStringToPlainText {
     param([securestring]$SecureValue)
 
@@ -477,10 +537,6 @@ function ConvertFrom-SecureStringToPlainText {
 }
 
 function Invoke-OptionalTransparencySetup {
-    if (-not $Transparency -and -not $NoTransparencyPrompt -and -not [Console]::IsInputRedirected) {
-        $script:Transparency = Read-BooleanOption -Prompt "Enable terminal transparency" -Default $false
-    }
-
     if (-not $Transparency) {
         return
     }
@@ -488,10 +544,6 @@ function Invoke-OptionalTransparencySetup {
     if (-not (Test-Path -LiteralPath $TransparencyTool)) {
         Write-Warning "Terminal transparency tool was not found: $TransparencyTool"
         return
-    }
-
-    if (-not $transparencyOpacityProvided -and -not [Console]::IsInputRedirected) {
-        $script:TransparencyOpacity = Read-OpacityOption -Default $TransparencyOpacity
     }
 
     $transparencyArgs = @{
@@ -526,14 +578,6 @@ function Import-OpenAiApiKey {
     }
 
     $plainKey = Get-StoredOpenAiApiKey
-    if ([string]::IsNullOrWhiteSpace($plainKey) -and -not [Console]::IsInputRedirected) {
-        $shouldSet = Read-BooleanOption -Prompt "OpenAI API key is not stored. Store it now for agent insights" -Default $false
-        if ($shouldSet) {
-            & $OpenAiKeyTool -Set
-            $plainKey = Get-StoredOpenAiApiKey
-        }
-    }
-
     if (-not [string]::IsNullOrWhiteSpace($plainKey)) {
         $env:OPENAI_API_KEY = $plainKey.Trim()
     }
@@ -591,64 +635,78 @@ Invoke-OptionalFullScreen
 $terminalRestoreSnapshot = Get-TerminalRestoreSnapshot
 Import-OpenAiApiKey
 
-$resolvedLanguage = Resolve-LanguageOption
-if (-not $modelProvided) {
-    $Model = Resolve-DefaultModelForLanguage -LanguageName $resolvedLanguage
-}
-
 New-Item -ItemType Directory -Force -Path $ModelsDir | Out-Null
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 Move-LegacyWhisperModels
 
-$modelInfo = Resolve-Model -Name $Model
-if (-not (Test-Path -LiteralPath $modelInfo.Path)) {
-    Write-Host "Downloading Whisper model $($modelInfo.Name)..." -ForegroundColor Cyan
-    $tmp = "$($modelInfo.Path).download"
-    if (Test-Path -LiteralPath $tmp) {
-        Remove-Item -LiteralPath $tmp -Force
-    }
-    Invoke-WebRequest -Uri $modelInfo.Url -OutFile $tmp
-    Move-Item -LiteralPath $tmp -Destination $modelInfo.Path -Force
-}
-
 $cargo = Get-CargoPath
 $manifest = Join-Path $AgentRoot "Cargo.toml"
-$cargoArgs = @("run", "--release", "--manifest-path", $manifest)
-
-if (-not $Cpu) {
-    $cargoArgs += @("--features", "cuda")
-}
-
-$cargoArgs += @("--", "--model", $modelInfo.Path, "--mode", $Mode.Replace("EnhancedTyping", "enhanced-typing").Replace("Transcription", "transcription"), "--temp-dir", $TempDir, "--fade-seconds", $FadeSeconds, "--language", $resolvedLanguage, "--agent-root", $AgentRoot)
-if ($terminalRestoreSnapshot -and $terminalRestoreSnapshot.WindowHandle -ne [IntPtr]::Zero) {
-    $cargoArgs += @("--terminal-window-handle", $terminalRestoreSnapshot.WindowHandle.ToInt64().ToString())
-}
-
-if ($NoAgent) {
-    $cargoArgs += "--agent-disabled"
-}
-else {
-    $cargoArgs += @("--agent-model", $AgentModel)
-}
-
-if ($Mode -ne "EnhancedTyping") {
-    Write-Host "Starting Enchanted transcription agent..." -ForegroundColor Cyan
-    Write-Host "Model: $($modelInfo.Path)" -ForegroundColor DarkGray
-    Write-Host "Language: $resolvedLanguage" -ForegroundColor DarkGray
-    Write-Host "Whisper backend: $(if ($Cpu) { "CPU" } else { "CUDA" })" -ForegroundColor DarkGray
-    Write-Host "OpenAI model: $(if ($NoAgent) { "disabled" } else { $AgentModel })" -ForegroundColor DarkGray
-    Write-Host ""
-}
-
 $agentExitCode = 0
-try {
-    & $cargo @cargoArgs
-    if ($null -ne $LASTEXITCODE) {
-        $agentExitCode = $LASTEXITCODE
+
+while ($true) {
+    $agentExitCode = 0
+    $settings = Read-TranscriptionSettings
+    $resolvedLanguage = Resolve-LanguageOption -Settings $settings
+    $resolvedModel = Resolve-ModelOption -Settings $settings -LanguageName $resolvedLanguage
+    $resolvedFadeSeconds = Resolve-FadeSecondsOption -Settings $settings
+    $resolvedAgentModel = Resolve-AgentModelOption -Settings $settings
+    $agentDisabled = Resolve-AgentDisabledOption -Settings $settings
+
+    $modelInfo = Resolve-Model -Name $resolvedModel
+    if (-not (Test-Path -LiteralPath $modelInfo.Path)) {
+        Write-Host "Downloading Whisper model $($modelInfo.Name)..." -ForegroundColor Cyan
+        $tmp = "$($modelInfo.Path).download"
+        if (Test-Path -LiteralPath $tmp) {
+            Remove-Item -LiteralPath $tmp -Force
+        }
+        Invoke-WebRequest -Uri $modelInfo.Url -OutFile $tmp
+        Move-Item -LiteralPath $tmp -Destination $modelInfo.Path -Force
     }
-}
-finally {
-    Restore-TerminalSnapshot -Snapshot $terminalRestoreSnapshot
+
+    $cargoArgs = @("run", "--release", "--manifest-path", $manifest)
+
+    if (-not $Cpu) {
+        $cargoArgs += @("--features", "cuda")
+    }
+
+    $cargoArgs += @("--", "--model", $modelInfo.Path, "--mode", $Mode.Replace("EnhancedTyping", "enhanced-typing").Replace("Transcription", "transcription"), "--temp-dir", $TempDir, "--fade-seconds", $resolvedFadeSeconds, "--language", $resolvedLanguage, "--agent-root", $AgentRoot)
+    if ($terminalRestoreSnapshot -and $terminalRestoreSnapshot.WindowHandle -ne [IntPtr]::Zero) {
+        $cargoArgs += @("--terminal-window-handle", $terminalRestoreSnapshot.WindowHandle.ToInt64().ToString())
+    }
+
+    if ($agentDisabled) {
+        $cargoArgs += "--agent-disabled"
+    }
+    else {
+        $cargoArgs += @("--agent-model", $resolvedAgentModel)
+    }
+
+    if ($Mode -ne "EnhancedTyping") {
+        Write-Host "Starting Enchanted transcription agent..." -ForegroundColor Cyan
+        Write-Host "Model: $($modelInfo.Path)" -ForegroundColor DarkGray
+        Write-Host "Language: $resolvedLanguage" -ForegroundColor DarkGray
+        Write-Host "Whisper backend: $(if ($Cpu) { "CPU" } else { "CUDA" })" -ForegroundColor DarkGray
+        Write-Host "OpenAI model: $(if ($agentDisabled) { "disabled" } else { $resolvedAgentModel })" -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    try {
+        & $cargo @cargoArgs
+        if ($null -ne $LASTEXITCODE) {
+            $agentExitCode = $LASTEXITCODE
+        }
+    }
+    finally {
+        Restore-TerminalSnapshot -Snapshot $terminalRestoreSnapshot
+    }
+
+    if ($agentExitCode -eq $RestartExitCode) {
+        Write-Host "Restarting Enchanted transcription with saved settings..." -ForegroundColor Cyan
+        $agentExitCode = 0
+        continue
+    }
+
+    break
 }
 
 if ($agentExitCode -ne 0) {

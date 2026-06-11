@@ -30,15 +30,23 @@ use whisper_rs::{
     install_logging_hooks, FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, RECT},
+    Foundation::{HWND, POINT, RECT},
     System::{
         Console::GetConsoleWindow,
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
         Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
     },
-    UI::WindowsAndMessaging::{
-        GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect, IsWindowVisible, IsZoomed,
-        SetWindowPos, ShowWindow, SW_MAXIMIZE, SW_RESTORE,
+    UI::{
+        Input::KeyboardAndMouse::{
+            GetAsyncKeyState, GetKeyState, RegisterHotKey, SendInput, UnregisterHotKey, VkKeyScanW,
+            INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+            VK_CAPITAL, VK_CONTROL, VK_MENU, VK_SHIFT,
+        },
+        WindowsAndMessaging::{
+            GetAncestor, GetClassNameW, GetForegroundWindow, GetWindowRect, IsWindow,
+            IsWindowVisible, IsZoomed, PeekMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
+            MSG, PM_REMOVE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_HOTKEY,
+        },
     },
 };
 
@@ -54,9 +62,15 @@ const MIN_STREAM_AUDIO_SECONDS: usize = 2;
 const SILENCE_BREAK_AFTER: Duration = Duration::from_millis(1200);
 const TYPING_PARTIAL_INTERVAL: Duration = Duration::from_millis(700);
 const TYPING_MIN_AUDIO_SECONDS: usize = 1;
-const TYPING_SILENCE_BREAK_AFTER: Duration = Duration::from_millis(650);
+const TYPING_SILENCE_BREAK_AFTER: Duration = Duration::from_millis(1200);
 const TYPING_RESIZE_SETTLE_TIMEOUT: Duration = Duration::from_millis(500);
 const TYPING_RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const TYPING_F1_DEDUPE_WINDOW: Duration = Duration::from_millis(250);
+const TYPING_TARGET_FOCUS_DELAY: Duration = Duration::from_millis(120);
+const TYPING_HOTKEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(900);
+const TYPING_HOTKEY_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const DEFAULT_TYPING_KEYSTROKE_DELAY_MS: u64 = 22;
+const TYPING_KEY_EVENT_DELAY: Duration = Duration::from_millis(3);
 const DEFAULT_LANGUAGE: &str = "en";
 const COLUMN_GAP: u16 = 6;
 const MIN_RESTART_PREFIX_WORDS: usize = 4;
@@ -79,6 +93,7 @@ const TYPING_RIGHT_GUTTER_COLS: u16 = 5;
 const TYPING_MAX_WIDTH: u16 = TYPING_MAX_CONTENT_WIDTH + TYPING_RIGHT_GUTTER_COLS;
 const TYPING_MIN_HEIGHT: u16 = 2;
 const TYPING_MAX_HEIGHT: u16 = 10;
+const TYPING_SETTINGS_MAX_HEIGHT: u16 = 12;
 const TYPING_CELL_WIDTH_PX: i32 = 9;
 const TYPING_CELL_HEIGHT_PX: i32 = 20;
 const TYPING_WINDOW_EXTRA_WIDTH_PX: i32 = 28;
@@ -86,12 +101,36 @@ const TYPING_WINDOW_EXTRA_HEIGHT_PX: i32 = 54;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
+const MOD_ALT: u32 = 0x0001;
+const MOD_CONTROL: u32 = 0x0002;
+const MOD_NOREPEAT: u32 = 0x4000;
+const VK_F1_CODE: u32 = 0x70;
+const VK_TAB_CODE: u16 = 0x09;
+const VK_RETURN_CODE: u16 = 0x0D;
+const TYPING_GLOBAL_F1_HOTKEY_ID: i32 = 0x5459;
+const TYPING_GLOBAL_BACKUP_HOTKEY_ID: i32 = 0x545A;
+const VK_KEYSCAN_NO_TRANSLATION: i16 = -1;
+const VK_KEYSCAN_SHIFT: u8 = 0x01;
+const VK_KEYSCAN_CONTROL: u8 = 0x02;
+const VK_KEYSCAN_ALT: u8 = 0x04;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TypingTransparencyPreset {
     label: &'static str,
     opacity: u8,
     background: TypingTransparencyBackground,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TypingSpeedPreset {
+    label: &'static str,
+    key_delay_ms: u64,
+}
+
+impl TypingSpeedPreset {
+    fn key_delay(self) -> Duration {
+        Duration::from_millis(self.key_delay_ms)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +155,28 @@ enum TypingSettingDirection {
 }
 
 const TYPING_REFINER_MODELS: [&str; 3] = ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"];
+const TYPING_SPEED_PRESETS: [TypingSpeedPreset; 5] = [
+    TypingSpeedPreset {
+        label: "fast",
+        key_delay_ms: 12,
+    },
+    TypingSpeedPreset {
+        label: "normal",
+        key_delay_ms: DEFAULT_TYPING_KEYSTROKE_DELAY_MS,
+    },
+    TypingSpeedPreset {
+        label: "careful",
+        key_delay_ms: 35,
+    },
+    TypingSpeedPreset {
+        label: "slow",
+        key_delay_ms: 55,
+    },
+    TypingSpeedPreset {
+        label: "very slow",
+        key_delay_ms: 80,
+    },
+];
 const TYPING_TRANSPARENCY_PRESETS: [TypingTransparencyPreset; 8] = [
     TypingTransparencyPreset {
         label: "opaque",
@@ -159,7 +220,8 @@ const TYPING_TRANSPARENCY_PRESETS: [TypingTransparencyPreset; 8] = [
     },
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 enum SourceKind {
     Microphone,
     SystemOutput,
@@ -184,6 +246,24 @@ impl SourceKind {
         match self {
             SourceKind::Microphone => Direction::Capture,
             SourceKind::SystemOutput => Direction::Render,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TypingFlushMode {
+    Clipboard,
+    Type,
+    Discard,
+}
+
+impl TypingFlushMode {
+    fn display_name(self) -> &'static str {
+        match self {
+            TypingFlushMode::Clipboard => "clipboard",
+            TypingFlushMode::Type => "type",
+            TypingFlushMode::Discard => "discard",
         }
     }
 }
@@ -265,13 +345,15 @@ struct TypingConfig {
     instructions: String,
     response_schema: Value,
     max_output_tokens: u64,
+    input_source: SourceKind,
     terminal_hwnd: Option<isize>,
     transparency_tool: PathBuf,
     settings_path: PathBuf,
     transparency_index: usize,
+    typing_speed_index: usize,
     apply_saved_transparency: bool,
     intelligence_enabled: bool,
-    clipboard_enabled: bool,
+    flush_mode: TypingFlushMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -280,8 +362,14 @@ struct EnhancedTypingSettings {
     intelligence_enabled: bool,
     #[serde(default = "default_enabled_setting")]
     clipboard_enabled: bool,
+    #[serde(default)]
+    flush_mode: Option<TypingFlushMode>,
+    #[serde(default = "default_typing_input_source")]
+    input_source: SourceKind,
     #[serde(default = "default_typing_transparency_label")]
     transparency_label: String,
+    #[serde(default = "default_typing_speed_label")]
+    typing_speed_label: String,
     #[serde(default = "default_typing_refiner_model")]
     refiner_model: String,
 }
@@ -291,9 +379,22 @@ impl Default for EnhancedTypingSettings {
         Self {
             intelligence_enabled: default_enabled_setting(),
             clipboard_enabled: default_enabled_setting(),
+            flush_mode: Some(default_typing_flush_mode()),
+            input_source: default_typing_input_source(),
             transparency_label: default_typing_transparency_label(),
+            typing_speed_label: default_typing_speed_label(),
             refiner_model: default_typing_refiner_model(),
         }
+    }
+}
+
+impl EnhancedTypingSettings {
+    fn flush_mode(&self) -> TypingFlushMode {
+        self.flush_mode.unwrap_or(if self.clipboard_enabled {
+            TypingFlushMode::Clipboard
+        } else {
+            TypingFlushMode::Discard
+        })
     }
 }
 
@@ -305,8 +406,20 @@ fn default_typing_transparency_label() -> String {
     TYPING_TRANSPARENCY_PRESETS[0].label.to_string()
 }
 
+fn default_typing_speed_label() -> String {
+    TYPING_SPEED_PRESETS[1].label.to_string()
+}
+
 fn default_typing_refiner_model() -> String {
     DEFAULT_AGENT_MODEL.to_string()
+}
+
+fn default_typing_input_source() -> SourceKind {
+    SourceKind::Microphone
+}
+
+fn default_typing_flush_mode() -> TypingFlushMode {
+    TypingFlushMode::Clipboard
 }
 
 #[derive(Clone)]
@@ -487,6 +600,14 @@ impl StreamingSourceState {
         parts.join("\n\n")
     }
 
+    fn last_history_text(&self) -> Option<&str> {
+        self.history
+            .last()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
     fn finish_current_block(&mut self) -> bool {
         let current = self.best_text.trim().to_string();
         self.samples.clear();
@@ -543,16 +664,22 @@ struct TypingPaneState {
     refiner_model: String,
     settings_path: PathBuf,
     transparency_index: usize,
+    typing_speed_index: usize,
     transparency_generation: u64,
     settings_note: Option<String>,
     intelligence_available: bool,
     intelligence_enabled: bool,
-    clipboard_enabled: bool,
+    flush_mode: TypingFlushMode,
+    input_source: SourceKind,
     settings_open: bool,
     settings_selection: usize,
     terminal_hwnd: Option<isize>,
+    terminal_focused: bool,
+    last_target_hwnd: Option<isize>,
     microphone_active: bool,
     request_in_flight: bool,
+    discard_pending_typing_output: bool,
+    exit_confirmation_open: bool,
     request_count: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -674,16 +801,26 @@ impl AppState {
                     .map(|config| config.settings_path.clone())
                     .unwrap_or_default(),
                 transparency_index: typing.map(|config| config.transparency_index).unwrap_or(0),
+                typing_speed_index: typing.map(|config| config.typing_speed_index).unwrap_or(1),
                 transparency_generation: 0,
                 settings_note: None,
                 intelligence_available: typing.is_some_and(|config| config.api_key.is_some()),
                 intelligence_enabled: typing.is_some_and(|config| config.intelligence_enabled),
-                clipboard_enabled: typing.is_some_and(|config| config.clipboard_enabled),
+                flush_mode: typing
+                    .map(|config| config.flush_mode)
+                    .unwrap_or_else(default_typing_flush_mode),
+                input_source: typing
+                    .map(|config| config.input_source)
+                    .unwrap_or(SourceKind::Microphone),
                 settings_open: false,
                 settings_selection: 0,
                 terminal_hwnd: typing.and_then(|config| config.terminal_hwnd),
+                terminal_focused: true,
+                last_target_hwnd: None,
                 microphone_active: false,
                 request_in_flight: false,
+                discard_pending_typing_output: false,
+                exit_confirmation_open: false,
                 request_count: 0,
                 input_tokens: 0,
                 output_tokens: 0,
@@ -880,6 +1017,10 @@ impl AppState {
                 true
             }
             UiEvent::TypingRequestFailed { message } => {
+                if self.typing.discard_pending_typing_output {
+                    self.typing.finish_discarded_request();
+                    return true;
+                }
                 self.typing.finish_request();
                 self.typing.record_error(message.clone());
                 self.typing.paste_status = message;
@@ -893,6 +1034,11 @@ impl AppState {
                 elapsed_ms,
                 paste_status,
             } => {
+                if self.typing.discard_pending_typing_output {
+                    self.typing.finish_discarded_request();
+                    self.status = format!("enhanced typing cleared in {} ms", elapsed_ms);
+                    return true;
+                }
                 self.typing
                     .apply_output(raw_text, typed_text, display_note, usage, paste_status);
                 self.status = format!("enhanced typing updated in {} ms", elapsed_ms);
@@ -1028,6 +1174,8 @@ impl TypingPaneState {
         self.last_raw_text.clear();
         self.last_typed_text.clear();
         self.display_note.clear();
+        self.discard_pending_typing_output = false;
+        self.exit_confirmation_open = false;
         self.paste_status = if self.enabled {
             "waiting for speech".to_string()
         } else {
@@ -1040,10 +1188,11 @@ impl TypingPaneState {
         self.settings_open = false;
         self.settings_selection = 0;
         self.settings_note = None;
+        self.terminal_focused = terminal_is_foreground(self.terminal_hwnd);
     }
 
     fn set_source_activity(&mut self, source: SourceKind, active: bool) -> bool {
-        if source != SourceKind::Microphone || self.microphone_active == active {
+        if source != self.input_source || self.microphone_active == active {
             return false;
         }
 
@@ -1053,7 +1202,11 @@ impl TypingPaneState {
 
     fn start_request(&mut self, raw_text: String, query_bytes: usize, intelligence_enabled: bool) {
         self.request_in_flight = true;
-        self.request_count += 1;
+        self.discard_pending_typing_output = false;
+        self.exit_confirmation_open = false;
+        if intelligence_enabled {
+            self.request_count += 1;
+        }
         self.last_query_bytes = Some(query_bytes);
         self.last_raw_text = raw_text;
         self.intelligence_enabled = intelligence_enabled;
@@ -1084,7 +1237,7 @@ impl TypingPaneState {
         self.finish_request();
         self.last_error = None;
         self.last_raw_text = raw_text;
-        self.last_typed_text = typed_text;
+        append_typing_text(&mut self.last_typed_text, &typed_text);
         self.display_note = display_note;
         self.paste_status = paste_status;
         self.updated_at = Some(Instant::now());
@@ -1101,6 +1254,102 @@ impl TypingPaneState {
         !self.last_typed_text.trim().is_empty() || self.last_error.is_some()
     }
 
+    fn has_clearable_content(&self) -> bool {
+        self.has_content() || self.request_in_flight
+    }
+
+    fn clear_content(&mut self) {
+        self.last_raw_text.clear();
+        self.last_typed_text.clear();
+        self.display_note.clear();
+        self.last_error = None;
+        self.scroll_offset = 0;
+        self.exit_confirmation_open = false;
+        if self.request_in_flight {
+            self.discard_pending_typing_output = true;
+            self.paste_status = "cleared; waiting for current phrase".to_string();
+        } else {
+            self.paste_status = "cleared".to_string();
+        }
+        self.updated_at = Some(Instant::now());
+    }
+
+    fn finish_discarded_request(&mut self) {
+        self.finish_request();
+        self.discard_pending_typing_output = false;
+        self.last_raw_text.clear();
+        self.last_error = None;
+        self.paste_status = "cleared".to_string();
+        self.updated_at = Some(Instant::now());
+    }
+
+    fn request_exit_confirmation(&mut self) {
+        self.exit_confirmation_open = true;
+        self.paste_status = "press Esc again to exit".to_string();
+        self.updated_at = Some(Instant::now());
+    }
+
+    fn cancel_exit_confirmation(&mut self) {
+        self.exit_confirmation_open = false;
+        self.paste_status = "ready".to_string();
+        self.updated_at = Some(Instant::now());
+    }
+
+    fn flush(&mut self) -> TypingFlushOutcome {
+        if self.request_in_flight {
+            self.paste_status = "waiting for current phrase".to_string();
+            self.updated_at = Some(Instant::now());
+            return TypingFlushOutcome::PendingRequest;
+        }
+
+        let text = self.last_typed_text.trim().to_string();
+        if text.is_empty() {
+            self.paste_status = "nothing to flush".to_string();
+            self.updated_at = Some(Instant::now());
+            return TypingFlushOutcome::NoContent;
+        }
+
+        match self.flush_mode {
+            TypingFlushMode::Clipboard => match copy_text_to_clipboard(&text) {
+                Ok(status) => self.clear_after_flush(status),
+                Err(err) => {
+                    self.paste_status =
+                        format!("copy failed: {}", compact_error(&err.to_string(), 90));
+                    self.updated_at = Some(Instant::now());
+                    TypingFlushOutcome::Failed
+                }
+            },
+            TypingFlushMode::Discard => self.clear_after_flush("flushed".to_string()),
+            TypingFlushMode::Type => {
+                self.paste_status = "typing".to_string();
+                self.updated_at = Some(Instant::now());
+                TypingFlushOutcome::TypeText(text)
+            }
+        }
+    }
+
+    fn clear_after_flush(&mut self, paste_status: String) -> TypingFlushOutcome {
+        self.last_typed_text.clear();
+        self.display_note.clear();
+        self.scroll_offset = 0;
+        self.paste_status = paste_status;
+        self.updated_at = Some(Instant::now());
+        TypingFlushOutcome::Completed
+    }
+
+    fn finish_type_flush(&mut self) {
+        self.last_typed_text.clear();
+        self.display_note.clear();
+        self.scroll_offset = 0;
+        self.paste_status = "typed".to_string();
+        self.updated_at = Some(Instant::now());
+    }
+
+    fn fail_type_flush(&mut self, error: String) {
+        self.paste_status = format!("type failed: {}", compact_error(&error, 90));
+        self.updated_at = Some(Instant::now());
+    }
+
     fn set_intelligence(&mut self, enabled: bool) -> bool {
         if !self.intelligence_available {
             self.intelligence_enabled = false;
@@ -1110,9 +1359,54 @@ impl TypingPaneState {
         self.intelligence_enabled
     }
 
-    fn set_clipboard(&mut self, enabled: bool) -> bool {
-        self.clipboard_enabled = enabled;
-        self.clipboard_enabled
+    fn set_flush_mode(&mut self, mode: TypingFlushMode) -> bool {
+        if self.flush_mode == mode {
+            return false;
+        }
+        self.flush_mode = mode;
+        true
+    }
+
+    fn cycle_flush_mode(&mut self, direction: TypingSettingDirection) -> TypingFlushMode {
+        let modes = [
+            TypingFlushMode::Clipboard,
+            TypingFlushMode::Type,
+            TypingFlushMode::Discard,
+        ];
+        let current = modes
+            .iter()
+            .position(|mode| *mode == self.flush_mode)
+            .unwrap_or(0);
+        let next = match direction {
+            TypingSettingDirection::Previous => (current + modes.len() - 1) % modes.len(),
+            TypingSettingDirection::Next => (current + 1) % modes.len(),
+        };
+        self.set_flush_mode(modes[next]);
+        self.flush_mode
+    }
+
+    fn set_input_source(&mut self, source: SourceKind) -> bool {
+        if self.input_source == source {
+            return false;
+        }
+        self.input_source = source;
+        self.microphone_active = false;
+        true
+    }
+
+    fn cycle_input_source(&mut self, direction: TypingSettingDirection) -> SourceKind {
+        let next = match (self.input_source, direction) {
+            (SourceKind::Microphone, TypingSettingDirection::Next)
+            | (SourceKind::Microphone, TypingSettingDirection::Previous) => {
+                SourceKind::SystemOutput
+            }
+            (SourceKind::SystemOutput, TypingSettingDirection::Next)
+            | (SourceKind::SystemOutput, TypingSettingDirection::Previous) => {
+                SourceKind::Microphone
+            }
+        };
+        self.set_input_source(next);
+        self.input_source
     }
 
     fn cycle_transparency(
@@ -1135,6 +1429,25 @@ impl TypingPaneState {
 
     fn transparency_preset(&self) -> TypingTransparencyPreset {
         TYPING_TRANSPARENCY_PRESETS[self.transparency_index]
+    }
+
+    fn cycle_typing_speed(&mut self, direction: TypingSettingDirection) -> TypingSpeedPreset {
+        let preset_count = TYPING_SPEED_PRESETS.len();
+        self.typing_speed_index = match direction {
+            TypingSettingDirection::Previous => {
+                (self.typing_speed_index + preset_count - 1) % preset_count
+            }
+            TypingSettingDirection::Next => (self.typing_speed_index + 1) % preset_count,
+        };
+        TYPING_SPEED_PRESETS[self.typing_speed_index]
+    }
+
+    fn typing_speed_label(&self) -> &'static str {
+        TYPING_SPEED_PRESETS[self.typing_speed_index].label
+    }
+
+    fn typing_key_delay(&self) -> Duration {
+        TYPING_SPEED_PRESETS[self.typing_speed_index].key_delay()
     }
 
     fn cycle_refiner_model(&mut self, direction: TypingSettingDirection) -> String {
@@ -1168,14 +1481,17 @@ impl TypingPaneState {
     fn persisted_settings(&self) -> EnhancedTypingSettings {
         EnhancedTypingSettings {
             intelligence_enabled: self.intelligence_enabled,
-            clipboard_enabled: self.clipboard_enabled,
+            clipboard_enabled: self.flush_mode == TypingFlushMode::Clipboard,
+            flush_mode: Some(self.flush_mode),
+            input_source: self.input_source,
             transparency_label: self.transparency_label().to_string(),
+            typing_speed_label: self.typing_speed_label().to_string(),
             refiner_model: self.refiner_model.clone(),
         }
     }
 
     fn state_marker(&self) -> (&'static str, Color) {
-        if self.settings_open {
+        if self.settings_open || !self.terminal_focused {
             ("\u{25cf} hold.", Color::Yellow)
         } else if self.request_in_flight {
             ("\u{25cf} thinking...", Color::Red)
@@ -1370,18 +1686,19 @@ fn main() -> Result<()> {
             .as_ref()
             .is_some_and(|typing| typing.intelligence_enabled),
     ));
-    let typing_clipboard_enabled = Arc::new(AtomicBool::new(
-        config
-            .typing
-            .as_ref()
-            .is_some_and(|typing| typing.clipboard_enabled),
-    ));
     let typing_refiner_model = Arc::new(Mutex::new(
         config
             .typing
             .as_ref()
             .map(|typing| typing.model.clone())
             .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string()),
+    ));
+    let typing_input_source = Arc::new(Mutex::new(
+        config
+            .typing
+            .as_ref()
+            .map(|typing| typing.input_source)
+            .unwrap_or(SourceKind::Microphone),
     ));
     let typing_paused = Arc::new(AtomicBool::new(false));
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>();
@@ -1419,7 +1736,6 @@ fn main() -> Result<()> {
             ui_tx.clone(),
             stop.clone(),
             typing_intelligence_enabled.clone(),
-            typing_clipboard_enabled.clone(),
             typing_refiner_model.clone(),
         );
         Some(typing_tx)
@@ -1427,8 +1743,15 @@ fn main() -> Result<()> {
         None
     };
 
+    let capture_errors_are_fatal = config.mode != AppMode::EnhancedTyping;
     for source in &config.sources {
-        spawn_capture_thread(*source, audio_tx.clone(), ui_tx.clone(), stop.clone());
+        spawn_capture_thread(
+            *source,
+            audio_tx.clone(),
+            ui_tx.clone(),
+            stop.clone(),
+            capture_errors_are_fatal,
+        );
     }
     drop(audio_tx);
 
@@ -1442,6 +1765,7 @@ fn main() -> Result<()> {
         refresh_generation.clone(),
         agent_force_generation.clone(),
         typing_paused.clone(),
+        typing_input_source.clone(),
     );
 
     let render_result = {
@@ -1472,8 +1796,8 @@ fn main() -> Result<()> {
             refresh_generation,
             agent_force_generation,
             typing_intelligence_enabled,
-            typing_clipboard_enabled,
             typing_refiner_model,
+            typing_input_source,
             typing_paused,
             typing_transparency_tx,
         )
@@ -1707,6 +2031,12 @@ fn typing_transparency_preset_index(label: &str) -> Option<usize> {
         .position(|preset| preset.label.eq_ignore_ascii_case(label.trim()))
 }
 
+fn typing_speed_preset_index(label: &str) -> Option<usize> {
+    TYPING_SPEED_PRESETS
+        .iter()
+        .position(|preset| preset.label.eq_ignore_ascii_case(label.trim()))
+}
+
 fn saved_typing_refiner_model(settings: &EnhancedTypingSettings, fallback: &str) -> String {
     let model = settings.refiner_model.trim();
     if model.is_empty() {
@@ -1820,6 +2150,7 @@ fn prompt_enhanced_typing_config(
     let refiner_model = saved_typing_refiner_model(&settings, &args.agent_model);
     let transparency_index =
         typing_transparency_preset_index(&settings.transparency_label).unwrap_or(0);
+    let typing_speed_index = typing_speed_preset_index(&settings.typing_speed_label).unwrap_or(1);
     let intelligence_available = api_key.is_some();
     let transparency_tool = agent_root
         .parent()
@@ -1831,7 +2162,7 @@ fn prompt_enhanced_typing_config(
         mode: AppMode::EnhancedTyping,
         model_path,
         temp_dir: args.temp_dir,
-        sources: vec![SourceKind::Microphone],
+        sources: vec![SourceKind::Microphone, SourceKind::SystemOutput],
         chunk_seconds: TYPING_CHUNK_SECONDS,
         language: if args.language_provided {
             args.language.clone()
@@ -1846,13 +2177,15 @@ fn prompt_enhanced_typing_config(
             instructions,
             response_schema: typing_response_schema(),
             max_output_tokens: 256,
+            input_source: settings.input_source,
             terminal_hwnd,
             transparency_tool,
             settings_path,
             transparency_index,
+            typing_speed_index,
             apply_saved_transparency: settings_were_saved,
             intelligence_enabled: intelligence_available && settings.intelligence_enabled,
-            clipboard_enabled: settings.clipboard_enabled,
+            flush_mode: settings.flush_mode(),
         }),
     })
 }
@@ -2280,6 +2613,7 @@ fn spawn_capture_thread(
     tx: Sender<AudioFrame>,
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
+    fatal_on_error: bool,
 ) {
     thread::Builder::new()
         .name(format!("capture-{}", source.label()))
@@ -2289,7 +2623,9 @@ fn spawn_capture_thread(
                     source,
                     message: err.to_string(),
                 });
-                stop.store(true, Ordering::SeqCst);
+                if fatal_on_error {
+                    stop.store(true, Ordering::SeqCst);
+                }
             }
         })
         .expect("failed to spawn capture thread");
@@ -2391,6 +2727,7 @@ fn spawn_whisper_thread(
     refresh_generation: Arc<AtomicU64>,
     agent_force_generation: Arc<AtomicU64>,
     typing_paused: Arc<AtomicBool>,
+    typing_input_source: Arc<Mutex<SourceKind>>,
 ) {
     thread::Builder::new()
         .name("whisper-worker".to_string())
@@ -2405,6 +2742,7 @@ fn spawn_whisper_thread(
                 refresh_generation,
                 agent_force_generation,
                 typing_paused,
+                typing_input_source,
             ) {
                 let _ = ui_tx.send(UiEvent::Status(format!("Whisper failed: {err}")));
                 stop.store(true, Ordering::SeqCst);
@@ -2423,6 +2761,7 @@ fn whisper_loop(
     refresh_generation: Arc<AtomicU64>,
     agent_force_generation: Arc<AtomicU64>,
     typing_paused: Arc<AtomicBool>,
+    typing_input_source: Arc<Mutex<SourceKind>>,
 ) -> Result<()> {
     let _ = ui_tx.send(UiEvent::Status("Loading Whisper model".to_string()));
     let mut context_params = WhisperContextParameters::default();
@@ -2488,6 +2827,18 @@ fn whisper_loop(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
                 let source = frame.source;
+                let selected_typing_source =
+                    current_typing_input_source(&typing_input_source, SourceKind::Microphone);
+                if typing_mode && source != selected_typing_source {
+                    if let Some(stream) = streams.get_mut(&source) {
+                        stream.reset();
+                    }
+                    let _ = ui_tx.send(UiEvent::SourceActivity {
+                        source,
+                        active: false,
+                    });
+                    continue;
+                }
                 if typing_mode && typing_paused.load(Ordering::SeqCst) {
                     if let Some(stream) = streams.get_mut(&source) {
                         stream.reset();
@@ -2534,22 +2885,22 @@ fn whisper_loop(
                             });
                         }
 
-                        let is_typing_microphone = typing_mode && source == SourceKind::Microphone;
+                        let is_typing_source = typing_mode && source == selected_typing_source;
                         let silence_break = silence_elapsed
                             && (!stream.best_text.trim().is_empty()
-                                || (is_typing_microphone && !stream.samples.is_empty()));
+                                || (is_typing_source && !stream.samples.is_empty()));
 
                         if silence_break {
                             let should_send_agent_update =
                                 source == SourceKind::SystemOutput && stream.agent_update_pending;
-                            if is_typing_microphone && stream.best_text.trim().is_empty() {
+                            if is_typing_source && stream.best_text.trim().is_empty() {
                                 let final_window = stream.samples.clone();
                                 if final_window.len() >= SAMPLE_RATE / 4 {
                                     let text = transcribe_chunk(
                                         &ctx,
                                         &final_window,
                                         config.language.as_deref(),
-                                        Some(&stream.prompt),
+                                        whisper_prompt_for_mode(typing_mode, stream),
                                     )?
                                     .trim()
                                     .to_string();
@@ -2559,16 +2910,15 @@ fn whisper_loop(
                                     }
                                 }
                             }
-                            let completed_typing_text = if is_typing_microphone {
-                                Some(stream.best_text.trim().to_string())
+                            let completed_typing_text = if is_typing_source {
+                                let text = typing_submission_text(stream);
+                                text.filter(|value| should_submit_typing(value))
                             } else {
                                 None
                             };
                             if stream.finish_current_block() {
                                 let _ = ui_tx.send(UiEvent::TranscriptBreak { source });
-                                if let Some(text) =
-                                    completed_typing_text.filter(|text| should_submit_typing(text))
-                                {
+                                if let Some(text) = completed_typing_text {
                                     typing_update = Some(text);
                                 }
                             }
@@ -2618,7 +2968,7 @@ fn whisper_loop(
                             &ctx,
                             &window,
                             config.language.as_deref(),
-                            Some(&stream.prompt),
+                            whisper_prompt_for_mode(typing_mode, stream),
                         )?
                         .trim()
                         .to_string();
@@ -2721,6 +3071,32 @@ fn send_agent_update(
 
 fn should_submit_typing(text: &str) -> bool {
     text.chars().filter(|value| value.is_alphanumeric()).count() >= 2
+}
+
+fn whisper_prompt_for_mode<'a>(
+    typing_mode: bool,
+    stream: &'a StreamingSourceState,
+) -> Option<&'a str> {
+    if typing_mode {
+        None
+    } else {
+        Some(&stream.prompt)
+    }
+}
+
+fn typing_submission_text(stream: &StreamingSourceState) -> Option<String> {
+    let current = stream.best_text.trim();
+    if current.is_empty() {
+        return None;
+    }
+
+    let text = new_text_since(stream.last_history_text(), current, AGENT_CONTEXT_CHARS);
+    let text = text.trim();
+    if text.is_empty() {
+        Some(current.to_string())
+    } else {
+        Some(text.to_string())
+    }
 }
 
 fn send_typing_update(typing_tx: &Option<Sender<TypingInput>>, raw_text: String) {
@@ -2874,7 +3250,6 @@ fn spawn_typing_thread(
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
     intelligence_enabled: Arc<AtomicBool>,
-    clipboard_enabled: Arc<AtomicBool>,
     refiner_model: Arc<Mutex<String>>,
 ) {
     thread::Builder::new()
@@ -2886,7 +3261,6 @@ fn spawn_typing_thread(
                 ui_tx.clone(),
                 stop.clone(),
                 intelligence_enabled,
-                clipboard_enabled,
                 refiner_model,
             ) {
                 let _ = ui_tx.send(UiEvent::TypingRequestFailed {
@@ -2903,7 +3277,6 @@ fn typing_loop(
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
     intelligence_enabled: Arc<AtomicBool>,
-    clipboard_enabled: Arc<AtomicBool>,
     refiner_model: Arc<Mutex<String>>,
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
@@ -2929,8 +3302,6 @@ fn typing_loop(
         }
         let use_intelligence =
             intelligence_enabled.load(Ordering::SeqCst) && config.api_key.is_some();
-        let use_clipboard = clipboard_enabled.load(Ordering::SeqCst);
-
         let current_model = current_typing_refiner_model(&refiner_model, &config.model);
         let request_body =
             use_intelligence.then(|| build_typing_request_body(&config, &current_model, &raw_text));
@@ -2947,23 +3318,13 @@ fn typing_loop(
 
         if !use_intelligence {
             last_submitted = raw_text.clone();
-            let paste_status = if use_clipboard {
-                match copy_text_to_clipboard(&raw_text) {
-                    Ok(status) => status,
-                    Err(err) => {
-                        format!("copy failed: {}", compact_error(&err.to_string(), 90))
-                    }
-                }
-            } else {
-                "ready".to_string()
-            };
             let _ = ui_tx.send(UiEvent::TypingOutput {
                 raw_text: raw_text.clone(),
                 typed_text: raw_text,
                 display_note: "raw transcription".to_string(),
                 usage: None,
                 elapsed_ms: started.elapsed().as_millis(),
-                paste_status,
+                paste_status: "draft updated".to_string(),
             });
             continue;
         }
@@ -2976,32 +3337,25 @@ fn typing_loop(
         match request_typing_result(&client, api_key, request_body) {
             Ok(result) => {
                 last_submitted = raw_text.clone();
-                let paste_status = if use_clipboard {
-                    match copy_text_to_clipboard(&result.typed_text) {
-                        Ok(status) => status,
-                        Err(err) => {
-                            format!("copy failed: {}", compact_error(&err.to_string(), 90))
-                        }
-                    }
-                } else {
-                    "ready".to_string()
-                };
                 let _ = ui_tx.send(UiEvent::TypingOutput {
                     raw_text,
                     typed_text: result.typed_text,
                     display_note: result.display_note,
                     usage: result.usage,
                     elapsed_ms: started.elapsed().as_millis(),
-                    paste_status,
+                    paste_status: "draft updated".to_string(),
                 });
             }
             Err(err) => {
-                last_submitted = raw_text;
-                let _ = ui_tx.send(UiEvent::TypingRequestFailed {
-                    message: format!(
-                        "OpenAI request failed: {}",
-                        compact_error(&err.to_string(), 90)
-                    ),
+                last_submitted = raw_text.clone();
+                let error = compact_error(&err.to_string(), 90);
+                let _ = ui_tx.send(UiEvent::TypingOutput {
+                    raw_text: raw_text.clone(),
+                    typed_text: raw_text,
+                    display_note: format!("raw transcription; refiner failed: {error}"),
+                    usage: None,
+                    elapsed_ms: started.elapsed().as_millis(),
+                    paste_status: "draft updated; refiner failed".to_string(),
                 });
             }
         }
@@ -3056,6 +3410,16 @@ fn current_typing_refiner_model(refiner_model: &Arc<Mutex<String>>, fallback: &s
         .lock()
         .map(|model| model.clone())
         .unwrap_or_else(|_| fallback.to_string())
+}
+
+fn current_typing_input_source(
+    input_source: &Arc<Mutex<SourceKind>>,
+    fallback: SourceKind,
+) -> SourceKind {
+    input_source
+        .lock()
+        .map(|source| *source)
+        .unwrap_or(fallback)
 }
 
 fn apply_typing_transparency(tool_path: &PathBuf, preset: TypingTransparencyPreset) -> Result<()> {
@@ -3411,6 +3775,40 @@ fn new_text_since(previous: Option<&str>, current: &str, max_chars: usize) -> St
         return recent_chars(new_text.trim(), max_chars);
     }
 
+    let previous_words = comparable_word_spans(previous);
+    let current_words = comparable_word_spans(current);
+    if !previous_words.is_empty() && !current_words.is_empty() {
+        let previous_cmp = previous_words
+            .iter()
+            .map(|word| word.0.clone())
+            .collect::<Vec<_>>();
+        let current_cmp = current_words
+            .iter()
+            .map(|word| word.0.clone())
+            .collect::<Vec<_>>();
+        if previous_cmp == current_cmp {
+            return String::new();
+        }
+
+        let shared_words = shared_prefix_len(&previous_cmp, &current_cmp);
+        if shared_words > 0 {
+            return current_words
+                .get(shared_words)
+                .map(|word| recent_chars(current[word.1..].trim(), max_chars))
+                .unwrap_or_default();
+        }
+
+        let max_overlap = previous_cmp.len().min(current_cmp.len());
+        for overlap in (2..=max_overlap).rev() {
+            if previous_cmp[previous_cmp.len() - overlap..] == current_cmp[..overlap] {
+                return current_words
+                    .get(overlap)
+                    .map(|word| recent_chars(current[word.1..].trim(), max_chars))
+                    .unwrap_or_default();
+            }
+        }
+    }
+
     let shared_chars = shared_prefix_char_count(previous, current);
     let current_tail = current
         .char_indices()
@@ -3588,6 +3986,409 @@ fn capture_terminal_window_snapshot(hwnd: isize) -> Option<TerminalWindowSnapsho
         height: rect.bottom.saturating_sub(rect.top),
         maximized: unsafe { IsZoomed(hwnd) != 0 },
     })
+}
+
+struct GlobalHotkeyGuard {
+    ids: Vec<i32>,
+}
+
+impl GlobalHotkeyGuard {
+    fn register_show_hotkeys() -> Result<Self> {
+        let mut ids = Vec::new();
+        if register_hotkey(TYPING_GLOBAL_F1_HOTKEY_ID, MOD_NOREPEAT, VK_F1_CODE) {
+            ids.push(TYPING_GLOBAL_F1_HOTKEY_ID);
+        }
+        if register_hotkey(
+            TYPING_GLOBAL_BACKUP_HOTKEY_ID,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            VK_F1_CODE,
+        ) {
+            ids.push(TYPING_GLOBAL_BACKUP_HOTKEY_ID);
+        }
+        if ids.is_empty() {
+            return Err(anyhow!("RegisterHotKey failed"));
+        }
+
+        Ok(Self { ids })
+    }
+
+    fn poll(&self) -> bool {
+        let mut triggered = false;
+        unsafe {
+            let mut message = MSG {
+                hwnd: ptr::null_mut(),
+                message: 0,
+                wParam: 0,
+                lParam: 0,
+                time: 0,
+                pt: POINT { x: 0, y: 0 },
+            };
+            while PeekMessageW(
+                &mut message,
+                ptr::null_mut(),
+                WM_HOTKEY,
+                WM_HOTKEY,
+                PM_REMOVE,
+            ) != 0
+            {
+                if message.message == WM_HOTKEY
+                    && self.ids.iter().any(|id| message.wParam == *id as usize)
+                {
+                    triggered = true;
+                }
+            }
+        }
+        triggered
+    }
+}
+
+impl Drop for GlobalHotkeyGuard {
+    fn drop(&mut self) {
+        for id in &self.ids {
+            unsafe {
+                UnregisterHotKey(ptr::null_mut(), *id);
+            }
+        }
+    }
+}
+
+fn register_hotkey(id: i32, modifiers: u32, key: u32) -> bool {
+    unsafe { RegisterHotKey(ptr::null_mut(), id, modifiers, key) != 0 }
+}
+
+fn sync_typing_focus_state(state: &mut AppState, typing_paused: &Arc<AtomicBool>) -> bool {
+    if state.mode != AppMode::EnhancedTyping {
+        return false;
+    }
+
+    if let Some(target_hwnd) = current_external_foreground_window(state.typing.terminal_hwnd) {
+        state.typing.last_target_hwnd = Some(target_hwnd);
+    }
+
+    let focused = terminal_is_foreground(state.typing.terminal_hwnd);
+    let changed =
+        state.typing.terminal_focused != focused || (!focused && state.typing.microphone_active);
+    state.typing.terminal_focused = focused;
+    if !focused {
+        state.typing.microphone_active = false;
+    }
+    update_typing_paused_for_state(state, typing_paused);
+    changed
+}
+
+fn update_typing_paused_for_state(state: &AppState, typing_paused: &Arc<AtomicBool>) {
+    if state.mode == AppMode::EnhancedTyping {
+        typing_paused.store(
+            state.typing.settings_open || !state.typing.terminal_focused,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+fn handle_typing_f1_action(
+    state: &mut AppState,
+    typing_paused: &Arc<AtomicBool>,
+) -> TypingKeyOutcome {
+    if state.typing.settings_open {
+        return TypingKeyOutcome::Consumed;
+    }
+
+    if !terminal_is_foreground(state.typing.terminal_hwnd) {
+        if let Some(target_hwnd) = current_external_foreground_window(state.typing.terminal_hwnd) {
+            state.typing.last_target_hwnd = Some(target_hwnd);
+        }
+        if bring_window_to_foreground(state.typing.terminal_hwnd) {
+            state.typing.terminal_focused = true;
+            state.typing.last_requested_size.set(None);
+            state.typing.paste_status = "ready".to_string();
+            update_typing_paused_for_state(state, typing_paused);
+            return TypingKeyOutcome::Changed;
+        }
+        state.typing.paste_status = "show failed".to_string();
+        return TypingKeyOutcome::Changed;
+    }
+
+    match state.typing.flush() {
+        TypingFlushOutcome::TypeText(text) => {
+            state.typing.terminal_focused = false;
+            state.typing.microphone_active = false;
+            update_typing_paused_for_state(state, typing_paused);
+            match type_text_into_target(
+                &text,
+                state.typing.terminal_hwnd,
+                state.typing.last_target_hwnd,
+                state.typing.typing_key_delay(),
+            ) {
+                Ok(()) => {
+                    state.typing.finish_type_flush();
+                    state.typing.terminal_focused = false;
+                }
+                Err(err) => {
+                    state.typing.fail_type_flush(err.to_string());
+                    let _ = bring_window_to_foreground(state.typing.terminal_hwnd);
+                    state.typing.terminal_focused =
+                        terminal_is_foreground(state.typing.terminal_hwnd);
+                }
+            }
+        }
+        TypingFlushOutcome::Completed => {
+            if hide_window(state.typing.terminal_hwnd) {
+                state.typing.terminal_focused = false;
+            }
+        }
+        TypingFlushOutcome::PendingRequest
+        | TypingFlushOutcome::NoContent
+        | TypingFlushOutcome::Failed => {}
+    }
+
+    update_typing_paused_for_state(state, typing_paused);
+    TypingKeyOutcome::Changed
+}
+
+fn terminal_is_foreground(terminal_hwnd: Option<isize>) -> bool {
+    let Some(terminal_hwnd) = terminal_hwnd else {
+        return true;
+    };
+    let terminal_hwnd = root_window_handle(terminal_hwnd as HWND);
+    if terminal_hwnd.is_null() {
+        return true;
+    }
+
+    let foreground_hwnd = root_window_handle(unsafe { GetForegroundWindow() });
+    !foreground_hwnd.is_null() && foreground_hwnd == terminal_hwnd
+}
+
+fn current_external_foreground_window(terminal_hwnd: Option<isize>) -> Option<isize> {
+    let foreground_hwnd = root_window_handle(unsafe { GetForegroundWindow() });
+    if foreground_hwnd.is_null() || !window_is_usable(foreground_hwnd) {
+        return None;
+    }
+
+    if let Some(terminal_hwnd) = terminal_hwnd {
+        let terminal_hwnd = root_window_handle(terminal_hwnd as HWND);
+        if !terminal_hwnd.is_null() && foreground_hwnd == terminal_hwnd {
+            return None;
+        }
+    }
+
+    Some(foreground_hwnd as isize)
+}
+
+fn window_is_usable(hwnd: HWND) -> bool {
+    !hwnd.is_null() && unsafe { IsWindow(hwnd) != 0 } && unsafe { IsWindowVisible(hwnd) != 0 }
+}
+
+fn bring_window_to_foreground(hwnd: Option<isize>) -> bool {
+    let Some(hwnd) = hwnd else {
+        return false;
+    };
+    let hwnd = root_window_handle(hwnd as HWND);
+    if !window_is_usable(hwnd) {
+        return false;
+    }
+
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd) != 0
+    }
+}
+
+fn hide_window(hwnd: Option<isize>) -> bool {
+    let Some(hwnd) = hwnd else {
+        return false;
+    };
+    let hwnd = root_window_handle(hwnd as HWND);
+    if !window_is_usable(hwnd) {
+        return false;
+    }
+
+    unsafe { ShowWindow(hwnd, SW_MINIMIZE) != 0 }
+}
+
+fn type_text_into_target(
+    text: &str,
+    terminal_hwnd: Option<isize>,
+    preferred_target_hwnd: Option<isize>,
+    key_delay: Duration,
+) -> Result<()> {
+    let terminal_target = terminal_hwnd
+        .map(|hwnd| root_window_handle(hwnd as HWND))
+        .filter(|hwnd| window_is_usable(*hwnd))
+        .ok_or_else(|| anyhow!("terminal window handle unavailable"))?;
+    let preferred_target = preferred_target_hwnd
+        .map(|hwnd| root_window_handle(hwnd as HWND))
+        .filter(|hwnd| window_is_usable(*hwnd))
+        .ok_or_else(|| anyhow!("no target window captured"))?;
+    if preferred_target == terminal_target {
+        return Err(anyhow!("captured target is the terminal window"));
+    }
+
+    let _ = hide_window(terminal_hwnd);
+    thread::sleep(TYPING_TARGET_FOCUS_DELAY);
+
+    unsafe {
+        ShowWindow(preferred_target, SW_RESTORE);
+        SetForegroundWindow(preferred_target);
+    }
+    thread::sleep(TYPING_TARGET_FOCUS_DELAY);
+
+    let foreground_target = current_external_foreground_window(terminal_hwnd)
+        .ok_or_else(|| anyhow!("no non-terminal target window is focused"))?;
+    if preferred_target as isize != foreground_target {
+        return Err(anyhow!("target window did not receive focus"));
+    }
+
+    send_text_input(text, key_delay)
+}
+
+fn send_text_input(text: &str, key_delay: Duration) -> Result<()> {
+    wait_for_typing_hotkeys_released()?;
+
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    for character in normalized.chars() {
+        send_character_input(character)?;
+        thread::sleep(key_delay);
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TypableKey {
+    virtual_key: u16,
+    shift: bool,
+}
+
+fn send_character_input(character: char) -> Result<()> {
+    match character {
+        '\n' => send_virtual_key_input(VK_RETURN_CODE, false),
+        '\t' => send_virtual_key_input(VK_TAB_CODE, false),
+        _ => {
+            if let Some(key) = typable_key_for_char(character) {
+                send_virtual_key_input(key.virtual_key, key.shift)
+            } else {
+                send_unicode_input(character)
+            }
+        }
+    }
+}
+
+fn typable_key_for_char(character: char) -> Option<TypableKey> {
+    if character as u32 > u16::MAX as u32 {
+        return None;
+    }
+
+    let scan = unsafe { VkKeyScanW(character as u16) };
+    if scan == VK_KEYSCAN_NO_TRANSLATION {
+        return None;
+    }
+
+    let virtual_key = (scan as u16) & 0x00FF;
+    let shift_state = ((scan as u16) >> 8) as u8;
+    if virtual_key == 0 || shift_state & (VK_KEYSCAN_CONTROL | VK_KEYSCAN_ALT) != 0 {
+        return None;
+    }
+
+    let mut shift = shift_state & VK_KEYSCAN_SHIFT != 0;
+    if character.is_ascii_alphabetic() && caps_lock_enabled() {
+        shift = !shift;
+    }
+
+    Some(TypableKey { virtual_key, shift })
+}
+
+fn caps_lock_enabled() -> bool {
+    unsafe { (GetKeyState(VK_CAPITAL as i32) as u16 & 0x0001) != 0 }
+}
+
+fn wait_for_typing_hotkeys_released() -> Result<()> {
+    let started = Instant::now();
+    while typing_hotkey_is_down() {
+        if started.elapsed() >= TYPING_HOTKEY_RELEASE_TIMEOUT {
+            return Err(anyhow!("F1 or modifier key is still held"));
+        }
+        thread::sleep(TYPING_HOTKEY_RELEASE_POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+fn typing_hotkey_is_down() -> bool {
+    [
+        VK_F1_CODE as i32,
+        VK_SHIFT as i32,
+        VK_CONTROL as i32,
+        VK_MENU as i32,
+    ]
+    .iter()
+    .any(|virtual_key| unsafe { (GetAsyncKeyState(*virtual_key) as u16 & 0x8000) != 0 })
+}
+
+fn send_virtual_key_input(virtual_key: u16, shift: bool) -> Result<()> {
+    if shift {
+        send_key_event(VK_SHIFT, false)?;
+        thread::sleep(TYPING_KEY_EVENT_DELAY);
+    }
+
+    let result = (|| {
+        send_key_event(virtual_key, false)?;
+        thread::sleep(TYPING_KEY_EVENT_DELAY);
+        send_key_event(virtual_key, true)
+    })();
+
+    if shift {
+        thread::sleep(TYPING_KEY_EVENT_DELAY);
+        send_key_event(VK_SHIFT, true)?;
+    }
+
+    result
+}
+
+fn send_unicode_input(character: char) -> Result<()> {
+    let mut code_units = [0u16; 2];
+    for code_unit in character.encode_utf16(&mut code_units) {
+        send_keyboard_inputs(&mut [
+            keyboard_input(0, *code_unit, KEYEVENTF_UNICODE),
+            keyboard_input(0, *code_unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+        ])?;
+        thread::sleep(TYPING_KEY_EVENT_DELAY);
+    }
+
+    Ok(())
+}
+
+fn send_key_event(virtual_key: u16, key_up: bool) -> Result<()> {
+    let flags = if key_up { KEYEVENTF_KEYUP } else { 0 };
+    send_keyboard_inputs(&mut [keyboard_input(virtual_key, 0, flags)])
+}
+
+fn send_keyboard_inputs(inputs: &mut [INPUT]) -> Result<()> {
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_mut_ptr(),
+            size_of::<INPUT>() as i32,
+        )
+    };
+    if sent != inputs.len() as u32 {
+        return Err(anyhow!("SendInput sent {sent} of {}", inputs.len()));
+    }
+
+    Ok(())
+}
+
+fn keyboard_input(vk: u16, scan: u16, flags: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 fn copy_text_to_clipboard(text: &str) -> Result<String> {
@@ -3942,17 +4743,40 @@ fn render_loop(
     refresh_generation: Arc<AtomicU64>,
     agent_force_generation: Arc<AtomicU64>,
     typing_intelligence_enabled: Arc<AtomicBool>,
-    typing_clipboard_enabled: Arc<AtomicBool>,
     typing_refiner_model: Arc<Mutex<String>>,
+    typing_input_source: Arc<Mutex<SourceKind>>,
     typing_paused: Arc<AtomicBool>,
     typing_transparency_tx: Option<Sender<TypingTransparencyRequest>>,
 ) -> Result<()> {
     let mut dirty = true;
     let mut last_render = Instant::now() - RENDER_INTERVAL;
+    let mut last_f1_action_at = Instant::now() - TYPING_F1_DEDUPE_WINDOW;
+    let global_f1_hotkey = if state.mode == AppMode::EnhancedTyping {
+        match GlobalHotkeyGuard::register_show_hotkeys() {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                state.typing.paste_status = "global show unavailable".to_string();
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     loop {
         while let Ok(app_event) = rx.try_recv() {
             dirty |= state.apply(app_event);
+        }
+
+        dirty |= sync_typing_focus_state(state, &typing_paused);
+
+        if global_f1_hotkey
+            .as_ref()
+            .is_some_and(GlobalHotkeyGuard::poll)
+            && last_f1_action_at.elapsed() >= TYPING_F1_DEDUPE_WINDOW
+        {
+            last_f1_action_at = Instant::now();
+            dirty |= handle_typing_f1_action(state, &typing_paused) == TypingKeyOutcome::Changed;
         }
 
         dirty |= state.agent.promote_pending_fields();
@@ -3978,12 +4802,26 @@ fn render_loop(
                 }
 
                 if state.mode == AppMode::EnhancedTyping {
+                    if key.code == KeyCode::F(1) && !state.typing.settings_open {
+                        if last_f1_action_at.elapsed() >= TYPING_F1_DEDUPE_WINDOW {
+                            last_f1_action_at = Instant::now();
+                            if handle_typing_f1_action(state, &typing_paused)
+                                == TypingKeyOutcome::Changed
+                            {
+                                render(state)?;
+                                dirty = false;
+                                last_render = Instant::now();
+                            }
+                        }
+                        continue;
+                    }
+
                     match handle_typing_key(
                         state,
                         &key,
                         &typing_intelligence_enabled,
-                        &typing_clipboard_enabled,
                         &typing_refiner_model,
+                        &typing_input_source,
                         &typing_paused,
                         typing_transparency_tx.as_ref(),
                     ) {
@@ -3992,6 +4830,10 @@ fn render_loop(
                             dirty = false;
                             last_render = Instant::now();
                             continue;
+                        }
+                        TypingKeyOutcome::ExitRequested => {
+                            stop.store(true, Ordering::SeqCst);
+                            break;
                         }
                         TypingKeyOutcome::Consumed => continue,
                         TypingKeyOutcome::Ignored => {}
@@ -4039,25 +4881,34 @@ enum TypingKeyOutcome {
     Ignored,
     Consumed,
     Changed,
+    ExitRequested,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TypingFlushOutcome {
+    PendingRequest,
+    NoContent,
+    Completed,
+    Failed,
+    TypeText(String),
 }
 
 fn handle_typing_key(
     state: &mut AppState,
     key: &event::KeyEvent,
     intelligence_enabled: &Arc<AtomicBool>,
-    clipboard_enabled: &Arc<AtomicBool>,
     refiner_model: &Arc<Mutex<String>>,
+    input_source: &Arc<Mutex<SourceKind>>,
     typing_paused: &Arc<AtomicBool>,
     transparency_tx: Option<&Sender<TypingTransparencyRequest>>,
 ) -> TypingKeyOutcome {
     if key.code == KeyCode::F(9) {
         if state.typing.settings_open {
             state.typing.close_settings();
-            typing_paused.store(false, Ordering::SeqCst);
         } else {
             state.typing.open_settings();
-            typing_paused.store(true, Ordering::SeqCst);
         }
+        update_typing_paused_for_state(state, typing_paused);
         return TypingKeyOutcome::Changed;
     }
 
@@ -4065,7 +4916,7 @@ fn handle_typing_key(
         return match key.code {
             KeyCode::Esc => {
                 state.typing.close_settings();
-                typing_paused.store(false, Ordering::SeqCst);
+                update_typing_paused_for_state(state, typing_paused);
                 TypingKeyOutcome::Changed
             }
             KeyCode::Up => {
@@ -4091,16 +4942,16 @@ fn handle_typing_key(
                 state,
                 TypingSettingDirection::Previous,
                 intelligence_enabled,
-                clipboard_enabled,
                 refiner_model,
+                input_source,
                 transparency_tx,
             ),
             KeyCode::Right => change_typing_setting(
                 state,
                 TypingSettingDirection::Next,
                 intelligence_enabled,
-                clipboard_enabled,
                 refiner_model,
+                input_source,
                 transparency_tx,
             ),
             KeyCode::Enter | KeyCode::Char(' ') => TypingKeyOutcome::Consumed,
@@ -4108,7 +4959,24 @@ fn handle_typing_key(
         };
     }
 
+    if state.typing.exit_confirmation_open {
+        return if key.code == KeyCode::Esc {
+            TypingKeyOutcome::ExitRequested
+        } else {
+            state.typing.cancel_exit_confirmation();
+            TypingKeyOutcome::Changed
+        };
+    }
+
     match key.code {
+        KeyCode::Esc => {
+            if state.typing.has_clearable_content() {
+                state.typing.clear_content();
+            } else {
+                state.typing.request_exit_confirmation();
+            }
+            TypingKeyOutcome::Changed
+        }
         KeyCode::Up => {
             let previous = state.typing.scroll_offset;
             state.typing.scroll_offset = state.typing.scroll_offset.saturating_sub(1);
@@ -4170,20 +5038,22 @@ fn handle_typing_key(
 }
 
 fn typing_settings_option_count() -> usize {
-    4
+    6
 }
 
 fn change_typing_setting(
     state: &mut AppState,
     direction: TypingSettingDirection,
     intelligence_enabled: &Arc<AtomicBool>,
-    clipboard_enabled: &Arc<AtomicBool>,
     refiner_model: &Arc<Mutex<String>>,
+    input_source: &Arc<Mutex<SourceKind>>,
     transparency_tx: Option<&Sender<TypingTransparencyRequest>>,
 ) -> TypingKeyOutcome {
     let before_values = (
         state.typing.intelligence_enabled,
-        state.typing.clipboard_enabled,
+        state.typing.flush_mode,
+        state.typing.input_source,
+        state.typing.typing_speed_index,
         state.typing.transparency_index,
         state.typing.refiner_model.clone(),
     );
@@ -4201,11 +5071,20 @@ fn change_typing_setting(
             }
         }
         1 => {
-            let enabled = !state.typing.clipboard_enabled;
-            state.typing.set_clipboard(enabled);
-            clipboard_enabled.store(enabled, Ordering::SeqCst);
+            state.typing.cycle_flush_mode(direction);
         }
         2 => {
+            state.typing.cycle_typing_speed(direction);
+        }
+        3 => {
+            let source = state.typing.cycle_input_source(direction);
+            if let Ok(mut shared_source) = input_source.lock() {
+                *shared_source = source;
+            } else {
+                state.typing.settings_note = Some("Input change failed".to_string());
+            }
+        }
+        4 => {
             let preset = state.typing.cycle_transparency(direction);
             state.typing.transparency_generation =
                 state.typing.transparency_generation.wrapping_add(1);
@@ -4216,7 +5095,7 @@ fn change_typing_setting(
                 &mut state.typing.settings_note,
             );
         }
-        3 => {
+        5 => {
             let model = state.typing.cycle_refiner_model(direction);
             if let Ok(mut shared_model) = refiner_model.lock() {
                 *shared_model = model;
@@ -4229,7 +5108,9 @@ fn change_typing_setting(
 
     let after_values = (
         state.typing.intelligence_enabled,
-        state.typing.clipboard_enabled,
+        state.typing.flush_mode,
+        state.typing.input_source,
+        state.typing.typing_speed_index,
         state.typing.transparency_index,
         state.typing.refiner_model.clone(),
     );
@@ -4246,7 +5127,9 @@ fn change_typing_setting(
 
     let after = (
         state.typing.intelligence_enabled,
-        state.typing.clipboard_enabled,
+        state.typing.flush_mode,
+        state.typing.input_source,
+        state.typing.typing_speed_index,
         state.typing.transparency_index,
         state.typing.refiner_model.clone(),
         state.typing.settings_note.clone(),
@@ -4256,6 +5139,8 @@ fn change_typing_setting(
         before_values.1,
         before_values.2,
         before_values.3,
+        before_values.4,
+        before_values.5,
         before_note,
     );
 
@@ -4475,14 +5360,9 @@ fn typing_settings_layout(state: &AppState, max_content_width: usize) -> TypingL
     };
     let option_rows = [
         ("Intelligence", intelligence_value),
-        (
-            "Clipboard output",
-            if state.typing.clipboard_enabled {
-                "on"
-            } else {
-                "off"
-            },
-        ),
+        ("Flush mode", state.typing.flush_mode.display_name()),
+        ("Typing speed", state.typing.typing_speed_label()),
+        ("Input", state.typing.input_source.display_name()),
         ("Transparency", state.typing.transparency_label()),
         ("Refiner model", state.typing.refiner_model.as_str()),
     ];
@@ -4545,7 +5425,7 @@ fn typing_settings_layout(state: &AppState, max_content_width: usize) -> TypingL
         .unwrap_or(TYPING_MIN_WIDTH as usize)
         .max(TYPING_MIN_WIDTH as usize)
         .min(max_content_width.max(1)) as u16;
-    let height = ((lines.len() + 1) as u16).clamp(TYPING_MIN_HEIGHT, TYPING_MAX_HEIGHT);
+    let height = ((lines.len() + 1) as u16).clamp(TYPING_MIN_HEIGHT, TYPING_SETTINGS_MAX_HEIGHT);
 
     TypingLayout {
         width: typing_window_width(content_width),
@@ -4560,6 +5440,9 @@ fn typing_display_text(state: &AppState) -> String {
     if !state.typing.last_typed_text.trim().is_empty() {
         return state.typing.last_typed_text.clone();
     }
+    if state.typing.exit_confirmation_open {
+        return "Press Esc again to exit.".to_string();
+    }
     if state.typing.request_in_flight {
         return "Refining...".to_string();
     }
@@ -4567,6 +5450,112 @@ fn typing_display_text(state: &AppState) -> String {
         return "Listening...".to_string();
     }
     "Speak, then pause.".to_string()
+}
+
+fn append_typing_text(draft: &mut String, text: &str) {
+    let text = compact_restarted_prefix(text);
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if draft.trim().is_empty() {
+        draft.clear();
+        draft.push_str(text);
+        return;
+    }
+
+    if replace_typing_revision_tail(draft, text) {
+        return;
+    }
+
+    if !draft.ends_with(char::is_whitespace) {
+        draft.push(' ');
+    }
+    draft.push_str(text);
+}
+
+fn replace_typing_revision_tail(draft: &mut String, text: &str) -> bool {
+    let draft_words = comparable_word_spans(draft);
+    let text_words = comparable_word_spans(text);
+    if draft_words.len() < MIN_RESTART_PREFIX_WORDS || text_words.len() < MIN_RESTART_PREFIX_WORDS {
+        return false;
+    }
+
+    let mut best: Option<(usize, usize, usize)> = None;
+    let text_prefix_limit = text_words.len().min(3);
+    for draft_start in 0..draft_words.len() {
+        for text_start in 0..text_prefix_limit {
+            let mut overlap = 0;
+            while draft_start + overlap < draft_words.len()
+                && text_start + overlap < text_words.len()
+                && draft_words[draft_start + overlap].0 == text_words[text_start + overlap].0
+            {
+                overlap += 1;
+            }
+            if overlap < MIN_RESTART_PREFIX_WORDS {
+                continue;
+            }
+            if draft_start + overlap < draft_words.len().saturating_sub(1) {
+                continue;
+            }
+            let replace = best
+                .map(|(best_overlap, best_draft_start, _)| {
+                    overlap > best_overlap
+                        || (overlap == best_overlap && draft_start > best_draft_start)
+                })
+                .unwrap_or(true);
+            if replace {
+                best = Some((overlap, draft_start, text_start));
+            }
+        }
+    }
+
+    let Some((_overlap, draft_start, text_start)) = best else {
+        return false;
+    };
+
+    let replace_from = draft_words[draft_start].1;
+    let append_from = text_words[text_start].1;
+    let prefix = draft[..replace_from].trim_end();
+    let suffix = text[append_from..].trim_start();
+    let mut merged = String::with_capacity(prefix.len() + suffix.len() + 1);
+    merged.push_str(prefix);
+    if !merged.is_empty() && !suffix.is_empty() && !merged.ends_with(char::is_whitespace) {
+        merged.push(' ');
+    }
+    merged.push_str(suffix);
+    *draft = merged;
+    true
+}
+
+fn comparable_word_spans(text: &str) -> Vec<(String, usize, usize)> {
+    let mut words = Vec::new();
+    let mut start = None;
+    for (index, character) in text.char_indices() {
+        if character.is_whitespace() {
+            if let Some(word_start) = start.take() {
+                push_comparable_word_span(text, word_start, index, &mut words);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(word_start) = start {
+        push_comparable_word_span(text, word_start, text.len(), &mut words);
+    }
+    words
+}
+
+fn push_comparable_word_span(
+    text: &str,
+    start: usize,
+    end: usize,
+    words: &mut Vec<(String, usize, usize)>,
+) {
+    let comparable = compare_token(&text[start..end]);
+    if !comparable.is_empty() {
+        words.push((comparable, start, end));
+    }
 }
 
 fn typing_desired_width(text: &str, minimum_width: usize, max_content_width: usize) -> u16 {
@@ -4609,7 +5598,31 @@ fn build_short_typing_status(state: &AppState) -> StyledLine {
     StyledLine {
         segments: vec![
             StyledSegment {
+                text: "F1 Flush/Show".to_string(),
+                color: Color::DarkGrey,
+            },
+            StyledSegment {
+                text: " | ".to_string(),
+                color: Color::DarkGrey,
+            },
+            StyledSegment {
+                text: "Esc Clear".to_string(),
+                color: Color::DarkGrey,
+            },
+            StyledSegment {
+                text: " | ".to_string(),
+                color: Color::DarkGrey,
+            },
+            StyledSegment {
                 text: "F9 Settings".to_string(),
+                color: Color::DarkGrey,
+            },
+            StyledSegment {
+                text: " | ".to_string(),
+                color: Color::DarkGrey,
+            },
+            StyledSegment {
+                text: format!("requests {}", state.typing.request_count),
                 color: Color::DarkGrey,
             },
             StyledSegment {
@@ -4625,7 +5638,9 @@ fn build_short_typing_status(state: &AppState) -> StyledLine {
 }
 
 fn min_typing_status_width() -> usize {
-    "F9 Settings | \u{25cf} listening...".chars().count()
+    "F1 Flush/Show | Esc Clear | F9 Settings | requests 0 | \u{25cf} listening..."
+        .chars()
+        .count()
 }
 
 fn request_typing_terminal_size(state: &AppState, width: u16, height: u16) -> Result<(u16, u16)> {
@@ -5432,12 +6447,14 @@ mod tests {
         build_response_schema, extract_agent_config_block, extract_agent_usage,
         extract_response_text, fade_intensity, format_byte_size, is_informative_text,
         merge_transcript_estimate, min_typing_status_width, new_text_since, parse_agent_config,
-        serialized_json_bytes, styled_line_width, typing_desired_width, typing_layout,
-        typing_safe_row_width, typing_window_width, wrap_plain_text, AgentConfig, AgentInput,
-        AgentUsage, AppConfig, AppMode, EnhancedTypingSettings, SourceKind, TranscriptState,
-        TranscriptWord, TypingConfig, TypingTransparencyBackground, DEFAULT_AGENT_MODEL,
-        DEFAULT_LANGUAGE, TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH,
-        TYPING_REFINER_MODELS, TYPING_RIGHT_GUTTER_COLS, TYPING_TRANSPARENCY_PRESETS,
+        serialized_json_bytes, styled_line_width, typable_key_for_char, typing_desired_width,
+        typing_display_text, typing_layout, typing_safe_row_width, typing_submission_text,
+        typing_window_width, wrap_plain_text, AgentConfig, AgentInput, AgentUsage, AppConfig,
+        AppMode, EnhancedTypingSettings, SourceKind, StreamingSourceState, TranscriptState,
+        TranscriptWord, TypingConfig, TypingFlushMode, TypingTransparencyBackground,
+        DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE, TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS,
+        TYPING_MAX_CONTENT_WIDTH, TYPING_REFINER_MODELS, TYPING_RIGHT_GUTTER_COLS,
+        TYPING_SPEED_PRESETS, TYPING_TRANSPARENCY_PRESETS,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -5459,13 +6476,15 @@ mod tests {
                 instructions: String::new(),
                 response_schema: json!({}),
                 max_output_tokens: 256,
+                input_source: SourceKind::Microphone,
                 terminal_hwnd: None,
                 transparency_tool: PathBuf::new(),
                 settings_path: PathBuf::new(),
                 transparency_index: 0,
+                typing_speed_index: 1,
                 apply_saved_transparency: false,
                 intelligence_enabled: false,
-                clipboard_enabled: true,
+                flush_mode: TypingFlushMode::Clipboard,
             }),
         };
         let mut state = super::AppState::new(&config);
@@ -5475,7 +6494,8 @@ mod tests {
 
     #[test]
     fn typing_window_width_keeps_gutter_outside_content() {
-        let status_width = "F9 Settings | listening...".len();
+        let status_width =
+            "F1 Flush/Show | Esc Clear | F9 Settings | requests 0 | listening...".len();
         let content_width =
             typing_desired_width("short", status_width, TYPING_MAX_CONTENT_WIDTH as usize);
         assert!(usize::from(content_width) >= status_width);
@@ -5544,6 +6564,13 @@ mod tests {
     }
 
     #[test]
+    fn typing_maps_common_characters_to_virtual_keys() {
+        assert!(typable_key_for_char('a').is_some());
+        assert!(typable_key_for_char('Z').is_some());
+        assert!(typable_key_for_char('\u{1F642}').is_none());
+    }
+
+    #[test]
     fn typing_transparency_presets_include_blurry_modes() {
         assert!(TYPING_TRANSPARENCY_PRESETS
             .iter()
@@ -5570,8 +6597,116 @@ mod tests {
 
         assert!(settings.intelligence_enabled);
         assert!(!settings.clipboard_enabled);
+        assert_eq!(settings.flush_mode(), TypingFlushMode::Discard);
+        assert_eq!(settings.input_source, SourceKind::Microphone);
         assert_eq!(settings.transparency_label, "opaque");
+        assert_eq!(settings.typing_speed_label, "normal");
         assert_eq!(settings.refiner_model, TYPING_REFINER_MODELS[0]);
+    }
+
+    #[test]
+    fn typing_outputs_accumulate_until_flush() {
+        let mut state = test_typing_state("");
+        state.typing.flush_mode = TypingFlushMode::Discard;
+
+        state.typing.apply_output(
+            "hello".to_string(),
+            "Hello.".to_string(),
+            "cleaned".to_string(),
+            None,
+            "draft updated".to_string(),
+        );
+        state.typing.apply_output(
+            "world".to_string(),
+            "World.".to_string(),
+            "cleaned".to_string(),
+            None,
+            "draft updated".to_string(),
+        );
+
+        assert_eq!(state.typing.last_typed_text, "Hello. World.");
+        assert_eq!(typing_display_text(&state), "Hello. World.");
+        assert_eq!(state.typing.flush(), super::TypingFlushOutcome::Completed);
+        assert!(state.typing.last_typed_text.is_empty());
+    }
+
+    #[test]
+    fn typing_clear_content_and_exit_confirmation_are_visible() {
+        let mut state = test_typing_state("Hello.");
+
+        state.typing.clear_content();
+        assert!(state.typing.last_typed_text.is_empty());
+        assert_eq!(state.typing.paste_status, "cleared");
+        assert_eq!(typing_display_text(&state), "Speak, then pause.");
+
+        state.typing.request_exit_confirmation();
+        assert!(state.typing.exit_confirmation_open);
+        assert_eq!(typing_display_text(&state), "Press Esc again to exit.");
+
+        state.typing.cancel_exit_confirmation();
+        assert!(!state.typing.exit_confirmation_open);
+        assert_eq!(state.typing.paste_status, "ready");
+    }
+
+    #[test]
+    fn typing_speed_persists_with_settings() {
+        let mut state = test_typing_state("");
+        state.typing.typing_speed_index = 3;
+
+        let settings = state.typing.persisted_settings();
+
+        assert_eq!(settings.typing_speed_label, TYPING_SPEED_PRESETS[3].label);
+    }
+
+    #[test]
+    fn typing_flush_waits_for_pending_phrase() {
+        let mut state = test_typing_state("Ready to send.");
+        state.typing.request_in_flight = true;
+        state.typing.flush_mode = TypingFlushMode::Clipboard;
+
+        assert_eq!(
+            state.typing.flush(),
+            super::TypingFlushOutcome::PendingRequest
+        );
+        assert_eq!(state.typing.last_typed_text, "Ready to send.");
+        assert_eq!(state.typing.paste_status, "waiting for current phrase");
+
+        state.typing.flush_mode = TypingFlushMode::Type;
+        assert_eq!(
+            state.typing.flush(),
+            super::TypingFlushOutcome::PendingRequest
+        );
+        assert_eq!(state.typing.last_typed_text, "Ready to send.");
+    }
+
+    #[test]
+    fn typing_append_replaces_revised_tail_instead_of_duplicating() {
+        let mut draft =
+            "Hey, hello, this is just a test. Ah, very good. This again is the second.".to_string();
+        super::append_typing_text(
+            &mut draft,
+            "Oh, very good. This, again, is the second test.",
+        );
+
+        assert_eq!(
+            draft,
+            "Hey, hello, this is just a test. Ah, very good. This, again, is the second test."
+        );
+    }
+
+    #[test]
+    fn typing_submission_strips_previous_hypothesis_prefix() {
+        let mut stream = StreamingSourceState::new(16_000);
+        stream
+            .history
+            .push("Hi. Hello. This is just a test.".to_string());
+        stream.best_text =
+            "Hi. Hello. This is just a test. Now write only this sentence.".to_string();
+
+        assert_eq!(
+            typing_submission_text(&stream).as_deref(),
+            Some("Now write only this sentence.")
+        );
     }
 
     #[test]
@@ -5900,6 +7035,18 @@ After.
                 100
             ),
             "Friday."
+        );
+    }
+
+    #[test]
+    fn new_text_since_ignores_punctuation_and_case_in_existing_prefix() {
+        assert_eq!(
+            new_text_since(Some("Hello, world."), "hello world again today.", 100),
+            "again today."
+        );
+        assert_eq!(
+            new_text_since(Some("Hello, world."), "hello world", 100),
+            ""
         );
     }
 

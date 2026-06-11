@@ -16,15 +16,15 @@ Preferred explicit alias:
 tk enchanted-transcription
 ```
 
-The first run downloads the selected model into the shared `windows\models\whisper` cache, builds the Rust terminal app with CUDA-enabled Whisper, prompts for the language setting and audio sources, and opens a split terminal view. The default model family is medium: English uses `ggml-medium.en.bin`, while `auto` and non-English language codes use `ggml-medium.bin`.
+The first run downloads the selected model into the shared `windows\models\whisper` cache, builds the Rust terminal app with CUDA-enabled Whisper, reads saved settings from `%APPDATA%\tukevejtso\enchanted-transcription-settings.json`, and opens a split terminal view. If no settings have been saved yet, it starts with microphone plus system-output capture, English, `ggml-medium.en.bin`, a 12-second rolling Whisper window, and a 70-second transcript fade.
 
 The terminal uses a rolling Whisper window rather than waiting for isolated fixed chunks. It refreshes a live hypothesis every few seconds and periodically commits only the new text into the stable transcript pane.
 
-Press F9 during transcription to open settings. The settings screen keeps audio capture and Whisper running. Transcript fade changes live with Left/Right. Source selection, language, model, rolling Whisper window, and agent wiring can be staged in the screen, with a single warning that those changes apply after restart because they are bound to startup worker setup.
+Press F9 during transcription to open settings. Transcript fade changes live with Left/Right. Source selection, language, model, rolling Whisper window, and agent wiring can be changed there and saved for future sessions. When you apply a worker-bound change, the launcher automatically restarts the agent with the saved settings.
 
-The launcher asks whether to enable terminal transparency before the agent starts. If enabled, it prompts for the current terminal window opacity.
+Terminal transparency is opt-in through the launcher flags and no longer prompts during normal startup.
 
-The optional right-side agent pane uses the OpenAI Responses API on system-output transcript text. Microphone transcript text is not sent unless you explicitly opt in at startup. Store the API key once with:
+The optional right-side agent pane uses the OpenAI Responses API on system-output transcript text. Microphone transcript text is not sent unless enabled in F9 settings. Store the API key once with:
 
 ```cmd
 tk openai-key
