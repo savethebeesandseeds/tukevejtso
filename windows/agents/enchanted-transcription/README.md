@@ -16,11 +16,13 @@ Preferred explicit alias:
 tk enchanted-transcription
 ```
 
-The first run downloads `ggml-small.bin`, builds the Rust terminal app with CUDA-enabled Whisper, prompts for the audio sources and language setting, and opens a split terminal view. The default language is English; enter `auto` if you need language detection.
+The first run downloads the selected model into the shared `windows\models\whisper` cache, builds the Rust terminal app with CUDA-enabled Whisper, prompts for the language setting and audio sources, and opens a split terminal view. The default model family is medium: English uses `ggml-medium.en.bin`, while `auto` and non-English language codes use `ggml-medium.bin`.
 
 The terminal uses a rolling Whisper window rather than waiting for isolated fixed chunks. It refreshes a live hypothesis every few seconds and periodically commits only the new text into the stable transcript pane.
 
-The launcher asks whether to enable terminal transparency before the agent starts. If enabled, it prompts for opacity and clear/acrylic background mode.
+Press F9 during transcription to open settings. The settings screen keeps audio capture and Whisper running. Transcript fade changes live with Left/Right. Source selection, language, model, rolling Whisper window, and agent wiring can be staged in the screen, with a single warning that those changes apply after restart because they are bound to startup worker setup.
+
+The launcher asks whether to enable terminal transparency before the agent starts. If enabled, it prompts for the current terminal window opacity.
 
 The optional right-side agent pane uses the OpenAI Responses API on system-output transcript text. Microphone transcript text is not sent unless you explicitly opt in at startup. Store the API key once with:
 
@@ -42,6 +44,12 @@ To use a different model:
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Model medium
 ```
 
+To choose the language before model selection:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Language auto
+```
+
 To tune transcript fading, set the fade duration in seconds:
 
 ```powershell
@@ -59,13 +67,13 @@ The startup prompt accepts `nano` for `gpt-5.4-nano` and `mini` for `gpt-5.4-min
 To enable transparency without the prompt:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Transparency -TransparencyOpacity 45 -TransparencyBackground Clear
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Transparency -TransparencyOpacity 45
 ```
 
 The same options can be passed through `tukevejtso`:
 
 ```cmd
-tk transcription -Transparency -TransparencyOpacity 45 -TransparencyBackground Clear
+tk transcription -Transparency -TransparencyOpacity 45
 ```
 
 ## Install dependencies

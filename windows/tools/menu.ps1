@@ -81,6 +81,11 @@ $items = @(
     },
     @{
         Label = "Agent"
+        Detail = "Enhanced typing"
+        ExitCode = 26
+    },
+    @{
+        Label = "Agent"
         Detail = "Set OpenAI API key"
         ExitCode = 24
     },

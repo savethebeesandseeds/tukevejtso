@@ -1,6 +1,6 @@
 param(
-    [ValidateSet("Transcription")]
-    [string]$Mode = "Transcription",
+    [ValidateSet("EnhancedTyping")]
+    [string]$Mode = "EnhancedTyping",
     [ValidateSet("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en")]
     [string]$Model = "medium",
     [string]$Language = "",

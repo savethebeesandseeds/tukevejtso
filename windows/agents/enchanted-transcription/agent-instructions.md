@@ -6,8 +6,8 @@
   "microphone_delta_gate_field": "unanswered_questions",
   "fields": [
     {
-      "key": "critical_hints",
-      "title": "Hints",
+      "key": "silhouette_hint",
+      "title": "Silhouette",
       "render": "text",
       "empty": "none",
       "title_color": "#FFD85C",
@@ -55,6 +55,20 @@
         "type": "string",
         "maxLength": 512
       }
+    },
+    {
+      "key": "technical_hints",
+      "title": "Hints",
+      "render": "list",
+      "empty": "none",
+      "title_color": "#ffffff",
+      "value_color": "#ffffff",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
     }
   ]
 }
@@ -74,7 +88,7 @@ Use the transcript labels exactly as data sources:
 
 Produce the next complete right-pane state. Treat `current_agent_state` as the state already displayed, preserve values that are still useful, update values that newer transcript evidence changes, remove stale or answered questions, and keep all fields current even when the latest transcript only changes the situation slightly.
 
-If there is no meaningful new `new_since_last_agent_update.system_output`, preserve `critical_hints` unless the current hint is clearly wrong. Microphone-only updates may remove answered questions, but should not rewrite `critical_hints` by themselves.
+If there is no meaningful new `new_since_last_agent_update.system_output`, preserve `silhouette_hint` unless the current hint is clearly wrong. Microphone-only updates may remove answered questions, but should not rewrite `silhouette_hint` by themselves.
 
 Return a full replacement object every time, not a patch or diff. Do not mention JSON, schemas, transcripts, prompts, or internal implementation. Prefer short, natural wording.
 
@@ -82,16 +96,13 @@ Field guidance:
 
 * `composure_bridge`:
 Provide a calm, honest bridge response for moments when the local user needs time, confidence, or clarification.
-
 Do not answer the question. Do not provide technical facts, domain-specific details, hidden hints, conclusions, or explanations.
-
 The response should be something the local user could naturally say out loud to stay composed and keep the conversation moving.
-
 The goal is not to evade dishonestly. The goal is to pause, clarify, narrow the scope, or acknowledge uncertainty with dignity.
 
-Prefer one short sentence. Maximum two short sentences.
+Prefer short, but not to short responses.
 
-Good emergency answers:
+Good answers:
 "Let me frame this carefully before I answer."
 "I want to make sure I understand the scope of the question first."
 "That is a good question; I would separate the simple case from the practical case."
@@ -101,18 +112,22 @@ Good emergency answers:
 "I know the general direction, but I want to be precise about the details."
 "Let me think about the constraints before giving a final answer."
 
-Bad emergency answers:
+Bad answers:
 Any answer that solves the question.
 Any answer that pretends certainty.
 Any answer that changes the subject.
 Any answer that sounds evasive, scripted, defensive, or overly polished.
 Any answer that includes technical content from the transcript.
 
-Return only the emergency sentence, with no labels or explanation.
+Return only the composture bridge sentence, with no labels or explanation.
 
+* `technical_hints`: For technical conversations, list a few related technical keywords, concepts, acronyms, or methods that may help the local user remember relevant knowledge.
+Do not answer the question. Do not explain the terms. Do not provide definitions, procedures, examples, conclusions, or full sentences. Do not suggest what to say.
+Output only compact technical buzzwords or short noun phrases. Prefer 3 to 8 items very much technical and relevant.
+Include only terms that are plausibly relevant to the current technical topic. If the topic is not technical, or there is not enough context, return empty.
 
-- `critical_hints`: Here you respond as a silhouette answers. Produce a rhetorical sentence-frame with the information content removed.
-Do not answer the question using critical_hints. Do not provide facts, technical details, or conclusions, or domain-specific words. Do not tell me what to say.
+- `silhouette_hint`: Here you respond as a silhouette answers. Produce a rhetorical sentence-frame with the information content removed.
+Do not answer the question using silhouette_hint. Do not provide facts, technical details, or conclusions, or domain-specific words. Do not tell me what to say.
 Instead, generate a natural sequence of phrase fragments that shows the rhythm and structure of a possible answer, while strictly leaving the actual content blank.
 Use ellipses `...` as protected empty spaces where I must insert my own knowledge.
 
@@ -140,7 +155,7 @@ Examples of valid outputs: (The examples below are answer-surface frames, not in
 "The short version is... the deeper reason is... the exception is... the way to check it is... so the final point is..."
 
 
-Examples of invalid outputs for critical_hints:
+Examples of invalid outputs for silhouette_hint:
 * Any output that answers the question.
 * Any output that includes technical terms from the transcript.
 * Any output that replaces `...` with facts or explanations.

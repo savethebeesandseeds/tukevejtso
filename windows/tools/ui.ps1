@@ -675,7 +675,7 @@ function Get-TuiHelpLine {
         (Format-TuiAnsiText -Text " move   " -Foreground "#777777") +
         (Format-TuiAnsiText -Text "Enter" -Foreground "#5dd9e8" -Bold) +
         (Format-TuiAnsiText -Text " run   " -Foreground "#777777") +
-        (Format-TuiAnsiText -Text "1-9" -Foreground "#5dd9e8" -Bold) +
+        (Format-TuiAnsiText -Text "Digits" -Foreground "#5dd9e8" -Bold) +
         (Format-TuiAnsiText -Text " jump   " -Foreground "#777777") +
         (Format-TuiAnsiText -Text "Home/End" -Foreground "#5dd9e8" -Bold) +
         (Format-TuiAnsiText -Text " edge   " -Foreground "#777777") +
@@ -727,6 +727,7 @@ function Select-TuiItem {
 
     $selected = 0
     $renderedOnce = $false
+    $numberBuffer = ""
 
     try {
         while ($true) {
@@ -744,7 +745,7 @@ function Select-TuiItem {
 
                 $leftLines = New-Object System.Collections.Generic.List[string]
                 for ($i = 0; $i -lt $Items.Count; $i++) {
-                    $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
+                    $number = "$($i + 1)."
                     $leftLines.Add((& $FormatStyledItem $Items[$i] $i ($i -eq $selected) $number))
                 }
 
@@ -773,7 +774,7 @@ function Select-TuiItem {
                 }
 
                 for ($i = 0; $i -lt $Items.Count; $i++) {
-                    $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
+                    $number = "$($i + 1)."
                     $isSelected = $i -eq $selected
                     $text = & $FormatItem $Items[$i]
 
@@ -797,7 +798,7 @@ function Select-TuiItem {
                 Write-TuiHeader -Title $Title -Subtitle $Subtitle -ShowLogo:$ShowLogo
 
                 for ($i = 0; $i -lt $Items.Count; $i++) {
-                    $number = if ($i -lt 9) { "$($i + 1)." } else { "  " }
+                    $number = "$($i + 1)."
                     $isSelected = $i -eq $selected
                     & $RenderItem $Items[$i] $i $isSelected $number
                 }
@@ -818,17 +819,21 @@ function Select-TuiItem {
 
             switch ($key.Key) {
                 "UpArrow" {
+                    $numberBuffer = ""
                     $selected--
                     if ($selected -lt 0) { $selected = $Items.Count - 1 }
                 }
                 "DownArrow" {
+                    $numberBuffer = ""
                     $selected++
                     if ($selected -ge $Items.Count) { $selected = 0 }
                 }
                 "Home" {
+                    $numberBuffer = ""
                     $selected = 0
                 }
                 "End" {
+                    $numberBuffer = ""
                     $selected = $Items.Count - 1
                 }
                 "Enter" {
@@ -841,11 +846,34 @@ function Select-TuiItem {
                     return $null
                 }
                 default {
-                    if ($key.KeyChar -match "^[1-9]$") {
-                        $index = [int]::Parse($key.KeyChar.ToString()) - 1
-                        if ($index -lt $Items.Count) {
-                            return $Items[$index]
+                    if ($key.KeyChar -match "^[0-9]$") {
+                        $digit = $key.KeyChar.ToString()
+                        if ($digit -eq "0" -and [string]::IsNullOrEmpty($numberBuffer)) {
+                            continue
                         }
+
+                        $candidateText = $numberBuffer + $digit
+                        $candidate = 0
+                        $maxDigits = $Items.Count.ToString().Length
+                        if ([int]::TryParse($candidateText, [ref] $candidate) -and
+                            $candidate -ge 1 -and
+                            $candidate -le $Items.Count) {
+                            $selected = $candidate - 1
+                            if ($Items.Count -lt 10 -or
+                                $candidateText.Length -ge $maxDigits -or
+                                (($candidate * 10) -gt $Items.Count)) {
+                                $numberBuffer = ""
+                            }
+                            else {
+                                $numberBuffer = $candidateText
+                            }
+                        }
+                        else {
+                            $numberBuffer = ""
+                        }
+                    }
+                    else {
+                        $numberBuffer = ""
                     }
                 }
             }

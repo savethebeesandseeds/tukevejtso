@@ -16,6 +16,7 @@ if "%TOOLKIT_CHOICE%"=="22" goto terminal_transparency
 if "%TOOLKIT_CHOICE%"=="23" goto enchanted_transcription
 if "%TOOLKIT_CHOICE%"=="24" goto openai_key
 if "%TOOLKIT_CHOICE%"=="25" goto password_manager
+if "%TOOLKIT_CHOICE%"=="26" goto enhanced_typing
 
 goto done
 
@@ -28,6 +29,9 @@ if /I "%~1"=="openai-key" goto openai_key
 if /I "%~1"=="enchanted-transcription" goto enchanted_transcription
 if /I "%~1"=="enchance-transcription" goto enchanted_transcription
 if /I "%~1"=="transcription" goto enchanted_transcription
+if /I "%~1"=="typing" goto enhanced_typing
+if /I "%~1"=="enhanced-typing" goto enhanced_typing
+if /I "%~1"=="enchanted-typing" goto enhanced_typing
 if /I "%~1"=="reboot" goto reboot_guard
 if /I "%~1"=="auto-reboot" goto reboot_guard
 if /I "%~1"=="reboots" goto reboot_guard
@@ -59,11 +63,12 @@ echo Usage:
 echo   tk                         Open the interactive menu
 echo   tk password                Generate passwords with length/complexity options
 echo   tk robotics-learning       Open the robotics-learning dev container
-echo   tk terminal-transparency   Configure terminal transparency
+echo   tk terminal-transparency   Set opacity for the current terminal window
 echo   tk openai-key              Store or update the OpenAI API key
 echo   tk openai-key -Status      Show whether the OpenAI API key is stored
 echo   tk transcription           Start the local Whisper transcription agent
 echo   tk enchanted-transcription Start the Enchanted transcription agent
+echo   tk enhanced-typing         Dictate, refine, and copy text with OpenAI
 echo   tk demo                    Show terminal interface primitives
 echo   tk reboot                  Open the reboot guard toggle
 echo   tk reboot status           Show Windows Update auto-reboot guard state
@@ -132,6 +137,20 @@ shift /1
 goto et_args
 :et_run
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%agents\enchanted-transcription\run.ps1" %TRANSCRIPTION_ARGS%
+goto done
+
+:enhanced_typing
+if /I "%~1"=="typing" shift /1
+if /I "%~1"=="enhanced-typing" shift /1
+if /I "%~1"=="enchanted-typing" shift /1
+set "TYPING_ARGS="
+:typing_args
+if "%~1"=="" goto typing_run
+set TYPING_ARGS=%TYPING_ARGS% "%~1"
+shift /1
+goto typing_args
+:typing_run
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%agents\enhanced-typing\run.ps1" %TYPING_ARGS%
 goto done
 
 :done

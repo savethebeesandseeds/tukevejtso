@@ -116,18 +116,6 @@ enum TypingSettingDirection {
 }
 
 const TYPING_REFINER_MODELS: [&str; 3] = ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"];
-const TRANSCRIPTION_LANGUAGE_CHOICES: [&str; 7] = ["auto", "en", "es", "pt", "fr", "de", "it"];
-const TRANSCRIPTION_MODEL_CHOICES: [&str; 8] = [
-    "tiny",
-    "base",
-    "small",
-    "medium",
-    "tiny.en",
-    "base.en",
-    "small.en",
-    "medium.en",
-];
-const TRANSCRIPTION_WINDOW_CHOICES: [usize; 7] = [6, 8, 10, 12, 15, 20, 30];
 const TYPING_TRANSPARENCY_PRESETS: [TypingTransparencyPreset; 8] = [
     TypingTransparencyPreset {
         label: "opaque",
@@ -525,11 +513,9 @@ struct AppState {
     dump_path: PathBuf,
     cuda_enabled: bool,
     sources: Vec<SourceKind>,
-    chunk_seconds: usize,
     language: Option<String>,
     fade_duration: Duration,
     agent: AgentPaneState,
-    transcription_settings: TranscriptionSettingsState,
     typing: TypingPaneState,
     transcripts: HashMap<SourceKind, TranscriptState>,
     status: String,
@@ -537,6 +523,7 @@ struct AppState {
 
 struct AgentPaneState {
     enabled: bool,
+    model: String,
     fields: Vec<AgentFieldState>,
     status: String,
     microphone_active: bool,
@@ -549,21 +536,6 @@ struct AgentPaneState {
     last_total_tokens: Option<u64>,
     last_query_bytes: Option<usize>,
     last_error: Option<String>,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct TranscriptionSettingsState {
-    open: bool,
-    selection: usize,
-    note: Option<String>,
-    pending_sources: Vec<SourceKind>,
-    pending_language: Option<String>,
-    pending_model: String,
-    pending_chunk_seconds: usize,
-    pending_agent_enabled: bool,
-    pending_agent_model: String,
-    pending_include_microphone: bool,
-    restart_pending: bool,
 }
 
 struct TypingPaneState {
@@ -671,11 +643,11 @@ impl AppState {
             dump_path: session_dump_path(&config.temp_dir),
             cuda_enabled: cfg!(feature = "cuda"),
             sources: config.sources.clone(),
-            chunk_seconds: config.chunk_seconds,
             language: config.language.clone(),
             fade_duration: config.fade_duration,
             agent: AgentPaneState {
                 enabled: config.agent.enabled,
+                model: config.agent.model.clone(),
                 fields: default_agent_fields(&config.agent.fields),
                 status: if config.agent.enabled {
                     "waiting for system output".to_string()
@@ -693,7 +665,6 @@ impl AppState {
                 last_query_bytes: None,
                 last_error: None,
             },
-            transcription_settings: TranscriptionSettingsState::from_config(config),
             typing: TypingPaneState {
                 enabled: typing.is_some(),
                 refiner_model: typing
@@ -941,34 +912,6 @@ impl AppState {
                 true
             }
         }
-    }
-}
-
-impl TranscriptionSettingsState {
-    fn from_config(config: &AppConfig) -> Self {
-        Self {
-            open: false,
-            selection: 0,
-            note: None,
-            pending_sources: config.sources.clone(),
-            pending_language: config.language.clone(),
-            pending_model: transcription_model_choice_from_path(&config.model_path),
-            pending_chunk_seconds: config.chunk_seconds,
-            pending_agent_enabled: config.agent.enabled,
-            pending_agent_model: config.agent.model.clone(),
-            pending_include_microphone: config.agent.include_microphone,
-            restart_pending: false,
-        }
-    }
-
-    fn open(&mut self) {
-        self.open = true;
-        self.note = None;
-    }
-
-    fn close(&mut self) {
-        self.open = false;
-        self.note = None;
     }
 }
 
@@ -1542,7 +1485,7 @@ fn main() -> Result<()> {
 
 fn parse_args() -> Result<CliArgs> {
     let mut args = env::args().skip(1);
-    let mut mode = AppMode::Transcription;
+    let mut mode = AppMode::EnhancedTyping;
     let mut model_path = None;
     let mut temp_dir = None;
     let mut agent_root = None;
@@ -1582,7 +1525,7 @@ fn parse_args() -> Result<CliArgs> {
             "--mode" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| anyhow!("--mode requires transcription"))?;
+                    .ok_or_else(|| anyhow!("--mode requires transcription or enhanced-typing"))?;
                 mode = parse_app_mode(&value)?;
             }
             "--fade-seconds" => {
@@ -1608,7 +1551,7 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: enchanted-transcription --model <ggml-model.bin> [--mode transcription] [--temp-dir <dir>] [--agent-root <dir>] [--terminal-window-handle <hwnd>] [--fade-seconds <5-180>] [--language <code|auto>] [--agent-model <model>] [--agent-disabled]"
+                    "Usage: enhanced-typing --model <ggml-model.bin> [--mode enhanced-typing] [--temp-dir <dir>] [--agent-root <dir>] [--terminal-window-handle <hwnd>] [--fade-seconds <5-180>] [--language <code|auto>] [--agent-model <model>] [--agent-disabled]"
                 );
                 std::process::exit(0);
             }
@@ -1634,8 +1577,8 @@ fn parse_args() -> Result<CliArgs> {
 
 fn parse_app_mode(value: &str) -> Result<AppMode> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "transcription" | "enchanted-transcription" => Ok(AppMode::Transcription),
-        other => Err(anyhow!("--mode must be transcription, got {other}")),
+        "typing" | "enhanced-typing" | "enchanted-typing" => Ok(AppMode::EnhancedTyping),
+        other => Err(anyhow!("--mode must be enhanced-typing, got {other}")),
     }
 }
 
@@ -4055,19 +3998,6 @@ fn render_loop(
                     }
                 }
 
-                if state.mode == AppMode::Transcription {
-                    match handle_transcription_key(state, &key) {
-                        TypingKeyOutcome::Changed => {
-                            render(state)?;
-                            dirty = false;
-                            last_render = Instant::now();
-                            continue;
-                        }
-                        TypingKeyOutcome::Consumed => continue,
-                        TypingKeyOutcome::Ignored => {}
-                    }
-                }
-
                 if key.code == KeyCode::F(1) {
                     agent_force_generation.fetch_add(1, Ordering::SeqCst);
                     state.agent.status = if state.agent.enabled {
@@ -4109,193 +4039,6 @@ enum TypingKeyOutcome {
     Ignored,
     Consumed,
     Changed,
-}
-
-fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> TypingKeyOutcome {
-    if key.code == KeyCode::F(9) {
-        if state.transcription_settings.open {
-            state.transcription_settings.close();
-        } else {
-            state.transcription_settings.open();
-        }
-        return TypingKeyOutcome::Changed;
-    }
-
-    if !state.transcription_settings.open {
-        return TypingKeyOutcome::Ignored;
-    }
-
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return TypingKeyOutcome::Ignored;
-    }
-
-    match key.code {
-        KeyCode::Esc => {
-            state.transcription_settings.close();
-            TypingKeyOutcome::Changed
-        }
-        KeyCode::Up => {
-            let count = transcription_settings_option_count();
-            state.transcription_settings.selection =
-                (state.transcription_settings.selection + count - 1) % count;
-            state.transcription_settings.note = None;
-            TypingKeyOutcome::Changed
-        }
-        KeyCode::Down => {
-            let count = transcription_settings_option_count();
-            state.transcription_settings.selection =
-                (state.transcription_settings.selection + 1) % count;
-            state.transcription_settings.note = None;
-            TypingKeyOutcome::Changed
-        }
-        KeyCode::Left => change_transcription_setting(state, TypingSettingDirection::Previous),
-        KeyCode::Right => change_transcription_setting(state, TypingSettingDirection::Next),
-        KeyCode::Enter | KeyCode::Char(' ') => TypingKeyOutcome::Consumed,
-        _ => TypingKeyOutcome::Consumed,
-    }
-}
-
-fn transcription_settings_option_count() -> usize {
-    8
-}
-
-fn change_transcription_setting(
-    state: &mut AppState,
-    direction: TypingSettingDirection,
-) -> TypingKeyOutcome {
-    let before = (state.fade_duration, state.transcription_settings.clone());
-    match state.transcription_settings.selection {
-        0 => {
-            let current = state.fade_duration.as_secs();
-            let next = match direction {
-                TypingSettingDirection::Previous => current.saturating_sub(5).max(5),
-                TypingSettingDirection::Next => (current + 5).min(180),
-            };
-            state.fade_duration = Duration::from_secs(next);
-            state.transcription_settings.note = Some("Fade applies immediately".to_string());
-        }
-        1 => {
-            state.transcription_settings.pending_sources = cycle_transcription_sources(
-                &state.transcription_settings.pending_sources,
-                direction,
-            );
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        2 => {
-            let current = transcription_language_choice(
-                state.transcription_settings.pending_language.as_deref(),
-            );
-            let next = cycle_str_choice(&current, &TRANSCRIPTION_LANGUAGE_CHOICES, direction);
-            state.transcription_settings.pending_language =
-                if next == "auto" { None } else { Some(next) };
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        3 => {
-            state.transcription_settings.pending_model = cycle_str_choice(
-                &state.transcription_settings.pending_model,
-                &TRANSCRIPTION_MODEL_CHOICES,
-                direction,
-            );
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        4 => {
-            state.transcription_settings.pending_chunk_seconds = cycle_usize_choice(
-                state.transcription_settings.pending_chunk_seconds,
-                &TRANSCRIPTION_WINDOW_CHOICES,
-                direction,
-            );
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        5 => {
-            state.transcription_settings.pending_agent_enabled =
-                !state.transcription_settings.pending_agent_enabled;
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        6 => {
-            state.transcription_settings.pending_agent_model = cycle_str_choice(
-                &state.transcription_settings.pending_agent_model,
-                &TYPING_REFINER_MODELS,
-                direction,
-            );
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        7 => {
-            state.transcription_settings.pending_include_microphone =
-                !state.transcription_settings.pending_include_microphone;
-            state.transcription_settings.note = None;
-            state.transcription_settings.restart_pending = true;
-        }
-        _ => {
-            return TypingKeyOutcome::Consumed;
-        }
-    }
-
-    let after = (state.fade_duration, state.transcription_settings.clone());
-    if before == after {
-        TypingKeyOutcome::Consumed
-    } else {
-        TypingKeyOutcome::Changed
-    }
-}
-
-fn cycle_transcription_sources(
-    current: &[SourceKind],
-    direction: TypingSettingDirection,
-) -> Vec<SourceKind> {
-    let current_index = match current {
-        [SourceKind::Microphone, SourceKind::SystemOutput]
-        | [SourceKind::SystemOutput, SourceKind::Microphone] => 0,
-        [SourceKind::Microphone] => 1,
-        [SourceKind::SystemOutput] => 2,
-        _ => 0,
-    };
-    match cycle_index(current_index, 3, direction) {
-        0 => vec![SourceKind::Microphone, SourceKind::SystemOutput],
-        1 => vec![SourceKind::Microphone],
-        _ => vec![SourceKind::SystemOutput],
-    }
-}
-
-fn cycle_str_choice(current: &str, choices: &[&str], direction: TypingSettingDirection) -> String {
-    if choices.is_empty() {
-        return current.to_string();
-    }
-    let current_index = choices
-        .iter()
-        .position(|choice| choice.eq_ignore_ascii_case(current.trim()))
-        .unwrap_or(0);
-    choices[cycle_index(current_index, choices.len(), direction)].to_string()
-}
-
-fn cycle_usize_choice(
-    current: usize,
-    choices: &[usize],
-    direction: TypingSettingDirection,
-) -> usize {
-    if choices.is_empty() {
-        return current;
-    }
-    let current_index = choices
-        .iter()
-        .position(|choice| *choice == current)
-        .unwrap_or(0);
-    choices[cycle_index(current_index, choices.len(), direction)]
-}
-
-fn cycle_index(current: usize, count: usize, direction: TypingSettingDirection) -> usize {
-    if count == 0 {
-        return current;
-    }
-    match direction {
-        TypingSettingDirection::Previous => (current + count - 1) % count,
-        TypingSettingDirection::Next => (current + 1) % count,
-    }
 }
 
 fn handle_typing_key(
@@ -4565,10 +4308,6 @@ fn render(state: &AppState) -> Result<()> {
 }
 
 fn render_transcription_mode(state: &AppState) -> Result<()> {
-    if state.transcription_settings.open {
-        return render_transcription_settings_mode(state);
-    }
-
     let (width, height) = terminal::size()?;
     let width = width.max(80);
     let height = height.max(24);
@@ -4620,160 +4359,6 @@ fn render_transcription_mode(state: &AppState) -> Result<()> {
 
     out.flush()?;
     Ok(())
-}
-
-fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
-    let (width, height) = terminal::size()?;
-    let width = width.max(80);
-    let height = height.max(12);
-    let usable_width = width.saturating_sub(1) as usize;
-    let footer_row = height.saturating_sub(1);
-    let rows = transcription_settings_rows(state, usable_width);
-    let mut out = io::stdout();
-
-    for row in 0..height {
-        queue!(out, cursor::MoveTo(0, row))?;
-        if row == footer_row {
-            render_segment(
-                &mut out,
-                "F9 Settings | \u{2191}/\u{2193} select | \u{2190}/\u{2192} change | Esc closes | Ctrl+C exits",
-                usable_width,
-                Color::DarkGrey,
-            )?;
-            continue;
-        }
-
-        if let Some(line) = rows.get(row as usize) {
-            render_styled_segment(&mut out, line, usable_width)?;
-        } else {
-            render_segment(&mut out, "", usable_width, Color::White)?;
-        }
-    }
-
-    out.flush()?;
-    Ok(())
-}
-
-fn transcription_settings_rows(state: &AppState, width: usize) -> Vec<StyledLine> {
-    let mut rows = vec![
-        StyledLine::plain(
-            "Settings",
-            Color::Rgb {
-                r: 210,
-                g: 245,
-                b: 255,
-            },
-        ),
-        StyledLine::plain("", Color::White),
-    ];
-
-    let settings = &state.transcription_settings;
-    let option_rows = [
-        (
-            "Transcript fade",
-            format!("{}s", state.fade_duration.as_secs()),
-        ),
-        (
-            "Sources",
-            transcription_sources_text(&settings.pending_sources),
-        ),
-        (
-            "Language",
-            transcription_language_text(settings.pending_language.as_deref()),
-        ),
-        ("Whisper model", settings.pending_model.clone()),
-        (
-            "Whisper window",
-            format!("{}s", settings.pending_chunk_seconds),
-        ),
-        (
-            "Agent",
-            if settings.pending_agent_enabled {
-                "on".to_string()
-            } else {
-                "off".to_string()
-            },
-        ),
-        ("Agent model", settings.pending_agent_model.clone()),
-        (
-            "Mic context",
-            transcription_mic_context_text(settings.pending_include_microphone),
-        ),
-    ];
-
-    for (index, (label, value)) in option_rows.iter().enumerate() {
-        let selected = index == state.transcription_settings.selection;
-        let marker = if selected { "> " } else { "  " };
-        let color = if selected {
-            Color::Cyan
-        } else {
-            Color::DarkGrey
-        };
-        rows.push(StyledLine::plain(
-            fit_line(&format!("{marker}{label}: {value}"), width.max(1)),
-            color,
-        ));
-    }
-
-    rows.push(StyledLine::plain("", Color::White));
-    rows.push(StyledLine::plain(
-        fit_line(
-            "Warning: source, language, model, window, and agent changes apply after restart.",
-            width.max(1),
-        ),
-        Color::Yellow,
-    ));
-
-    if let Some(note) = &state.transcription_settings.note {
-        rows.push(StyledLine::plain("", Color::White));
-        rows.push(StyledLine::plain(
-            fit_line(note, width.max(1)),
-            Color::Rgb {
-                r: 190,
-                g: 190,
-                b: 190,
-            },
-        ));
-    }
-
-    rows
-}
-
-fn transcription_sources_text(sources: &[SourceKind]) -> String {
-    if sources.is_empty() {
-        return "none".to_string();
-    }
-
-    sources
-        .iter()
-        .map(|source| source.display_name())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn transcription_language_text(language: Option<&str>) -> String {
-    transcription_language_choice(language)
-}
-
-fn transcription_language_choice(language: Option<&str>) -> String {
-    language.unwrap_or("auto").to_string()
-}
-
-fn transcription_model_choice_from_path(path: &PathBuf) -> String {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("model");
-    let name = file_name.strip_prefix("ggml-").unwrap_or(file_name);
-    name.strip_suffix(".bin").unwrap_or(name).to_string()
-}
-
-fn transcription_mic_context_text(include_microphone: bool) -> String {
-    if include_microphone {
-        "on".to_string()
-    } else {
-        "off".to_string()
-    }
 }
 
 fn render_typing_mode(state: &AppState) -> Result<()> {
@@ -5573,9 +5158,55 @@ fn scale_rgb(fresh: (u8, u8, u8), intensity: f32) -> Color {
 }
 
 fn build_footer_line(state: &AppState) -> String {
+    let backend = if state.cuda_enabled { "CUDA" } else { "CPU" };
+    let model = state
+        .model_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model");
+    let language = state.language.as_deref().unwrap_or("auto");
+    let sources = state
+        .sources
+        .iter()
+        .map(|source| source.label())
+        .collect::<Vec<_>>()
+        .join(",");
+    let fade_seconds = state.fade_duration.as_secs();
+    let agent = if state.agent.enabled {
+        format!("agent {} ({})", state.agent.model, state.agent.status)
+    } else {
+        "agent off".to_string()
+    };
+    let api_usage = build_api_usage_line(&state.agent);
+
     format!(
-        "F9 settings | F1 agent | F5 refresh | q/Ctrl+C exits | {}",
+        "backend {backend} | model {model} | language {language} | sources {sources} | fade {fade_seconds}s | {agent} | {api_usage} | {} | F1 agent | F5 refresh | q/Ctrl+C exits",
         state.status
+    )
+}
+
+fn build_api_usage_line(agent: &AgentPaneState) -> String {
+    if !agent.enabled {
+        return "api off".to_string();
+    }
+
+    let in_flight = if agent.request_in_flight {
+        " waiting"
+    } else {
+        ""
+    };
+    let last = agent
+        .last_total_tokens
+        .map(|tokens| tokens.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let query_size = agent
+        .last_query_bytes
+        .map(format_byte_size)
+        .unwrap_or_else(|| "-".to_string());
+
+    format!(
+        "api {} req{in_flight}, query {query_size}, last {last} tok, total {} tok (in {}, out {})",
+        agent.request_count, agent.total_tokens, agent.input_tokens, agent.output_tokens
     )
 }
 
@@ -5798,40 +5429,19 @@ fn fit_line_fragment(text: &str, width: usize) -> String {
 mod tests {
     use super::{
         agent_input_has_informative_delta, agent_input_signature, align_transcript_words,
-        build_footer_line, build_response_schema, extract_agent_config_block, extract_agent_usage,
-        extract_response_text, fade_intensity, format_byte_size, handle_transcription_key,
-        is_informative_text, merge_transcript_estimate, min_typing_status_width, new_text_since,
-        parse_agent_config, serialized_json_bytes, styled_line_width, transcription_settings_rows,
-        typing_desired_width, typing_layout, typing_safe_row_width, typing_window_width,
-        wrap_plain_text, AgentConfig, AgentInput, AgentUsage, AppConfig, AppMode,
-        EnhancedTypingSettings, SourceKind, TranscriptState, TranscriptWord, TypingConfig,
-        TypingKeyOutcome, TypingTransparencyBackground, DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE,
-        TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH, TYPING_REFINER_MODELS,
-        TYPING_RIGHT_GUTTER_COLS, TYPING_TRANSPARENCY_PRESETS,
+        build_response_schema, extract_agent_config_block, extract_agent_usage,
+        extract_response_text, fade_intensity, format_byte_size, is_informative_text,
+        merge_transcript_estimate, min_typing_status_width, new_text_since, parse_agent_config,
+        serialized_json_bytes, styled_line_width, typing_desired_width, typing_layout,
+        typing_safe_row_width, typing_window_width, wrap_plain_text, AgentConfig, AgentInput,
+        AgentUsage, AppConfig, AppMode, EnhancedTypingSettings, SourceKind, TranscriptState,
+        TranscriptWord, TypingConfig, TypingTransparencyBackground, DEFAULT_AGENT_MODEL,
+        DEFAULT_LANGUAGE, TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH,
+        TYPING_REFINER_MODELS, TYPING_RIGHT_GUTTER_COLS, TYPING_TRANSPARENCY_PRESETS,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn test_transcription_state() -> super::AppState {
-        let config = AppConfig {
-            mode: AppMode::Transcription,
-            model_path: PathBuf::from("ggml-medium.en.bin"),
-            temp_dir: PathBuf::from("."),
-            sources: vec![SourceKind::Microphone, SourceKind::SystemOutput],
-            chunk_seconds: 12,
-            language: Some(DEFAULT_LANGUAGE.to_string()),
-            fade_duration: Duration::from_secs(70),
-            agent: AgentConfig::disabled(DEFAULT_AGENT_MODEL),
-            typing: None,
-        };
-        super::AppState::new(&config)
-    }
 
     fn test_typing_state(text: &str) -> super::AppState {
         let config = AppConfig {
@@ -5861,90 +5471,6 @@ mod tests {
         let mut state = super::AppState::new(&config);
         state.typing.last_typed_text = text.to_string();
         state
-    }
-
-    #[test]
-    fn transcription_f9_settings_open_and_close_without_worker_changes() {
-        let mut state = test_transcription_state();
-
-        assert!(!state.transcription_settings.open);
-        assert_eq!(
-            handle_transcription_key(&mut state, &key(KeyCode::F(9))),
-            TypingKeyOutcome::Changed
-        );
-        assert!(state.transcription_settings.open);
-        assert_eq!(state.sources.len(), 2);
-        assert_eq!(state.language.as_deref(), Some(DEFAULT_LANGUAGE));
-        assert_eq!(state.chunk_seconds, 12);
-
-        assert_eq!(
-            handle_transcription_key(&mut state, &key(KeyCode::Esc)),
-            TypingKeyOutcome::Changed
-        );
-        assert!(!state.transcription_settings.open);
-    }
-
-    #[test]
-    fn transcription_settings_stage_restart_bound_values() {
-        let mut state = test_transcription_state();
-        state.transcription_settings.open();
-
-        assert_eq!(
-            handle_transcription_key(&mut state, &key(KeyCode::Right)),
-            TypingKeyOutcome::Changed
-        );
-        assert_eq!(state.fade_duration, Duration::from_secs(75));
-        assert_eq!(
-            state.transcription_settings.note.as_deref(),
-            Some("Fade applies immediately")
-        );
-
-        state.transcription_settings.selection = 1;
-        let sources_before = state.sources.clone();
-        assert_eq!(
-            handle_transcription_key(&mut state, &key(KeyCode::Right)),
-            TypingKeyOutcome::Changed
-        );
-        assert_eq!(state.sources, sources_before);
-        assert_eq!(
-            state.transcription_settings.pending_sources,
-            vec![SourceKind::Microphone]
-        );
-        assert_eq!(state.transcription_settings.note.as_deref(), None);
-        assert!(state.transcription_settings.restart_pending);
-    }
-
-    #[test]
-    fn transcription_settings_rows_use_one_restart_warning() {
-        let mut state = test_transcription_state();
-        state.transcription_settings.open();
-
-        let rendered = transcription_settings_rows(&state, 120)
-            .into_iter()
-            .flat_map(|line| line.segments.into_iter().map(|segment| segment.text))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("Transcript fade: 70s"));
-        assert!(rendered.contains("Sources: Microphone, System output"));
-        assert!(rendered.contains("Language: en"));
-        assert!(rendered.contains("Whisper model: medium.en"));
-        assert!(rendered.contains(
-            "Warning: source, language, model, window, and agent changes apply after restart."
-        ));
-        assert!(!rendered.contains("[restart]"));
-    }
-
-    #[test]
-    fn transcription_footer_stays_compact() {
-        let state = test_transcription_state();
-        let footer = build_footer_line(&state);
-
-        assert!(footer.contains("F9 settings"));
-        assert!(footer.contains("F1 agent"));
-        assert!(!footer.contains("model"));
-        assert!(!footer.contains("sources"));
-        assert!(!footer.contains("api"));
     }
 
     #[test]
@@ -6339,25 +5865,6 @@ After.
 
         assert!(error.contains("microphone_delta_gate_field"));
         assert!(error.contains("references missing field"));
-    }
-
-    #[test]
-    fn repository_agent_instructions_config_is_valid() {
-        let markdown = include_str!("../agent-instructions.md");
-        let (config_text, instructions) =
-            extract_agent_config_block(markdown).expect("agent-config block should exist");
-        let parsed = parse_agent_config(&config_text).expect("agent-config should be valid");
-        let schema = build_response_schema(&parsed.fields);
-
-        assert!(!instructions.contains("```agent-config"));
-        let required = schema["required"]
-            .as_array()
-            .expect("schema required fields should be an array");
-        assert_eq!(required.len(), parsed.fields.len());
-        for field in &parsed.fields {
-            assert!(schema["properties"].get(&field.key).is_some());
-            assert!(required.iter().any(|value| value == &field.key));
-        }
     }
 
     #[test]
