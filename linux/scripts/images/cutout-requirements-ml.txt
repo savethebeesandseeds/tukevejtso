@@ -1,0 +1,6 @@
+transformers>=4.44
+accelerate
+safetensors
+timm
+einops
+kornia

@@ -11,6 +11,8 @@ Useful direct commands:
 ```cmd
 tk demo
 tk password
+tk linux
+tk cutout INPUT [OUTPUT]
 tk transcription
 tk enchanted-transcription
 tk enhanced-typing
@@ -27,6 +29,10 @@ tk reboot enable
 `tk terminal-transparency` opens a small menu for setting opacity on the current terminal window only. It does not persist opacity to Windows Terminal profiles. In Windows Terminal, tabs and panes in the same window share the window opacity; the tool keeps a private key binding installed so Terminal does not reset opacity after applying it.
 
 `tk password` opens the password manager. It only generates local passwords using Windows/.NET cryptographic randomness and does not save generated passwords. Choose Generate password, enter the length, then select the complexity.
+
+`tk linux` builds and opens the `tukevejtso` Debian utility container. The container is based on `debian:latest`, keeps the repo mounted at `/workspace/tukevejtso`, mounts the cutout Python runtime volume at `/opt/tukevejtso-venvs`, and starts in `/workspace/tukevejtso/linux`. When Docker GPU support is available, newly created containers are created with `--gpus all`; use `tk linux -RecreateForGpu` to replace an older CPU-only container with a GPU-enabled one.
+
+`tk cutout INPUT [OUTPUT]` removes image backgrounds with the Linux cutout engine and writes transparent PNG files. `INPUT` is a Windows folder, and `OUTPUT` defaults to a sibling folder named `<input> - transparent`. Good defaults are BiRefNet, `device=auto` so CUDA is used when the container and PyTorch support it, 1024px model input, alpha floor 24, and alpha ceiling 250. Add `-CleanOutput` to delete the output folder before writing, and `-SaveExtras` only when you want alpha/mask/diagnostic sidecars. Temporary staging under `linux\workspaces\images\cutout-stage` is cleaned automatically after successful copyback. See `..\CUTOUT.md` for usage and deprecated legacy background-removal commands.
 
 `tk transcription` starts the local Whisper transcription agent. The first run downloads the default Whisper model if needed, builds the Rust app with CUDA-enabled Whisper, reads saved settings from `%APPDATA%\tukevejtso\enchanted-transcription-settings.json`, and opens a split terminal view. Defaults are microphone plus system-output capture, English, `ggml-medium.en.bin`, a 12-second rolling Whisper window, and a 70-second transcript fade. Press F9 during transcription for persistent settings; applying worker-bound changes automatically restarts the agent.
 

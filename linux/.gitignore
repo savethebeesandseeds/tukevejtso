@@ -1,0 +1,12 @@
+# Local scratch inputs, generated outputs, and experiment media.
+workspaces/**
+!workspaces/
+!workspaces/**/
+!workspaces/**/README.md
+
+# Runtime caches from Python helpers.
+__pycache__/
+*.py[cod]
+
+# Local Python environments for heavier optional tools.
+.venvs/

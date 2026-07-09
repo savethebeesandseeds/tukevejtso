@@ -17,6 +17,8 @@ if "%TOOLKIT_CHOICE%"=="23" goto enchanted_transcription
 if "%TOOLKIT_CHOICE%"=="24" goto openai_key
 if "%TOOLKIT_CHOICE%"=="25" goto password_manager
 if "%TOOLKIT_CHOICE%"=="26" goto enhanced_typing
+if "%TOOLKIT_CHOICE%"=="27" goto tukevejtso_linux
+if "%TOOLKIT_CHOICE%"=="28" goto cutout_backgrounds
 
 goto done
 
@@ -24,6 +26,12 @@ goto done
 set "TOOLKIT_FROM_MENU="
 if /I "%~1"=="password" goto password_manager
 if /I "%~1"=="robotics-learning" goto robotics_learning_dev
+if /I "%~1"=="linux" goto tukevejtso_linux
+if /I "%~1"=="tukevejtso" goto tukevejtso_linux
+if /I "%~1"=="debian" goto tukevejtso_linux
+if /I "%~1"=="cutout" goto cutout_backgrounds
+if /I "%~1"=="backgrounds" goto cutout_backgrounds
+if /I "%~1"=="remove-backgrounds" goto cutout_backgrounds
 if /I "%~1"=="terminal-transparency" goto terminal_transparency
 if /I "%~1"=="openai-key" goto openai_key
 if /I "%~1"=="enchanted-transcription" goto enchanted_transcription
@@ -62,6 +70,8 @@ echo.
 echo Usage:
 echo   tk                         Open the interactive menu
 echo   tk password                Generate passwords with length/complexity options
+echo   tk linux                   Build/open the tukevejtso Debian utility container
+echo   tk cutout INPUT [OUTPUT]   Remove image backgrounds into transparent PNGs
 echo   tk robotics-learning       Open the robotics-learning dev container
 echo   tk terminal-transparency   Set opacity for the current terminal window
 echo   tk openai-key              Store or update the OpenAI API key
@@ -83,6 +93,34 @@ goto done
 
 :robotics_learning_dev
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\docker-robotics-learning-shell.ps1"
+goto done
+
+:tukevejtso_linux
+if /I "%~1"=="linux" shift /1
+if /I "%~1"=="tukevejtso" shift /1
+if /I "%~1"=="debian" shift /1
+set "TUKEVEJTSO_LINUX_ARGS="
+:tl_args
+if "%~1"=="" goto tl_run
+set TUKEVEJTSO_LINUX_ARGS=%TUKEVEJTSO_LINUX_ARGS% "%~1"
+shift /1
+goto tl_args
+:tl_run
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\docker-tukevejtso-shell.ps1" %TUKEVEJTSO_LINUX_ARGS%
+goto done
+
+:cutout_backgrounds
+if /I "%~1"=="cutout" shift /1
+if /I "%~1"=="backgrounds" shift /1
+if /I "%~1"=="remove-backgrounds" shift /1
+set "CUTOUT_ARGS="
+:cutout_args
+if "%~1"=="" goto cutout_run
+set CUTOUT_ARGS=%CUTOUT_ARGS% "%~1"
+shift /1
+goto cutout_args
+:cutout_run
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\cutout-backgrounds.ps1" %CUTOUT_ARGS%
 goto done
 
 :terminal_transparency

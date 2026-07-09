@@ -29,6 +29,24 @@ windows/agents/*/.temp/
 windows/agents/*/models/
 windows/agents/*/target/
 
+# Linux utility workspaces, model caches, and generated media
+linux/workspaces/**
+!linux/workspaces/
+!linux/workspaces/**/
+!linux/workspaces/README.md
+!linux/workspaces/**/README.md
+linux/.venvs/
+linux/.cache/
+linux/scripts/images/.venvs/
+linux/scripts/images/.cache/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.gguf
+*.bin
+
 # Build and dependency caches
 target/
 node_modules/

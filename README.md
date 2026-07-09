@@ -7,12 +7,19 @@ This project is a local operations toolkit: small terminal commands for keeping 
 ## Platforms
 
 - [Windows](windows/README.md)
+- [Linux](linux/README.md)
+
+## Tool Guides
+
+- [Background cutout usage](CUTOUT.md)
+- [Cutout environment recovery](CUTOUT_ENVIRONMENT.md)
 
 ## Current Focus
 
 The Windows version starts with the tools we already use locally:
 
 - Docker container helpers.
+- Image tools, including learned background removal into transparent PNGs.
 - A Windows Update reboot guard for long trainings and Codex sessions.
 - Small security and terminal diagnostics.
 - A dependency-light terminal rendering layer inspired by the `iinuji` primitives.

@@ -7,6 +7,7 @@ function Get-MenuCategoryColor {
 
     switch ($Label) {
         "Docker" { return "#4aa3ff" }
+        "Images" { return "#37d99e" }
         "Open" { return "#ffd45a" }
         "Security" { return "#ff6b63" }
         "Windows" { return "#37d99e" }
@@ -61,13 +62,23 @@ $items = @(
     },
     @{
         Label = "Docker"
-        Detail = "cuwacunu-dev shell"
+        Detail = "cuwacunu shell"
         ExitCode = 20
     },
     @{
         Label = "Docker"
         Detail = "robotics-learning shell"
         ExitCode = 21
+    },
+    @{
+        Label = "Docker"
+        Detail = "tukevejtso Linux shell"
+        ExitCode = 27
+    },
+    @{
+        Label = "Images"
+        Detail = "Background cutout"
+        ExitCode = 28
     },
     @{
         Label = "Terminal"
