@@ -9,6 +9,9 @@ installed. They are not wired into the Windows `tk` launcher.
 
 - `image_tool.sh`: main image CLI
 - `cutout.sh`: model-aware background removal CLI and GUI entrypoint
+- `split_sprite_sheets.py`: object-aware sprite-sheet splitter using cutout masks
+- `transparent_hole_knockout.py`: config-driven cleanup for interior holes
+- `SPRITE_SPLIT_REPACK.md`: repeatable guide for split, repack, preview, and QA
 - `pdf_tool.sh`: main PDF CLI
 - `lib/common.sh`: shared shell helpers
 - `cluster_transparency.sh`, `gif_cluster_transparent.sh`,
@@ -126,6 +129,35 @@ Batch-process a test folder while saving sidecars for inspection:
   --alpha-ceiling 250 \
   --save-extras \
   --diagnostics ./workspaces/images/tests-output-birefnet/report.json
+```
+
+Split a masked sprite sheet folder into padded individual PNGs while writing
+preview overlays and repacked sheets. See `SPRITE_SPLIT_REPACK.md` for the
+full workflow, Caatuu examples, and QA checks for smoke/flags/fumes:
+
+```bash
+./scripts/images/image_tool.sh sprite-split \
+  ./workspaces/images/sheets \
+  ./workspaces/images/sheets-split \
+  --rows 4 \
+  --cols 4 \
+  --prefix sprite \
+  --repack-dir ./workspaces/images/sheets-repacked \
+  --preview-dir ./workspaces/images/sheets-previews \
+  --manifest ./workspaces/images/sheets-manifest.json
+```
+
+Remove intended transparent interior holes that a cutout model cannot infer,
+such as archways or window openings:
+
+```bash
+./scripts/images/image_tool.sh hole-knockout \
+  ./workspaces/images/hole-knockouts.json \
+  --input-dir ./workspaces/images/sprites \
+  --output-dir ./workspaces/images/sprites-clean \
+  --preview-dir ./workspaces/images/hole-previews \
+  --mask-dir ./workspaces/images/hole-masks \
+  --manifest ./workspaces/images/hole-knockout-manifest.json
 ```
 
 For normal use, omit `--save-extras`; the batch command writes only final

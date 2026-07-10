@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$containerName = "cuwacunu-dev"
+$containerName = "unnamed_taoist"
 $dockerDesktopTimeoutSeconds = 90
 $dockerTerminalEnv = @(
     "-e", "TERM=xterm-256color",

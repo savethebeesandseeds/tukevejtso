@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$containerName = "cuwacunu-dev"
+$containerName = "unnamed_taoist"
 
 $docker = Get-Command docker -ErrorAction SilentlyContinue
 if ($null -eq $docker) {

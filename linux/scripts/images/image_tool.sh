@@ -24,6 +24,8 @@ Commands:
   mask-alpha                Deprecated: threshold alpha helper; prefer cutout
   cluster-transparent       Deprecated: color-cluster alpha helper; prefer cutout
   cutout                    Model-aware background removal CLI and GUI
+  sprite-split              Split masked sprite sheets into padded individual PNGs
+  hole-knockout             Remove configured transparent holes inside sprites
   allowed-palette-clean     Quantize to 6 colors, remove the dominant cluster, remap to the approved palette
   gif-cluster-transparent   Deprecated: frame cluster helper; prefer cutout for still images
   cluster-white-transparent Deprecated legacy grayscale cluster workflow
@@ -119,6 +121,32 @@ Examples:
   ./scripts/image_tool.sh cutout gui
 
 Run `./scripts/images/cutout.sh --help` for the full cutout CLI.
+EOF
+}
+
+usage_sprite_split() {
+  cat <<'EOF'
+Usage:
+  ./scripts/image_tool.sh sprite-split INPUT_DIR OUTPUT_DIR --rows N --cols N [options]
+
+Object-aware sheet splitter. It uses alpha/background masking to find each
+sprite's real bounds, writes padded individual PNGs, and can also write
+repacked sheets plus preview overlays.
+
+Run `./scripts/images/split_sprite_sheets.py --help` for the full CLI.
+EOF
+}
+
+usage_hole_knockout() {
+  cat <<'EOF'
+Usage:
+  ./scripts/image_tool.sh hole-knockout CONFIG --input-dir DIR (--output-dir DIR | --in-place) [options]
+
+Config-driven cleanup for enclosed holes that background removal cannot infer,
+such as archways, windows, and handles. The config supplies erase shapes and
+optional protect shapes so the pass only removes intended interior pixels.
+
+Run `./scripts/images/transparent_hole_knockout.py --help` for the full CLI.
 EOF
 }
 
@@ -781,6 +809,26 @@ cmd_cluster_white_transparent() {
   print_result "Output:" "$transparent"
 }
 
+cmd_sprite_split() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -lt 1 ]]; then
+    usage_sprite_split
+    [[ $# -ge 1 ]] || return 1
+    return 0
+  fi
+
+  python3 "$SCRIPT_DIR/split_sprite_sheets.py" "$@"
+}
+
+cmd_hole_knockout() {
+  if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || $# -lt 1 ]]; then
+    usage_hole_knockout
+    [[ $# -ge 1 ]] || return 1
+    return 0
+  fi
+
+  python3 "$SCRIPT_DIR/transparent_hole_knockout.py" "$@"
+}
+
 main() {
   local cmd="${1:-}"
   shift || true
@@ -795,6 +843,8 @@ main() {
     mask-alpha) cmd_mask_alpha "$@" ;;
     cluster-transparent) cmd_cluster_transparent "$@" ;;
     cutout) cmd_cutout "$@" ;;
+    sprite-split) cmd_sprite_split "$@" ;;
+    hole-knockout) cmd_hole_knockout "$@" ;;
     allowed-palette-clean) cmd_allowed_palette_clean "$@" ;;
     gif-cluster-transparent) cmd_gif_cluster_transparent "$@" ;;
     cluster-white-transparent) cmd_cluster_white_transparent "$@" ;;
