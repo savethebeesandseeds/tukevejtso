@@ -24,6 +24,11 @@ tk reboot status
 tk reboot toggle
 tk reboot disable
 tk reboot enable
+tk storage
+tk storage start
+tk storage rebuild
+tk storage status
+tk storage stop
 ```
 
 `tk terminal-transparency` opens a small menu for setting opacity on the current terminal window only. It does not persist opacity to Windows Terminal profiles. In Windows Terminal, tabs and panes in the same window share the window opacity; the tool keeps a private key binding installed so Terminal does not reset opacity after applying it.
@@ -41,6 +46,8 @@ tk reboot enable
 `tk openai-key` stores or updates an OpenAI API key encrypted with Windows DPAPI for tools that need OpenAI access. `tk openai-key -Status` shows whether a key is configured without printing it.
 
 The reboot guard keeps Windows Update enabled, but blocks automatic Windows Update restarts while a user is logged in. Run `tk reboot` for the simple status-and-toggle screen. Changing the guard requires administrator approval.
+
+`tk storage` opens a control menu for `C:\Work\storage-and-sharing-services`. It can start or rebuild the Docker service, show its container and HTTP health, print the current local and LAN URLs, or stop it. Starting launches Docker Desktop when needed and waits until the service is ready. The service keeps `restart: "no"`, so it does not start automatically with the computer.
 
 ## Layout
 

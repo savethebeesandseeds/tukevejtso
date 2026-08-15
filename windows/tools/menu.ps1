@@ -7,6 +7,7 @@ function Get-MenuCategoryColor {
 
     switch ($Label) {
         "Docker" { return "#4aa3ff" }
+        "Storage" { return "#5dd9e8" }
         "Images" { return "#37d99e" }
         "Open" { return "#ffd45a" }
         "Security" { return "#ff6b63" }
@@ -74,6 +75,11 @@ $items = @(
         Label = "Docker"
         Detail = "tukevejtso Linux shell"
         ExitCode = 27
+    },
+    @{
+        Label = "Storage"
+        Detail = "Sharing service"
+        Script = Join-Path $PSScriptRoot "storage-and-sharing-services.ps1"
     },
     @{
         Label = "Images"

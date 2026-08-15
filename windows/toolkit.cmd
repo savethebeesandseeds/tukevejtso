@@ -43,6 +43,9 @@ if /I "%~1"=="enchanted-typing" goto enhanced_typing
 if /I "%~1"=="reboot" goto reboot_guard
 if /I "%~1"=="auto-reboot" goto reboot_guard
 if /I "%~1"=="reboots" goto reboot_guard
+if /I "%~1"=="storage" goto storage_sharing_services
+if /I "%~1"=="sharing" goto storage_sharing_services
+if /I "%~1"=="storage-sharing" goto storage_sharing_services
 if /I "%~1"=="demo" goto ui_demo
 if /I "%~1"=="ui" goto ui_demo
 if /I "%~1"=="help" goto help
@@ -85,6 +88,18 @@ echo   tk reboot status           Show Windows Update auto-reboot guard state
 echo   tk reboot toggle           Toggle the auto-reboot guard
 echo   tk reboot disable          Disable auto-reboots while logged in
 echo   tk reboot enable           Allow auto-reboots again
+echo   tk storage                 Choose start/stop/status for storage sharing
+echo   tk storage start           Start the storage and sharing service
+echo   tk storage rebuild         Rebuild its Docker image, then start it
+echo   tk storage status          Show container health and current URLs
+echo   tk storage stop            Stop the storage and sharing service
+goto done
+
+:storage_sharing_services
+set "STORAGE_SHARING_ACTION=%~2"
+if "%STORAGE_SHARING_ACTION%"=="" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\storage-and-sharing-services.ps1"
+if "%STORAGE_SHARING_ACTION%"=="" goto done
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\storage-and-sharing-services.ps1" -Action "%STORAGE_SHARING_ACTION%"
 goto done
 
 :cuwacunu_dev
