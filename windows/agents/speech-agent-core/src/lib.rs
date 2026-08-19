@@ -8508,28 +8508,9 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
 
 fn wrap_choice_list(choices: &[String], width: usize) -> Vec<String> {
     let width = width.max(1);
-    let prefix = "  ";
-    let separator = "  •  ";
-    let mut lines = Vec::new();
-    let mut current = prefix.to_string();
-
-    for choice in choices {
-        let separator = if current == prefix { "" } else { separator };
-        let addition = format!("{separator}{choice}");
-        if current != prefix && current.chars().count() + addition.chars().count() > width {
-            lines.push(current);
-            current = format!("{prefix}{choice}");
-        } else {
-            current.push_str(&addition);
-        }
-    }
-
-    if current != prefix {
-        lines.push(current);
-    }
-    lines
-        .into_iter()
-        .flat_map(|line| wrap_line(&line, width))
+    choices
+        .iter()
+        .flat_map(|choice| wrap_line(&format!("  • {choice}"), width))
         .collect()
 }
 
