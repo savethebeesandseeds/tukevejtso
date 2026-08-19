@@ -1,3 +1,5 @@
 /target/
 /models/
 /.temp/
+/contexts/*
+!/contexts/example.md
