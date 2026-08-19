@@ -4,8 +4,9 @@ This crate owns the runtime shared by Enchanted Transcription and Enhanced Typin
 
 - WASAPI audio capture and source isolation
 - rolling local Whisper inference and transcript reconciliation
-- OpenAI Responses API transport and usage accounting
+- OpenAI Responses API transport, optional reference-document grounding, and usage accounting
 - terminal/Win32 lifecycle management
+- protected restart continuity and API pause/exit safeguards
 - shared rendering and settings primitives
 
 The product packages are deliberately thin entrypoints:

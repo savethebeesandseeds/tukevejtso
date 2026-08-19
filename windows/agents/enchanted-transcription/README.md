@@ -1,110 +1,138 @@
-# Enchanted Transcription Agent
+# Enchanted Transcription
 
-Native Windows transcription agent for microphone and system-audio capture with local Whisper inference.
+Native Windows transcription for microphone and system audio, using local Whisper inference with an optional OpenAI-powered Agent Insights pane.
 
-## Run
+## Start
 
-Use the `tukevejtso` launcher:
+Use either launcher alias:
 
 ```cmd
 tk transcription
-```
-
-Preferred explicit alias:
-
-```cmd
 tk enchanted-transcription
 ```
 
-The first run downloads the selected model into the shared `windows\models\whisper` cache, builds the Rust terminal app with CUDA-enabled Whisper, reads saved settings from `%APPDATA%\tukevejtso\enchanted-transcription-settings.json`, and opens a split terminal view. If no settings have been saved yet, it starts with microphone plus system-output capture, English, `ggml-medium.en.bin`, a 12-second rolling Whisper window, and a 70-second transcript fade.
+The first run builds the Rust terminal application and downloads the selected Whisper model into the shared `windows\models\whisper` cache. Saved settings live at `%APPDATA%\tukevejtso\enchanted-transcription-settings.json`.
 
-The terminal uses a rolling Whisper window rather than waiting for isolated fixed chunks. It refreshes a live hypothesis every few seconds and periodically commits only the new text into the stable transcript pane.
+With no saved settings, the application starts with microphone plus system-output capture, English, `ggml-medium.en.bin`, a 12-second rolling Whisper window, a 70-second transcript fade, and Agent Insights enabled when an API key is available.
 
-Press F9 during transcription to open settings. The option list is on the left, details and choices for the selected option are on the right, and recent errors plus live agent diagnostics appear below. Transcript fade, terminal transparency, and API lifecycle controls apply without restarting. Source selection, language, model, rolling Whisper window, and agent wiring are saved and automatically restart the worker when required.
-
-The persistent **Answer mode** setting offers two right-pane response styles. **Silhouette** is the default and returns a content-free spoken-answer frame with `...` blanks for the user's own knowledge. **Natural Answer** returns a concise, directly usable answer to the latest question while stating uncertainty instead of inventing missing facts. Changing the mode uses the normal brief automatic application restart to rebuild the response contract.
-
-F9 can also attach one local reference document from the `contexts` folder to Agent Insights requests. Add private UTF-8 `.md`, `.txt`, `.json`, or `.csv` files beside `contexts\example.md`, then choose **Reference context** and **Context strictness**. **Soft** uses the document as helpful background while still allowing transcript evidence and reliable general knowledge. **Strong** treats the document as authoritative grounding and asks the agent to state when the available context is insufficient. The selected document is sent in full with every Agent Insights request, is limited to 32 KiB to control cost, and is treated as data rather than as higher-priority instructions. Private context files are ignored by Git; only `example.md` is tracked. This is lightweight document grounding, not chunked retrieval or full RAG.
-
-The insight agent has layered API safeguards. By default, new API requests pause after the terminal has remained hidden, minimized, cloaked, or out of the foreground for 15 seconds; F9 can select a different grace period or turn the rule off. Audio capture, local Whisper inference, rolling transcript history, and agent context continue while paused. Only API submission is held, and resuming uses the newest consolidated context without replaying a request backlog. If terminal visibility cannot be monitored, API requests pause and F9 shows a warning separate from actual errors. The application exits after 15 minutes continuously hidden, 30 minutes without transcript activity, or a four-hour session. At 100,000 reported API tokens, new insight requests pause and the terminal asks before granting another 100,000-token block. Declining leaves only the API paused; F1 reopens the prompt. F9 can change or disable each limit.
-
-Terminal transparency is available as a persistent F9 setting using the existing `terminal-transparency` tool. The launcher flags remain available as a one-session override.
-
-Plaintext transcript files are disabled by default. To opt in for local debugging, launch with `-TranscriptDump` or set `TUKEVEJTSO_TRANSCRIPT_DUMP=1`; enabled dumps retain the existing seven-day cleanup policy. F9 restarts use a launcher-scoped, Windows DPAPI-protected temporary state so the visible transcript and Agent context survive without being written as plaintext.
-
-The optional right-side agent pane uses the OpenAI Responses API on system-output transcript text. Microphone transcript text is not sent unless enabled in F9 settings. Store the API key once with:
+Store or update the API key before using Agent Insights:
 
 ```cmd
 tk openai-key
 ```
 
-The key is encrypted with Windows DPAPI for the current user and stored under `%APPDATA%\tukevejtso\secrets`.
+The key is encrypted with Windows DPAPI for the current user and stored under `%APPDATA%\tukevejtso\secrets`. Without a usable key, local transcription still works and F9 reports that Agent Insights is unavailable.
 
-Enchanted Transcription and Enhanced Typing are separate thin binaries over `..\speech-agent-core`. Shared capture, Whisper, transcript reconciliation, API transport, and terminal lifecycle behavior is implemented once in that crate; product-specific entrypoints select the transcription or typing experience.
+## Main controls
 
-To force CPU mode:
+| Key | Action |
+| --- | --- |
+| F1 | Request an immediate Agent Insights update. When the token budget is paused, reopen its continuation prompt. |
+| F5 | Clear the current transcript and Agent Insights state. Lifetime request and token counters remain visible. |
+| F9 | Open persistent settings, details, choices, status, warnings, and recent errors. |
+| Q, Esc, or Ctrl+C | Exit from the main screen. |
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Cpu
-```
+Inside F9, use Up/Down to select a setting and Left/Right to change it. F9 or Esc closes the settings list; if values changed, choose Apply or Discard. Page Up, Page Down, Home, and End scroll long settings and diagnostics views.
 
-To use a different model:
+## Transcription and Agent Insights
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Model medium
-```
+The terminal maintains rolling Whisper hypotheses instead of treating each audio interval as an isolated clip. Stable transcript text is reconciled locally and retained as context.
 
-To choose the language before model selection:
+Automatic Agent Insights updates wait for about 1.2 seconds of silence after new text in an Agent-shared audio source instead of issuing requests continuously while speech is active. Updates are consolidated, rate-limited, and based on the newest context; F1 can request an update manually. Agent Insights requires system-output capture, an enabled agent, and a stored API key.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Language auto
-```
+The Responses API requests use `store: false`. System-output transcript text is included when Agent Insights runs. Microphone transcript text remains local unless **Mic context** is enabled in F9.
 
-To tune transcript fading, set the fade duration in seconds:
+### Answer modes
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -FadeSeconds 12
-```
+- **Silhouette** is the default. It returns a short, content-free spoken-answer frame with `...` blanks for the user's own knowledge.
+- **Natural Answer** returns a concise, directly usable answer to the latest question and states uncertainty instead of inventing missing facts.
 
-To choose the OpenAI agent model:
+Changing the answer mode restarts the agent wiring, clears answer content derived from the previous mode, and requests a fresh update.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -AgentModel gpt-5.4-nano
-```
+## Reference context
 
-The startup prompt accepts `nano` for `gpt-5.4-nano` and `mini` for `gpt-5.4-mini`. If no key is stored, the launcher asks whether to store one before the transcription agent starts. Use `-SetupOpenAiKey` to force that setup prompt during launch, or `-NoAgent` to skip agent setup completely.
+Place private UTF-8 `.md`, `.txt`, `.json`, or `.csv` files in `contexts`, beside the tracked `contexts\example.md`. F9 discovers files directly inside that folder and exposes two settings:
 
-To enable transparency without the prompt:
+- **Reference context** selects one file or **None**.
+- **Context strictness** controls how the selected file guides the answer:
+    - **Soft** uses it as helpful background while allowing transcript evidence and reliable general knowledge.
+    - **Strong** treats it as authoritative factual grounding, avoids outside facts, and states when the available context is insufficient.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\run.ps1 -Transparency -TransparencyOpacity 45
-```
+The selected file is loaded fresh and sent in full with every Agent Insights request. Editing it takes effect on the next request without another restart. Files are limited to 32 KiB, both to bound API cost and to prevent accidentally selecting a large export. Missing, empty, unreadable, non-UTF-8, symbolic-link, or oversized files stop before the API call and produce an F9 error.
 
-The same options can be passed through `tukevejtso`:
+Changing the selected file or strictness clears Agent results derived under the old context and requests a fresh update. Document content is sent as untrusted user data; a higher-priority developer policy tells the model never to treat instructions inside the document as prompt instructions. Private context files are ignored by Git, and only `example.md` is tracked. This is lightweight whole-document grounding, not chunked retrieval or full RAG.
+
+## F9 settings
+
+| Group | Settings | Application behavior |
+| --- | --- | --- |
+| Transcription | Transcript fade | Applies immediately. |
+| Transcription | Sources, language, Whisper model, Whisper window | Saved and applied through an automatic worker restart. |
+| Agent | Agent on/off, Agent model, Answer mode, Mic context, Reference context, Context strictness | Saved and applied through an automatic worker restart. |
+| API safeguards | Hidden API pause, hidden exit, idle exit, maximum session, token budget | Applies without restarting capture. |
+| Appearance | Transparency | Applies immediately through the existing terminal-transparency tool. |
+
+Settings that require a restart first prevent new requests, wait for any in-flight request so its usage can be counted, and then restart automatically. Visible transcripts, Agent context, errors, lifecycle timers, and usage counters survive through a launcher-scoped restart state protected with Windows DPAPI. The reference document itself is not copied into that state.
+
+## API and background safeguards
+
+Defaults are designed to limit forgotten background sessions and unexpected token use:
+
+- New API requests pause after the terminal has not been the foreground window for 15 seconds.
+- Local audio capture, Whisper inference, transcript history, and context collection continue while API requests are paused.
+- If terminal visibility cannot be monitored, requests pause immediately and F9 shows a warning. Monitoring recovery resumes from the newest consolidated context without replaying a backlog.
+- The application exits after 15 minutes out of view, 30 minutes without transcript activity, or four hours of total session time.
+- At 100,000 reported API tokens, requests pause and require confirmation before granting another block of the same size. Declining keeps the API paused; F1 reopens the prompt.
+
+Every safeguard can be changed or disabled in F9. Turning Agent Insights off stops remote requests without stopping local transcription.
+
+## Local data and privacy
+
+Plaintext transcript dumps are disabled by default. Enable them only for local debugging with `-TranscriptDump` or `TUKEVEJTSO_TRANSCRIPT_DUMP=1`; enabled dumps use the existing seven-day cleanup policy.
+
+The launcher restores any pre-existing `OPENAI_API_KEY` and `TUKEVEJTSO_TRANSCRIPT_DUMP` environment values when it exits. The client sets `store: false` on every request, but selected transcript and reference-context content still leaves the computer as request input whenever Agent Insights is enabled.
+
+## Launcher options
+
+Options passed through `tk transcription` override saved values for the initial worker. After F9 saves settings, the saved values become authoritative for the automatic restart.
+
+| Option | Purpose |
+| --- | --- |
+| `-Cpu` | Build and run without the CUDA feature. |
+| `-Model <name>` | Select `tiny`, `base`, `small`, `medium`, or an English `.en` variant. |
+| `-Language <code>` | Use a language code or `auto`; English defaults to an `.en` model. |
+| `-FadeSeconds <5-180>` | Override transcript fading for this launch. |
+| `-AgentModel <id>` | Override the OpenAI model ID. |
+| `-NoAgent` | Start with Agent Insights disabled. |
+| `-SetupOpenAiKey` | Run the API-key setup during launch. |
+| `-TranscriptDump` | Opt in to local plaintext transcript dumps. |
+| `-Transparency` | Apply a one-session transparency override; combine with `-TransparencyOpacity` and `-TransparencyBackground`. |
+| `-FullScreen` | Maximize the terminal for this launch. |
+
+Example:
 
 ```cmd
-tk transcription -Transparency -TransparencyOpacity 45
+tk transcription -Cpu -Language auto -Model medium
+```
+
+For direct PowerShell use from this directory:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Cpu
 ```
 
 ## Install dependencies
 
-Run from PowerShell:
+From this directory, run:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\install-dependencies.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-dependencies.ps1
 ```
 
-This installs:
-
-- Rustup / Rust toolchain
-- Visual Studio Build Tools 2022 with the C++ workload
-- CMake
-- Ninja
-- LLVM / libclang for Rust bindgen
-- NVIDIA CUDA Toolkit 12.8
-
-To skip CUDA for a CPU-only setup:
+The installer provides Rustup, Visual Studio Build Tools 2022 with the C++ workload, CMake, Ninja, LLVM/libclang, and NVIDIA CUDA Toolkit 12.8. For a CPU-only setup:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File C:\Work\tukevejtso\windows\agents\enchanted-transcription\install-dependencies.ps1 -SkipCuda
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-dependencies.ps1 -SkipCuda
 ```
+
+Enchanted Transcription and Enhanced Typing are thin binaries over `..\speech-agent-core`. Shared capture, Whisper, transcript reconciliation, API transport, rendering, and lifecycle behavior are implemented in that crate.

@@ -20,6 +20,7 @@ The Windows version starts with the tools we already use locally:
 
 - Docker container helpers.
 - Image tools, including learned background removal into transparent PNGs.
+- Local Whisper transcription and enhanced typing, with optional OpenAI assistance.
 - A Windows Update reboot guard for long trainings and Codex sessions.
 - Small security and terminal diagnostics.
 - A dependency-light terminal rendering layer inspired by the `iinuji` primitives.
