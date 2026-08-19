@@ -77,6 +77,16 @@ $items = @(
         ExitCode = 27
     },
     @{
+        Label = "Docker"
+        Detail = "OpenSim muscle lab"
+        Script = Join-Path $PSScriptRoot "docker-opensim-muscles.ps1"
+    },
+    @{
+        Label = "Caatuu"
+        Detail = "Start server"
+        Script = Join-Path $PSScriptRoot "caatuu-start.ps1"
+    },
+    @{
         Label = "Storage"
         Detail = "Sharing service"
         Script = Join-Path $PSScriptRoot "storage-and-sharing-services.ps1"

@@ -43,6 +43,7 @@ if /I "%~1"=="enchanted-typing" goto enhanced_typing
 if /I "%~1"=="reboot" goto reboot_guard
 if /I "%~1"=="auto-reboot" goto reboot_guard
 if /I "%~1"=="reboots" goto reboot_guard
+if /I "%~1"=="caatuu" goto caatuu_start
 if /I "%~1"=="storage" goto storage_sharing_services
 if /I "%~1"=="sharing" goto storage_sharing_services
 if /I "%~1"=="storage-sharing" goto storage_sharing_services
@@ -88,11 +89,25 @@ echo   tk reboot status           Show Windows Update auto-reboot guard state
 echo   tk reboot toggle           Toggle the auto-reboot guard
 echo   tk reboot disable          Disable auto-reboots while logged in
 echo   tk reboot enable           Allow auto-reboots again
+echo   tk caatuu                  Choose local or tunneled Caatuu startup
+echo   tk caatuu local            Start Caatuu locally
+echo   tk caatuu tunnel           Start Caatuu with its Cloudflare tunnel
+echo   tk caatuu status           Show containers and HTTP endpoint checks
+echo   tk caatuu verify           Verify local and active public endpoints
+echo   tk caatuu stop             Stop Caatuu; keep the shared tunnel
+echo   tk caatuu stop-tunnel      Stop the shared Caatuu/Minerals tunnel
 echo   tk storage                 Choose start/stop/status for storage sharing
 echo   tk storage start           Start the storage and sharing service
 echo   tk storage rebuild         Rebuild its Docker image, then start it
 echo   tk storage status          Show container health and current URLs
 echo   tk storage stop            Stop the storage and sharing service
+goto done
+
+:caatuu_start
+set "CAATUU_ACTION=%~2"
+if "%CAATUU_ACTION%"=="" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\caatuu-start.ps1"
+if "%CAATUU_ACTION%"=="" goto done
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\caatuu-start.ps1" -Action "%CAATUU_ACTION%"
 goto done
 
 :storage_sharing_services
