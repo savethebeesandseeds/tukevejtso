@@ -80,6 +80,7 @@ const TEXT_FULL_INTENSITY: Duration = Duration::from_secs(8);
 const DEFAULT_TEXT_FADE_SECONDS: u64 = 70;
 const TEXT_MIN_INTENSITY: f32 = 0.60;
 const FADE_RENDER_INTERVAL: Duration = Duration::from_secs(2);
+const ERROR_BUFFER_CAPACITY: usize = 6;
 const DEFAULT_AGENT_MODEL: &str = "gpt-5.4-nano";
 const TRANSCRIPTION_RESTART_EXIT_CODE: i32 = 75;
 const AGENT_INSTRUCTIONS_FILE: &str = "agent-instructions.md";
@@ -907,6 +908,8 @@ struct AppState {
     transcription_settings: TranscriptionSettingsState,
     typing: TypingPaneState,
     transcripts: HashMap<SourceKind, TranscriptState>,
+    errors: VecDeque<AppErrorEntry>,
+    error_revision: u64,
     status: String,
     restart_requested: bool,
     started_at: Instant,
@@ -915,6 +918,13 @@ struct AppState {
     agent_token_limit: Option<u64>,
     token_budget_prompt_open: bool,
     token_budget_prompt_dismissed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AppErrorEntry {
+    elapsed: Duration,
+    message: String,
+    repeat_count: u32,
 }
 
 struct AgentPaneState {
@@ -1141,6 +1151,8 @@ impl AppState {
                 last_requested_size: Cell::new(None),
             },
             transcripts: HashMap::new(),
+            errors: VecDeque::with_capacity(ERROR_BUFFER_CAPACITY),
+            error_revision: 0,
             status: "Starting".to_string(),
             restart_requested: false,
             started_at: Instant::now(),
@@ -1170,7 +1182,9 @@ impl AppState {
         block.text = merged;
         self.last_context_activity_at = Instant::now();
         if let Err(err) = self.dump_transcripts() {
-            self.status = format!("transcript dump failed: {err}");
+            let message = format!("Transcript dump failed: {err}");
+            self.status = message.clone();
+            self.record_error(message);
         }
         true
     }
@@ -1183,7 +1197,9 @@ impl AppState {
             return false;
         }
         if let Err(err) = self.dump_transcripts() {
-            self.status = format!("transcript dump failed: {err}");
+            let message = format!("Transcript dump failed: {err}");
+            self.status = message.clone();
+            self.record_error(message);
         }
         true
     }
@@ -1210,8 +1226,37 @@ impl AppState {
         self.last_context_activity_at = Instant::now();
         self.status = "Refreshed".to_string();
         if let Err(err) = self.dump_transcripts() {
-            self.status = format!("transcript dump failed: {err}");
+            let message = format!("Transcript dump failed: {err}");
+            self.status = message.clone();
+            self.record_error(message);
         }
+    }
+
+    fn record_error(&mut self, message: impl Into<String>) {
+        let message = compact_error(message.into().trim(), 240);
+        if message.is_empty() {
+            return;
+        }
+
+        let elapsed = self.started_at.elapsed();
+        if let Some(last) = self.errors.back_mut() {
+            if last.message == message {
+                last.elapsed = elapsed;
+                last.repeat_count = last.repeat_count.saturating_add(1);
+                self.error_revision = self.error_revision.wrapping_add(1);
+                return;
+            }
+        }
+
+        if self.errors.len() == ERROR_BUFFER_CAPACITY {
+            self.errors.pop_front();
+        }
+        self.errors.push_back(AppErrorEntry {
+            elapsed,
+            message,
+            repeat_count: 1,
+        });
+        self.error_revision = self.error_revision.wrapping_add(1);
     }
 
     fn dump_transcripts(&self) -> Result<()> {
@@ -1240,8 +1285,14 @@ impl AppState {
     fn apply(&mut self, event: UiEvent) -> bool {
         match event {
             UiEvent::Status(message) => {
+                let error_recorded = if is_error_status(&message) {
+                    self.record_error(message.clone());
+                    true
+                } else {
+                    false
+                };
                 if is_noisy_status(&message) || self.status == message {
-                    return false;
+                    return error_recorded;
                 }
                 self.status = message;
                 true
@@ -1276,11 +1327,13 @@ impl AppState {
             }
             UiEvent::TranscriptBreak { source } => self.add_transcript_break(source),
             UiEvent::SourceError { source, message } => {
-                self.status = format!(
+                let message = format!(
                     "{} failed: {}",
                     source.display_name(),
                     compact_error(&message, 90)
                 );
+                self.status = message.clone();
+                self.record_error(message);
                 self.agent.set_source_activity(source, false);
                 self.typing.set_source_activity(source, false);
                 true
@@ -1304,7 +1357,8 @@ impl AppState {
             UiEvent::AgentRequestFailed { message } => {
                 self.agent.finish_request();
                 self.agent.record_error(message.clone());
-                self.agent.status = message;
+                self.agent.status = message.clone();
+                self.record_error(format!("Agent request failed: {message}"));
                 true
             }
             UiEvent::AgentOutput {
@@ -1336,7 +1390,8 @@ impl AppState {
                 }
                 self.typing.finish_request();
                 self.typing.record_error(message.clone());
-                self.typing.paste_status = message;
+                self.typing.paste_status = message.clone();
+                self.record_error(format!("Typing request failed: {message}"));
                 true
             }
             UiEvent::TypingOutput {
@@ -1367,7 +1422,8 @@ impl AppState {
                 if self.typing.settings_note.as_deref() == Some(message.as_str()) {
                     return false;
                 }
-                self.typing.settings_note = Some(message);
+                self.typing.settings_note = Some(message.clone());
+                self.record_error(format!("Transparency update failed: {message}"));
                 true
             }
         }
@@ -5162,7 +5218,14 @@ fn render_loop(
 
     loop {
         while let Ok(app_event) = rx.try_recv() {
-            dirty |= state.apply(app_event);
+            let settings_open = state.transcription_settings.open || state.typing.settings_open;
+            let error_revision = state.error_revision;
+            let changed = state.apply(app_event);
+            dirty |= if settings_open {
+                state.error_revision != error_revision
+            } else {
+                changed
+            };
         }
 
         let (lifecycle_changed, automatic_exit) =
@@ -5187,9 +5250,14 @@ fn render_loop(
             dirty |= handle_typing_f1_action(state, &typing_paused) == TypingKeyOutcome::Changed;
         }
 
-        dirty |= state.agent.promote_pending_fields();
+        let promoted_agent_fields = state.agent.promote_pending_fields();
+        if !state.transcription_settings.open && !state.typing.settings_open {
+            dirty |= promoted_agent_fields;
+        }
 
         if state.mode == AppMode::Transcription
+            && !state.transcription_settings.open
+            && !state.token_budget_prompt_open
             && !dirty
             && state.has_fading_content()
             && last_render.elapsed() >= FADE_RENDER_INTERVAL
@@ -5529,8 +5597,10 @@ fn apply_transcription_settings(state: &mut AppState) {
             }
         }
         Err(err) => {
+            let message = format!("Failed to save transcription settings: {err:#}");
             state.transcription_settings.confirm_close = false;
-            state.transcription_settings.note = Some(format!("Failed to save settings: {err:#}"));
+            state.transcription_settings.note = Some(message.clone());
+            state.record_error(message);
         }
     }
 }
@@ -5998,6 +6068,10 @@ fn is_noisy_status(message: &str) -> bool {
         || message.ends_with(" live pass produced no text")
 }
 
+fn is_error_status(message: &str) -> bool {
+    message.starts_with("Whisper failed:")
+}
+
 fn render(state: &AppState) -> Result<()> {
     match state.mode {
         AppMode::Transcription if state.token_budget_prompt_open => {
@@ -6126,10 +6200,9 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
     let (width, height) = terminal::size()?;
     let usable_width = width.saturating_sub(1).max(1) as usize;
     let footer_row = height.saturating_sub(1);
-    let rows = transcription_settings_rows(state, usable_width);
+    let rows = transcription_settings_rows(state, usable_width, footer_row as usize);
     let mut out = io::stdout();
 
-    queue!(out, terminal::Clear(terminal::ClearType::All))?;
     for row in 0..height {
         queue!(out, cursor::MoveTo(0, row))?;
         if row == footer_row {
@@ -6149,7 +6222,11 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn transcription_settings_rows(state: &AppState, width: usize) -> Vec<StyledLine> {
+fn transcription_settings_rows(
+    state: &AppState,
+    width: usize,
+    available_rows: usize,
+) -> Vec<StyledLine> {
     let settings = &state.transcription_settings;
     let pending = &settings.pending;
     let option_rows = vec![
@@ -6193,10 +6270,7 @@ fn transcription_settings_rows(state: &AppState, width: usize) -> Vec<StyledLine
         ),
     ];
 
-    let mut rows = vec![
-        StyledLine::plain("Transcription settings", Color::White),
-        StyledLine::plain("", Color::White),
-    ];
+    let mut rows = vec![StyledLine::plain("Transcription settings", Color::White)];
     for (index, (label, value)) in option_rows.iter().enumerate() {
         let selected = index == settings.selection;
         rows.push(StyledLine::plain(
@@ -6208,14 +6282,21 @@ fn transcription_settings_rows(state: &AppState, width: usize) -> Vec<StyledLine
         ));
     }
 
-    rows.push(StyledLine::plain("", Color::White));
-    rows.push(StyledLine::plain("Selected setting", Color::Yellow));
+    let mut detail_rows = vec![StyledLine::plain("Settings details", Color::Yellow)];
     for line in wrap_plain_text(transcription_setting_help(settings.selection), width.max(1)) {
-        rows.push(StyledLine::plain(line, Color::DarkGrey));
+        detail_rows.push(StyledLine::plain(line, Color::DarkGrey));
+    }
+    detail_rows.push(StyledLine::plain("Choices", Color::Cyan));
+    for line in wrap_choice_list(
+        transcription_setting_choices(settings.selection),
+        width.max(1),
+    ) {
+        detail_rows.push(StyledLine::plain(line, Color::DarkGrey));
     }
 
+    let mut notice_rows = Vec::new();
     if settings.has_restart_changes() {
-        rows.push(StyledLine::plain(
+        notice_rows.push(StyledLine::plain(
             fit_line(
                 "Pending worker changes will restart capture after you apply them.",
                 width.max(1),
@@ -6224,18 +6305,117 @@ fn transcription_settings_rows(state: &AppState, width: usize) -> Vec<StyledLine
         ));
     }
     if let Some(note) = &settings.note {
-        rows.push(StyledLine::plain(
+        notice_rows.push(StyledLine::plain(
             fit_line(note, width.max(1)),
             Color::Yellow,
         ));
     }
     if settings.confirm_close {
-        rows.push(StyledLine::plain(
+        notice_rows.push(StyledLine::plain(
             fit_line("Apply these changes or discard them?", width.max(1)),
             Color::Yellow,
         ));
     }
+
+    if state.errors.is_empty() {
+        rows.push(StyledLine::plain("Recent errors: none", Color::DarkGrey));
+    } else {
+        let reserved_rows = rows.len() + detail_rows.len() + notice_rows.len() + 1;
+        let visible_count = available_rows
+            .saturating_sub(reserved_rows)
+            .max(1)
+            .min(state.errors.len());
+        let heading = if visible_count == state.errors.len() {
+            format!("Recent errors ({})", state.errors.len())
+        } else {
+            format!(
+                "Recent errors (showing {visible_count} of {})",
+                state.errors.len()
+            )
+        };
+        rows.push(StyledLine::plain(heading, Color::Red));
+        for error in state.errors.iter().rev().take(visible_count) {
+            rows.push(StyledLine::plain(
+                fit_line(&format_error_entry(error), width.max(1)),
+                Color::Red,
+            ));
+        }
+    }
+
+    rows.extend(detail_rows);
+    rows.extend(notice_rows);
     rows
+}
+
+fn transcription_setting_choices(selection: usize) -> &'static [&'static str] {
+    match selection {
+        0 => &["5s", "10s", "15s", "...", "180s (5-second steps)"],
+        1 => &["Microphone + system output", "Microphone", "System output"],
+        2 => &[
+            "Auto",
+            "English (en)",
+            "Spanish (es)",
+            "Portuguese (pt)",
+            "French (fr)",
+            "German (de)",
+            "Italian (it)",
+        ],
+        3 => &[
+            "tiny",
+            "base",
+            "small",
+            "medium",
+            "tiny.en",
+            "base.en",
+            "small.en",
+            "medium.en",
+        ],
+        4 => &["6s", "8s", "10s", "12s", "15s", "20s", "30s"],
+        5 | 8 | 9 => &["On", "Off"],
+        6 => &["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"],
+        7 => &["Silhouette", "Natural Answer"],
+        10 => &["Off", "5m", "10m", "15m", "30m", "60m"],
+        11 => &["Off", "15m", "30m", "60m", "120m", "240m"],
+        12 => &["Off", "60m", "120m", "240m", "480m", "720m"],
+        13 => &["Off", "25k", "50k", "100k", "250k", "500k"],
+        _ => &[],
+    }
+}
+
+fn wrap_choice_list(choices: &[&str], width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let prefix = "  ";
+    let separator = "  •  ";
+    let mut lines = Vec::new();
+    let mut current = prefix.to_string();
+
+    for choice in choices {
+        let separator = if current == prefix { "" } else { separator };
+        let addition = format!("{separator}{choice}");
+        if current != prefix && current.chars().count() + addition.chars().count() > width {
+            lines.push(current);
+            current = format!("{prefix}{choice}");
+        } else {
+            current.push_str(&addition);
+        }
+    }
+
+    if current != prefix {
+        lines.push(current);
+    }
+    lines
+}
+
+fn format_error_entry(error: &AppErrorEntry) -> String {
+    let total_seconds = error.elapsed.as_secs();
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    let repeated = if error.repeat_count > 1 {
+        format!(" (x{})", error.repeat_count)
+    } else {
+        String::new()
+    };
+    format!("  [+{minutes:02}:{seconds:02}] {}{repeated}", error.message)
 }
 
 fn transcription_setting_help(selection: usize) -> &'static str {
