@@ -4412,8 +4412,11 @@ fn whisper_loop(
                                 generation: seen_refresh_generation,
                             });
                             if source_updates_agent(source, config.agent.include_microphone) {
-                                stream.agent_update_pending = false;
-                                agent_update_needed = true;
+                                // Committing live transcript text is a UI/storage
+                                // concern, not an API trigger. Keep the newest
+                                // context pending and send it once the source has
+                                // been quiet for SILENCE_BREAK_AFTER.
+                                stream.agent_update_pending = true;
                             }
                         }
                     }
