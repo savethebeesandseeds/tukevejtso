@@ -157,6 +157,38 @@ enum TypingSettingDirection {
     Next,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum TranscriptionAnswerMode {
+    Silhouette,
+    NaturalAnswer,
+}
+
+impl TranscriptionAnswerMode {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Silhouette => "Silhouette",
+            Self::NaturalAnswer => "Natural Answer",
+        }
+    }
+
+    fn request_value(self) -> &'static str {
+        match self {
+            Self::Silhouette => "silhouette",
+            Self::NaturalAnswer => "natural-answer",
+        }
+    }
+
+    fn cycle(self, direction: TypingSettingDirection) -> Self {
+        match (self, direction) {
+            (Self::Silhouette, TypingSettingDirection::Next)
+            | (Self::NaturalAnswer, TypingSettingDirection::Previous) => Self::NaturalAnswer,
+            (Self::NaturalAnswer, TypingSettingDirection::Next)
+            | (Self::Silhouette, TypingSettingDirection::Previous) => Self::Silhouette,
+        }
+    }
+}
+
 const TYPING_REFINER_MODELS: [&str; 3] = ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"];
 const TRANSCRIPTION_LANGUAGE_CHOICES: [&str; 7] = ["auto", "en", "es", "pt", "fr", "de", "it"];
 const TRANSCRIPTION_MODEL_CHOICES: [&str; 8] = [
@@ -350,6 +382,7 @@ struct AgentConfig {
     model: String,
     api_key: Option<String>,
     include_microphone: bool,
+    answer_mode: TranscriptionAnswerMode,
     instructions: String,
     response_schema: Value,
     max_output_tokens: u64,
@@ -364,6 +397,7 @@ impl AgentConfig {
             model: model.into(),
             api_key: None,
             include_microphone: false,
+            answer_mode: default_transcription_answer_mode(),
             instructions: String::new(),
             response_schema: json!({}),
             max_output_tokens: 220,
@@ -425,6 +459,8 @@ struct EnchantedTranscriptionSettings {
     agent_enabled: bool,
     #[serde(default = "default_agent_model_setting")]
     agent_model: String,
+    #[serde(default = "default_transcription_answer_mode")]
+    answer_mode: TranscriptionAnswerMode,
     #[serde(default)]
     include_microphone: bool,
     #[serde(default = "default_pause_when_hidden")]
@@ -449,6 +485,7 @@ impl Default for EnchantedTranscriptionSettings {
             fade_seconds: default_fade_seconds_setting(),
             agent_enabled: default_enabled_setting(),
             agent_model: default_agent_model_setting(),
+            answer_mode: default_transcription_answer_mode(),
             include_microphone: false,
             pause_agent_when_hidden: default_pause_when_hidden(),
             hidden_exit_minutes: default_hidden_exit_minutes(),
@@ -605,6 +642,10 @@ fn default_fade_seconds_setting() -> u64 {
 
 fn default_agent_model_setting() -> String {
     DEFAULT_AGENT_MODEL.to_string()
+}
+
+fn default_transcription_answer_mode() -> TranscriptionAnswerMode {
+    TranscriptionAnswerMode::Silhouette
 }
 
 fn default_pause_when_hidden() -> bool {
@@ -912,6 +953,7 @@ struct TranscriptionRestartSettings {
     chunk_seconds: usize,
     agent_enabled: bool,
     agent_model: String,
+    answer_mode: TranscriptionAnswerMode,
     include_microphone: bool,
     pause_agent_when_hidden: bool,
     hidden_exit_minutes: u64,
@@ -1383,6 +1425,7 @@ impl TranscriptionSettingsState {
             || self.pending.chunk_seconds != self.active.chunk_seconds
             || self.pending.agent_enabled != self.active.agent_enabled
             || self.pending.agent_model != self.active.agent_model
+            || self.pending.answer_mode != self.active.answer_mode
             || self.pending.include_microphone != self.active.include_microphone
     }
 
@@ -1395,6 +1438,7 @@ impl TranscriptionSettingsState {
             fade_seconds: fade_duration.as_secs(),
             agent_enabled: self.pending.agent_enabled,
             agent_model: self.pending.agent_model.clone(),
+            answer_mode: self.pending.answer_mode,
             include_microphone: self.pending.include_microphone,
             pause_agent_when_hidden: self.pending.pause_agent_when_hidden,
             hidden_exit_minutes: self.pending.hidden_exit_minutes,
@@ -1415,6 +1459,7 @@ impl TranscriptionRestartSettings {
             chunk_seconds: settings.chunk_seconds,
             agent_enabled: settings.agent_enabled,
             agent_model: settings.agent_model.clone(),
+            answer_mode: settings.answer_mode,
             include_microphone: settings.include_microphone,
             pause_agent_when_hidden: settings.pause_agent_when_hidden,
             hidden_exit_minutes: settings.hidden_exit_minutes,
@@ -2617,12 +2662,20 @@ fn build_transcription_agent_config(
 
     let include_microphone =
         settings.include_microphone && sources.contains(&SourceKind::Microphone);
-    let agent_context = load_agent_context(agent_root)?;
+    let mut agent_context = load_agent_context(agent_root)?;
+    if let Some(answer_field) = agent_context
+        .fields
+        .iter_mut()
+        .find(|field| field.key == "answer_guidance")
+    {
+        answer_field.title = settings.answer_mode.display_name().to_string();
+    }
     Ok(AgentConfig {
         enabled: true,
         model: settings.agent_model.clone(),
         api_key: Some(api_key),
         include_microphone,
+        answer_mode: settings.answer_mode,
         instructions: agent_context.instructions,
         response_schema: agent_context.response_schema,
         max_output_tokens: agent_context.max_output_tokens,
@@ -3921,6 +3974,7 @@ fn build_agent_request_body(
     });
 
     let payload = json!({
+        "answer_mode": config.answer_mode.request_value(),
         "current_agent_state": current_state,
         "transcript_context": {
             "system_output_transcript": recent_chars(&input.system_transcript, AGENT_CONTEXT_CHARS),
@@ -5482,7 +5536,7 @@ fn apply_transcription_settings(state: &mut AppState) {
 }
 
 fn transcription_settings_option_count() -> usize {
-    13
+    14
 }
 
 fn change_transcription_setting(
@@ -5534,30 +5588,31 @@ fn change_transcription_setting(
                 direction,
             )
         }
-        7 => settings.pending.include_microphone = !settings.pending.include_microphone,
-        8 => settings.pending.pause_agent_when_hidden = !settings.pending.pause_agent_when_hidden,
-        9 => {
+        7 => settings.pending.answer_mode = settings.pending.answer_mode.cycle(direction),
+        8 => settings.pending.include_microphone = !settings.pending.include_microphone,
+        9 => settings.pending.pause_agent_when_hidden = !settings.pending.pause_agent_when_hidden,
+        10 => {
             settings.pending.hidden_exit_minutes = cycle_u64_choice(
                 settings.pending.hidden_exit_minutes,
                 &HIDDEN_EXIT_MINUTE_CHOICES,
                 direction,
             )
         }
-        10 => {
+        11 => {
             settings.pending.idle_exit_minutes = cycle_u64_choice(
                 settings.pending.idle_exit_minutes,
                 &IDLE_EXIT_MINUTE_CHOICES,
                 direction,
             )
         }
-        11 => {
+        12 => {
             settings.pending.max_session_minutes = cycle_u64_choice(
                 settings.pending.max_session_minutes,
                 &SESSION_MINUTE_CHOICES,
                 direction,
             )
         }
-        12 => {
+        13 => {
             settings.pending.agent_token_budget = cycle_u64_choice(
                 settings.pending.agent_token_budget,
                 &AGENT_TOKEN_BUDGET_CHOICES,
@@ -6115,6 +6170,10 @@ fn transcription_settings_rows(state: &AppState, width: usize) -> Vec<StyledLine
         ("Agent", on_off(pending.agent_enabled).to_string()),
         ("Agent model", pending.agent_model.clone()),
         (
+            "Answer mode",
+            pending.answer_mode.display_name().to_string(),
+        ),
+        (
             "Mic context",
             on_off(pending.include_microphone).to_string(),
         ),
@@ -6188,12 +6247,13 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         4 => "Controls the rolling audio context sent to local Whisper. Longer windows preserve context but increase inference work and latency; changing it restarts.",
         5 => "Enables the remote insight pane. Local capture and Whisper continue when this is off; applying the change restarts agent wiring.",
         6 => "Selects the OpenAI model used for insight updates. Model choice affects latency, quality, and API cost; changing it restarts agent wiring.",
-        7 => "Allows microphone transcript text to be included in API context. Off keeps local speech out of remote requests; changing it restarts agent wiring.",
-        8 => "Stops only new API requests while this terminal is hidden, minimized, cloaked, or invalid. Audio capture, Whisper, and context buffering continue locally.",
-        9 => "Closes the application after it remains hidden for this long. Off disables this shutdown rule; API pausing can still happen immediately.",
-        10 => "Closes the application after no transcript changes for this long. Off allows an idle visible session to remain open indefinitely.",
-        11 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
-        12 => "Pauses new insight requests at this reported API-token threshold and asks before granting another block of the same size. Local transcription and context collection keep running; Off removes the prompt and cap.",
+        7 => "Silhouette returns a content-free answer frame with blanks for your own knowledge. Natural Answer returns a concise, directly usable answer. Changing modes restarts agent wiring.",
+        8 => "Allows microphone transcript text to be included in API context. Off keeps local speech out of remote requests; changing it restarts agent wiring.",
+        9 => "Stops only new API requests while this terminal is hidden, minimized, cloaked, or invalid. Audio capture, Whisper, and context buffering continue locally.",
+        10 => "Closes the application after it remains hidden for this long. Off disables this shutdown rule; API pausing can still happen immediately.",
+        11 => "Closes the application after no transcript changes for this long. Off allows an idle visible session to remain open indefinitely.",
+        12 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
+        13 => "Pauses new insight requests at this reported API-token threshold and asks before granting another block of the same size. Local transcription and context collection keep running; Off removes the prompt and cap.",
         _ => "",
     }
 }
