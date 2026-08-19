@@ -989,6 +989,7 @@ struct RawAgentFieldConfig {
 struct AudioFrame {
     source: SourceKind,
     samples: Vec<f32>,
+    captured_at: Instant,
 }
 
 enum UiEvent {
@@ -1173,6 +1174,163 @@ impl StreamingSourceState {
         set_prompt(&mut self.prompt, &history_text);
         true
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_silenced_stream(
+    ctx: &WhisperContext,
+    source: SourceKind,
+    stream: &mut StreamingSourceState,
+    typing_mode: bool,
+    is_typing_source: bool,
+    language: Option<&str>,
+    include_microphone: bool,
+    ui_tx: &Sender<UiEvent>,
+    generation: u64,
+) -> Result<(bool, Option<String>)> {
+    if stream.best_text.trim().is_empty() && !stream.samples.is_empty() {
+        let minimum_samples = if is_typing_source {
+            SAMPLE_RATE / 4
+        } else {
+            CAPTURE_FRAMES_PER_PACKET
+        };
+        if stream.samples.len() >= minimum_samples {
+            let final_energy = rms(&stream.samples);
+            let mut final_window = stream.samples.clone();
+            if !is_typing_source && final_window.len() < SAMPLE_RATE {
+                // A little trailing silence gives Whisper enough acoustic context
+                // to decode a single short word without delaying the live path.
+                final_window.resize(SAMPLE_RATE, 0.0);
+            }
+            let started = Instant::now();
+            let text = transcribe_chunk(
+                ctx,
+                &final_window,
+                language,
+                whisper_prompt_for_mode(typing_mode, stream),
+            )?
+            .trim()
+            .to_string();
+            let elapsed_ms = started.elapsed().as_millis();
+            if !text.is_empty() {
+                let merged_text = merge_transcript_estimate(&stream.best_text, &text);
+                let text_changed = stream.best_text.trim() != merged_text.trim();
+                if text_changed {
+                    stream.best_text = merged_text.clone();
+                    stream.pending_commit = merged_text.clone();
+                    if source_updates_agent(source, include_microphone) {
+                        stream.agent_update_pending = true;
+                    }
+                }
+                if !typing_mode {
+                    let _ = ui_tx.send(UiEvent::Transcript {
+                        source,
+                        text: merged_text,
+                        elapsed_ms,
+                        rms: final_energy,
+                        generation,
+                    });
+                }
+            }
+        }
+    }
+
+    let should_send_agent_update =
+        source_updates_agent(source, include_microphone) && stream.agent_update_pending;
+    let completed_typing_text = if is_typing_source {
+        typing_submission_text(stream).filter(|value| should_submit_typing(value))
+    } else {
+        None
+    };
+
+    stream.voice_active = false;
+    let _ = ui_tx.send(UiEvent::SourceActivity {
+        source,
+        active: false,
+    });
+    let finished_block = stream.finish_current_block();
+    if finished_block {
+        let _ = ui_tx.send(UiEvent::TranscriptBreak { source, generation });
+    }
+    stream.agent_update_pending = false;
+
+    Ok((
+        should_send_agent_update,
+        finished_block.then_some(completed_typing_text).flatten(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_due_streams(
+    ctx: &WhisperContext,
+    streams: &mut HashMap<SourceKind, StreamingSourceState>,
+    reference_time: Instant,
+    silence_break_after: Duration,
+    typing_mode: bool,
+    selected_typing_source: SourceKind,
+    language: Option<&str>,
+    include_microphone: bool,
+    ui_tx: &Sender<UiEvent>,
+    agent_tx: &Option<Sender<AgentInput>>,
+    typing_tx: &Option<Sender<TypingInput>>,
+    generation: u64,
+) -> Result<()> {
+    let silenced_sources = streams
+        .iter()
+        .filter_map(|(source, stream)| {
+            let source_is_selected = !typing_mode || *source == selected_typing_source;
+            let silence_elapsed = stream_silence_elapsed(
+                stream.voice_active,
+                stream.last_voice_at,
+                reference_time,
+                silence_break_after,
+            );
+            (source_is_selected && silence_elapsed).then_some(*source)
+        })
+        .collect::<Vec<_>>();
+
+    let mut agent_update_needed = false;
+    let mut typing_updates = Vec::new();
+    for source in silenced_sources {
+        let stream = streams
+            .get_mut(&source)
+            .expect("silenced source should still have streaming state");
+        let (source_agent_update, typing_update) = flush_silenced_stream(
+            ctx,
+            source,
+            stream,
+            typing_mode,
+            typing_mode && source == selected_typing_source,
+            language,
+            include_microphone,
+            ui_tx,
+            generation,
+        )?;
+        agent_update_needed |= source_agent_update;
+        if let Some(text) = typing_update {
+            typing_updates.push(text);
+        }
+    }
+
+    if agent_update_needed {
+        send_agent_update(agent_tx, streams, include_microphone, false, generation);
+    }
+    for raw_text in typing_updates {
+        send_typing_update(typing_tx, raw_text, generation);
+    }
+    Ok(())
+}
+
+fn stream_silence_elapsed(
+    voice_active: bool,
+    last_voice_at: Option<Instant>,
+    reference_time: Instant,
+    silence_break_after: Duration,
+) -> bool {
+    voice_active
+        && last_voice_at.is_some_and(|last_voice_at| {
+            reference_time.saturating_duration_since(last_voice_at) >= silence_break_after
+        })
 }
 
 struct AppState {
@@ -4342,7 +4500,15 @@ fn capture_loop(
                 }
             }
             let samples = f32_samples_from_bytes(&bytes);
-            if !samples.is_empty() && tx.send(AudioFrame { source, samples }).is_err() {
+            if !samples.is_empty()
+                && tx
+                    .send(AudioFrame {
+                        source,
+                        samples,
+                        captured_at: Instant::now(),
+                    })
+                    .is_err()
+            {
                 break 'capture;
             }
         }
@@ -4521,6 +4687,7 @@ fn whisper_loop(
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
                 let source = frame.source;
+                let frame_captured_at = frame.captured_at;
                 let selected_typing_source =
                     current_typing_input_source(&typing_input_source, SourceKind::Microphone);
                 if typing_mode && source != selected_typing_source {
@@ -4545,15 +4712,12 @@ fn whisper_loop(
                 }
 
                 let frame_energy = rms(&frame.samples);
-                let now = Instant::now();
-                let mut agent_update_needed = false;
-                let mut typing_update: Option<String> = None;
+                let mut skip_frame = false;
                 {
                     let stream = streams
                         .get_mut(&source)
                         .ok_or_else(|| anyhow!("received audio for disabled source"))?;
 
-                    let mut skip_frame = false;
                     if frame_energy >= SILENCE_RMS {
                         if !stream.voice_active {
                             stream.voice_active = true;
@@ -4562,184 +4726,152 @@ fn whisper_loop(
                                 active: true,
                             });
                         }
-                        stream.last_voice_at = Some(now);
-                    } else {
-                        let silence_elapsed = stream
-                            .last_voice_at
-                            .map(|last_voice_at| {
-                                now.saturating_duration_since(last_voice_at) >= silence_break_after
-                            })
-                            .unwrap_or(false);
-
-                        if silence_elapsed && stream.voice_active {
-                            stream.voice_active = false;
-                            let _ = ui_tx.send(UiEvent::SourceActivity {
-                                source,
-                                active: false,
-                            });
-                        }
-
-                        let is_typing_source = typing_mode && source == selected_typing_source;
-                        let silence_break = silence_elapsed
-                            && (!stream.best_text.trim().is_empty()
-                                || (is_typing_source && !stream.samples.is_empty()));
-
-                        if silence_break {
-                            let should_send_agent_update =
-                                source_updates_agent(source, config.agent.include_microphone)
-                                    && stream.agent_update_pending;
-                            if is_typing_source && stream.best_text.trim().is_empty() {
-                                let final_window = stream.samples.clone();
-                                if final_window.len() >= SAMPLE_RATE / 4 {
-                                    let text = transcribe_chunk(
-                                        &ctx,
-                                        &final_window,
-                                        config.language.as_deref(),
-                                        whisper_prompt_for_mode(typing_mode, stream),
-                                    )?
-                                    .trim()
-                                    .to_string();
-                                    if !text.is_empty() {
-                                        stream.best_text =
-                                            merge_transcript_estimate(&stream.best_text, &text);
-                                    }
-                                }
-                            }
-                            let completed_typing_text = if is_typing_source {
-                                let text = typing_submission_text(stream);
-                                text.filter(|value| should_submit_typing(value))
-                            } else {
-                                None
-                            };
-                            if stream.finish_current_block() {
-                                let _ = ui_tx.send(UiEvent::TranscriptBreak {
-                                    source,
-                                    generation: seen_refresh_generation,
-                                });
-                                if let Some(text) = completed_typing_text {
-                                    typing_update = Some(text);
-                                }
-                            }
-                            stream.agent_update_pending = false;
-                            agent_update_needed = should_send_agent_update;
-                            skip_frame = true;
-                        } else if stream.best_text.trim().is_empty() {
-                            skip_frame = true;
-                        }
+                        stream.last_voice_at = Some(frame_captured_at);
+                    } else if stream.best_text.trim().is_empty() {
+                        // Keep the voiced samples, but do not dilute a short utterance
+                        // with silence while it waits for its bounded final pass.
+                        skip_frame = true;
                     }
 
-                    if skip_frame {
-                        // Agent updates are sent after the mutable stream borrow ends.
-                    } else {
+                    if !skip_frame {
                         stream.samples.extend(frame.samples);
 
                         if stream.samples.len() > window_samples {
                             let excess = stream.samples.len() - window_samples;
                             stream.samples.drain(..excess);
                         }
+                    }
+                }
 
-                        if stream.samples.len() < min_stream_samples
-                            || stream.last_pass.elapsed() < partial_interval
-                        {
-                            continue;
-                        }
+                if !typing_mode || !typing_paused.load(Ordering::SeqCst) {
+                    flush_due_streams(
+                        &ctx,
+                        &mut streams,
+                        frame_captured_at,
+                        silence_break_after,
+                        typing_mode,
+                        selected_typing_source,
+                        config.language.as_deref(),
+                        config.agent.include_microphone,
+                        &ui_tx,
+                        &agent_tx,
+                        &typing_tx,
+                        seen_refresh_generation,
+                    )?;
+                }
 
-                        let window = stream.samples.clone();
-                        let energy = rms(&window);
+                if !skip_frame {
+                    let stream = streams
+                        .get_mut(&source)
+                        .ok_or_else(|| anyhow!("received audio for disabled source"))?;
 
-                        if energy < SILENCE_RMS {
-                            stream.last_pass = Instant::now();
-                            let _ = ui_tx.send(UiEvent::Status(format!(
-                                "{} listening, rms {:.4}",
-                                source.display_name(),
-                                energy
-                            )));
-                            continue;
-                        }
+                    if stream.samples.len() < min_stream_samples
+                        || stream.last_pass.elapsed() < partial_interval
+                    {
+                        continue;
+                    }
 
+                    let window = stream.samples.clone();
+                    let energy = rms(&window);
+
+                    if energy < SILENCE_RMS {
+                        stream.last_pass = Instant::now();
                         let _ = ui_tx.send(UiEvent::Status(format!(
-                            "Refreshing {} live transcript",
+                            "{} listening, rms {:.4}",
+                            source.display_name(),
+                            energy
+                        )));
+                        continue;
+                    }
+
+                    let _ = ui_tx.send(UiEvent::Status(format!(
+                        "Refreshing {} live transcript",
+                        source.display_name()
+                    )));
+                    let started = Instant::now();
+                    let text = transcribe_chunk(
+                        &ctx,
+                        &window,
+                        config.language.as_deref(),
+                        whisper_prompt_for_mode(typing_mode, stream),
+                    )?
+                    .trim()
+                    .to_string();
+                    let elapsed_ms = started.elapsed().as_millis();
+                    stream.last_pass = Instant::now();
+
+                    if text.is_empty() {
+                        let _ = ui_tx.send(UiEvent::Status(format!(
+                            "{} live pass produced no text",
                             source.display_name()
                         )));
-                        let started = Instant::now();
-                        let text = transcribe_chunk(
-                            &ctx,
-                            &window,
-                            config.language.as_deref(),
-                            whisper_prompt_for_mode(typing_mode, stream),
-                        )?
-                        .trim()
-                        .to_string();
-                        let elapsed_ms = started.elapsed().as_millis();
-                        stream.last_pass = Instant::now();
+                        continue;
+                    }
 
-                        if text.is_empty() {
-                            let _ = ui_tx.send(UiEvent::Status(format!(
-                                "{} live pass produced no text",
-                                source.display_name()
-                            )));
-                            continue;
+                    let merged_text = merge_transcript_estimate(&stream.best_text, &text);
+                    let text_changed = stream.best_text.trim() != merged_text.trim();
+                    if text_changed {
+                        stream.best_text = merged_text.clone();
+                        stream.pending_commit = merged_text.clone();
+                        if source_updates_agent(source, config.agent.include_microphone) {
+                            stream.agent_update_pending = true;
                         }
+                    }
 
-                        let merged_text = merge_transcript_estimate(&stream.best_text, &text);
-                        let text_changed = stream.best_text.trim() != merged_text.trim();
-                        if text_changed {
-                            stream.best_text = merged_text.clone();
-                            stream.pending_commit = merged_text.clone();
-                            if source_updates_agent(source, config.agent.include_microphone) {
-                                stream.agent_update_pending = true;
-                            }
-                        }
+                    let _ = ui_tx.send(UiEvent::PartialTranscript {
+                        source,
+                        text: merged_text,
+                        elapsed_ms,
+                        rms: energy,
+                        generation: seen_refresh_generation,
+                    });
 
-                        let _ = ui_tx.send(UiEvent::PartialTranscript {
+                    if stream.last_commit.elapsed() >= STREAM_COMMIT_INTERVAL
+                        && !stream.pending_commit.trim().is_empty()
+                    {
+                        let committed = stream.pending_commit.trim().to_string();
+                        stream.pending_commit.clear();
+                        stream.last_commit = Instant::now();
+                        let full_text = stream.full_text();
+                        set_prompt(&mut stream.prompt, &full_text);
+
+                        let _ = ui_tx.send(UiEvent::Transcript {
                             source,
-                            text: merged_text,
+                            text: committed,
                             elapsed_ms,
                             rms: energy,
                             generation: seen_refresh_generation,
                         });
-
-                        if stream.last_commit.elapsed() >= STREAM_COMMIT_INTERVAL
-                            && !stream.pending_commit.trim().is_empty()
-                        {
-                            let committed = stream.pending_commit.trim().to_string();
-                            stream.pending_commit.clear();
-                            stream.last_commit = Instant::now();
-                            let full_text = stream.full_text();
-                            set_prompt(&mut stream.prompt, &full_text);
-
-                            let _ = ui_tx.send(UiEvent::Transcript {
-                                source,
-                                text: committed,
-                                elapsed_ms,
-                                rms: energy,
-                                generation: seen_refresh_generation,
-                            });
-                            if source_updates_agent(source, config.agent.include_microphone) {
-                                // Committing live transcript text is a UI/storage
-                                // concern, not an API trigger. Keep the newest
-                                // context pending and send it once the source has
-                                // been quiet for SILENCE_BREAK_AFTER.
-                                stream.agent_update_pending = true;
-                            }
+                        if source_updates_agent(source, config.agent.include_microphone) {
+                            // Committing live transcript text is a UI/storage
+                            // concern, not an API trigger. Keep the newest
+                            // context pending and send it once the source has
+                            // been quiet for SILENCE_BREAK_AFTER.
+                            stream.agent_update_pending = true;
                         }
                     }
                 }
-
-                if agent_update_needed {
-                    send_agent_update(
-                        &agent_tx,
-                        &streams,
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let selected_typing_source =
+                    current_typing_input_source(&typing_input_source, SourceKind::Microphone);
+                if !typing_mode || !typing_paused.load(Ordering::SeqCst) {
+                    flush_due_streams(
+                        &ctx,
+                        &mut streams,
+                        Instant::now(),
+                        silence_break_after,
+                        typing_mode,
+                        selected_typing_source,
+                        config.language.as_deref(),
                         config.agent.include_microphone,
-                        false,
+                        &ui_tx,
+                        &agent_tx,
+                        &typing_tx,
                         seen_refresh_generation,
-                    );
-                }
-                if let Some(raw_text) = typing_update {
-                    send_typing_update(&typing_tx, raw_text, seen_refresh_generation);
+                    )?;
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -9893,14 +10025,15 @@ mod tests {
         canonical_agent_result, extract_agent_config_block, extract_agent_usage,
         extract_response_text, fade_intensity, format_byte_size, is_informative_text,
         merge_transcript_estimate, min_typing_status_width, new_text_since, parse_agent_config,
-        serialized_json_bytes, source_updates_agent, styled_line_width, typable_key_for_char,
-        typing_desired_width, typing_display_text, typing_layout, typing_safe_row_width,
-        typing_submission_text, typing_window_width, wrap_plain_text, AgentConfig, AgentInput,
-        AgentUsage, AppConfig, AppMode, EnhancedTypingSettings, SourceKind, StreamingSourceState,
-        TranscriptState, TranscriptWord, TypingConfig, TypingFlushMode,
-        TypingTransparencyBackground, DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE, TEXT_MIN_INTENSITY,
-        TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH, TYPING_REFINER_MODELS,
-        TYPING_RIGHT_GUTTER_COLS, TYPING_SPEED_PRESETS, TYPING_TRANSPARENCY_PRESETS,
+        serialized_json_bytes, source_updates_agent, stream_silence_elapsed, styled_line_width,
+        typable_key_for_char, typing_desired_width, typing_display_text, typing_layout,
+        typing_safe_row_width, typing_submission_text, typing_window_width, wrap_plain_text,
+        AgentConfig, AgentInput, AgentUsage, AppConfig, AppMode, EnhancedTypingSettings,
+        SourceKind, StreamingSourceState, TranscriptState, TranscriptWord, TypingConfig,
+        TypingFlushMode, TypingTransparencyBackground, DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE,
+        SILENCE_BREAK_AFTER, TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH,
+        TYPING_REFINER_MODELS, TYPING_RIGHT_GUTTER_COLS, TYPING_SPEED_PRESETS,
+        TYPING_TRANSPARENCY_PRESETS,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -10700,5 +10833,31 @@ After.
             generation: 0,
         }));
         assert!(state.transcripts.is_empty());
+    }
+
+    #[test]
+    fn short_utterance_reaches_silence_flush_deadline() {
+        let last_voice_at = Instant::now();
+        let before_deadline = last_voice_at + SILENCE_BREAK_AFTER - Duration::from_millis(1);
+        let at_deadline = last_voice_at + SILENCE_BREAK_AFTER;
+
+        assert!(!stream_silence_elapsed(
+            true,
+            Some(last_voice_at),
+            before_deadline,
+            SILENCE_BREAK_AFTER,
+        ));
+        assert!(stream_silence_elapsed(
+            true,
+            Some(last_voice_at),
+            at_deadline,
+            SILENCE_BREAK_AFTER,
+        ));
+        assert!(!stream_silence_elapsed(
+            false,
+            Some(last_voice_at),
+            at_deadline,
+            SILENCE_BREAK_AFTER,
+        ));
     }
 }
