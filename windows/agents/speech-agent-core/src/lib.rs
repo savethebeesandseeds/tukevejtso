@@ -9120,11 +9120,14 @@ fn agent_error_rows(message: &str, width: usize, max_lines: usize) -> Vec<Styled
         return rows;
     }
 
-    let wrapped = wrap_plain_text(message.trim(), width.clamp(1, 72))
+    let indent_width = 4usize.min(width.saturating_sub(1));
+    let indent = " ".repeat(indent_width);
+    let body_width = width.saturating_sub(indent_width).clamp(1, 72);
+    let wrapped = wrap_plain_text(message.trim(), body_width)
         .into_iter()
         .map(|line| {
             StyledLine::plain(
-                line.trim().to_string(),
+                format!("{indent}{}", line.trim()),
                 Color::Rgb {
                     r: 255,
                     g: 120,
@@ -9173,16 +9176,18 @@ fn agent_field_rows(
 }
 
 fn wrap_agent_lines(values: &[String], width: usize) -> Vec<String> {
-    let usable_width = width.clamp(1, 72);
+    let indent_width = 4usize.min(width.saturating_sub(1));
+    let indent = " ".repeat(indent_width);
+    let usable_width = width.saturating_sub(indent_width).clamp(1, 72);
     let mut output = Vec::new();
     for line in values {
         for wrapped in wrap_plain_text(line.trim(), usable_width) {
-            output.push(wrapped.trim().to_string());
+            output.push(format!("{indent}{}", wrapped.trim()));
         }
     }
 
     if output.is_empty() {
-        output.push(String::new());
+        output.push(indent);
     }
     output
 }
