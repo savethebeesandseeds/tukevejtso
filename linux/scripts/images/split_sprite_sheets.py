@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import sys
@@ -171,6 +172,33 @@ def clamp_bbox(
         min(width, right + padding),
         min(height, bottom + padding),
     )
+
+
+def restore_clamped_padding(
+    crop: Image.Image,
+    *,
+    bbox: tuple[int, int, int, int],
+    padded_bbox: tuple[int, int, int, int],
+    padding: int,
+) -> tuple[Image.Image, tuple[int, int, int, int]]:
+    left, top, right, bottom = bbox
+    padded_left, padded_top, padded_right, padded_bottom = padded_bbox
+    missing = (
+        max(0, padding - (left - padded_left)),
+        max(0, padding - (top - padded_top)),
+        max(0, padding - (padded_right - right)),
+        max(0, padding - (padded_bottom - bottom)),
+    )
+    missing_left, missing_top, missing_right, missing_bottom = missing
+    if not any(missing):
+        return crop, missing
+    canvas = Image.new(
+        "RGBA",
+        (crop.width + missing_left + missing_right, crop.height + missing_top + missing_bottom),
+        (0, 0, 0, 0),
+    )
+    canvas.alpha_composite(crop, (missing_left, missing_top))
+    return canvas, missing
 
 
 def union_bbox(
@@ -489,7 +517,42 @@ def save_repacked(
         checker.convert("RGB").save(checker_preview, quality=95)
 
 
-def safe_clean_dir(path: Path, *, input_dir: Path) -> None:
+def save_contact_sheet(
+    previews: list[Path],
+    output: Path,
+    *,
+    columns: int = 3,
+    max_preview_size: tuple[int, int] = (640, 640),
+) -> None:
+    if not previews:
+        return
+    font = ImageFont.load_default()
+    label_height = 28
+    cell_width = max_preview_size[0]
+    cell_height = max_preview_size[1] + label_height
+    rows = math.ceil(len(previews) / columns)
+    contact = Image.new("RGB", (columns * cell_width, rows * cell_height), (34, 34, 34))
+    draw = ImageDraw.Draw(contact)
+
+    for index, preview_path in enumerate(previews):
+        with Image.open(preview_path) as source:
+            preview = source.convert("RGB")
+        preview.thumbnail(max_preview_size, Image.Resampling.LANCZOS)
+        col = index % columns
+        row = index // columns
+        cell_x = col * cell_width
+        cell_y = row * cell_height
+        image_x = cell_x + (cell_width - preview.width) // 2
+        image_y = cell_y + (max_preview_size[1] - preview.height) // 2
+        contact.paste(preview, (image_x, image_y))
+        label = preview_path.name.removesuffix("_repacked_preview.jpg")
+        draw.text((cell_x + 8, cell_y + max_preview_size[1] + 8), label, fill=(235, 235, 235), font=font)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    contact.save(output, quality=92)
+
+
+def validate_clean_dir(path: Path, *, input_dir: Path) -> Path:
     resolved = path.resolve()
     input_resolved = input_dir.resolve()
     forbidden = {
@@ -502,10 +565,32 @@ def safe_clean_dir(path: Path, *, input_dir: Path) -> None:
         raise RuntimeError(f"Refusing to clean unsafe output directory: {path}")
     if input_resolved in resolved.parents:
         raise RuntimeError(f"Refusing to clean an output directory inside the input tree: {path}")
+    if resolved in input_resolved.parents:
+        raise RuntimeError(f"Refusing to clean an ancestor of the input directory: {path}")
     if path.exists() and path.is_symlink():
         raise RuntimeError(f"Refusing to clean symlink output directory: {path}")
     if path.exists() and not path.is_dir():
         raise RuntimeError(f"Output path exists and is not a directory: {path}")
+    return resolved
+
+
+def validate_clean_targets(paths: list[Path], *, input_dir: Path) -> None:
+    resolved_paths = [(path, validate_clean_dir(path, input_dir=input_dir)) for path in paths]
+    for index, (left_path, left_resolved) in enumerate(resolved_paths):
+        for right_path, right_resolved in resolved_paths[index + 1 :]:
+            if (
+                left_resolved == right_resolved
+                or left_resolved in right_resolved.parents
+                or right_resolved in left_resolved.parents
+            ):
+                raise RuntimeError(
+                    "Refusing to clean overlapping output directories: "
+                    f"{left_path} and {right_path}"
+                )
+
+
+def safe_clean_dir(path: Path, *, input_dir: Path) -> None:
+    validate_clean_dir(path, input_dir=input_dir)
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -575,6 +660,12 @@ def split_sheet(
         crop_arr = np.asarray(crop, dtype=np.uint8).copy()
         crop_arr[slot_alpha == 0, :3] = 0
         crop = Image.fromarray(crop_arr, "RGBA")
+        crop, restored_padding = restore_clamped_padding(
+            crop,
+            bbox=slot.bbox,
+            padded_bbox=padded,
+            padding=args.padding,
+        )
         name = f"{args.prefix}_{next_index:0{args.digits}d}.png"
         output = args.output_dir / name
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -590,6 +681,8 @@ def split_sheet(
                 "col": slot.col + 1,
                 "bbox": list(slot.bbox),
                 "padded_bbox": list(padded),
+                "restored_padding": list(restored_padding),
+                "output_size": [crop.width, crop.height],
                 "area": slot.area,
                 "components": slot.components,
                 "mask_engine": engine_used,
@@ -671,11 +764,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"Input directory not found: {args.input_dir}")
 
     if args.clean_output:
-        safe_clean_dir(args.output_dir, input_dir=args.input_dir)
+        clean_targets = [args.output_dir]
         if args.repack_dir is not None:
-            safe_clean_dir(args.repack_dir, input_dir=args.input_dir)
+            clean_targets.append(args.repack_dir)
         if args.preview_dir is not None:
-            safe_clean_dir(args.preview_dir, input_dir=args.input_dir)
+            clean_targets.append(args.preview_dir)
+        validate_clean_targets(clean_targets, input_dir=args.input_dir)
+        for target in clean_targets:
+            safe_clean_dir(target, input_dir=args.input_dir)
     else:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         if args.repack_dir is not None:
@@ -697,6 +793,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{input_path.name}: wrote {len(records)} sprites")
         for warning in warnings:
             print(f"Warning: {warning}", file=sys.stderr)
+
+    if args.preview_dir is not None and args.repack_dir is not None:
+        repacked_previews = [
+            args.preview_dir / f"{input_path.stem}_repacked_preview.jpg" for input_path in inputs
+        ]
+        save_contact_sheet(
+            repacked_previews,
+            args.preview_dir / "_repacked_contact_sheet.jpg",
+        )
 
     manifest = {
         "input_dir": str(args.input_dir),

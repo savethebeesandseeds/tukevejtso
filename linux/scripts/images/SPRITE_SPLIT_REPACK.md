@@ -19,6 +19,8 @@ go into sibling folders such as `split`, `repacked`, and `split_previews`.
    lanterns, floating parts, and small props to the nearest/overlapping main
    object instead of blindly assigning them to the nearest grid anchor.
 5. Crops each sprite with padding.
+   If a sprite is close to a source-sheet edge, transparent canvas is added so
+   the requested padding remains consistent instead of being lost to clamping.
 6. Writes isolated transparent PNGs.
 7. Optionally writes repacked sheets with larger spacing.
 8. Optionally writes preview overlays and a manifest for audit.
@@ -47,7 +49,10 @@ Run from `C:\Work\tukevejtso\linux` in Linux/Git Bash/container context:
 ```
 
 Use `--clean-output` only for generated output folders. Do not point an output
-or preview directory at the source `originals` directory.
+or preview directory at the source `originals` directory, any directory inside
+it, or any parent directory that contains it. Split, repack, and preview output
+directories must also be separate siblings rather than nested inside one
+another. The CLI validates all cleanup targets before deleting any of them.
 
 ## Caatuu Examples
 
@@ -95,8 +100,8 @@ the Python script directly if needed.
 - `split_previews/*_boxes.png`: original image with crop boxes overlaid.
 - `split_previews/*_repacked_preview.jpg`: repacked sheet composited on a
   checkerboard background.
-- `split_previews/_repacked_contact_sheet.jpg`: optional manually generated
-  contact sheet for fast visual scanning.
+- `split_previews/_repacked_contact_sheet.jpg`: automatically generated contact
+  sheet for fast visual scanning when repack and preview outputs are enabled.
 - `split_manifest.json`: source file, source slot, bbox, padded bbox,
   component count, and output file for every sprite.
 
