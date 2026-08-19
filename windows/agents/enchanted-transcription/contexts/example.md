@@ -1,6 +1,6 @@
 # Example reference context
 
-This file demonstrates the kind of background document Enchanted Transcription can attach to Agent Insights requests. Create another `.md` or `.txt` file in this folder for your real context; those private files are ignored by Git.
+This file demonstrates the kind of background document Enchanted Transcription can attach to Agent Insights requests. Create another `.md`, `.txt`, `.json`, or `.csv` file in this folder for your real context; those private files are ignored by Git.
 
 ## Sample project
 

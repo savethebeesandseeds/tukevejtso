@@ -708,7 +708,12 @@ fn normalize_context_file_name(value: &str) -> Option<String> {
     let supported = path
         .extension()
         .and_then(|value| value.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("txt"));
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("md")
+                || ext.eq_ignore_ascii_case("txt")
+                || ext.eq_ignore_ascii_case("json")
+                || ext.eq_ignore_ascii_case("csv")
+        });
     supported.then(|| trimmed.to_string())
 }
 
@@ -8547,7 +8552,7 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         12 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
         13 => "Pauses new insight requests at this reported API-token threshold and asks before granting another block of the same size. Local transcription and context collection keep running; Off removes the prompt and cap.",
         14 => "Applies the existing terminal transparency tool to this window. Opaque disables the effect; clear presets keep a sharp background, while blurry presets use acrylic blur. The choice is saved and does not restart capture.",
-        15 => "Selects one Markdown or text reference from the local contexts folder. Its full contents are added to each Agent Insights request, up to 32 KiB; None sends no reference document. Applying a different selection restarts only the worker wiring.",
+        15 => "Selects one Markdown, text, JSON, or CSV reference from the local contexts folder. Its full contents are added to each Agent Insights request, up to 32 KiB; None sends no reference document. Applying a different selection restarts only the worker wiring.",
         16 => "Soft treats the selected document as useful background while allowing transcript evidence and reliable general knowledge. Strong treats it as authoritative grounding, avoids outside facts, and states when the context is insufficient. Document text is always treated as data, not as instructions.",
         _ => "",
     }
