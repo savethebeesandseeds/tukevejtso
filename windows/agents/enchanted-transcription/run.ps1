@@ -1,7 +1,6 @@
 param(
     [ValidateSet("Transcription")]
     [string]$Mode = "Transcription",
-    [ValidateSet("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en")]
     [string]$Model = "medium",
     [string]$Language = "",
     [ValidateRange(5, 180)]
@@ -331,7 +330,20 @@ function ConvertTo-WhisperLanguage {
 function Test-WhisperModelName {
     param([string]$Name)
 
-    return @("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en") -contains $Name
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $false
+    }
+
+    $normalized = $Name.Trim().ToLowerInvariant()
+    $builtIn = @("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en")
+    if ($builtIn -contains $normalized) {
+        return $true
+    }
+    if ($normalized -notmatch '^[a-z0-9][a-z0-9._-]{0,99}$') {
+        return $false
+    }
+
+    return Test-Path -LiteralPath (Join-Path $ModelsDir "ggml-$normalized.bin") -PathType Leaf
 }
 
 function Resolve-CompatibleWhisperModel {
@@ -341,8 +353,17 @@ function Resolve-CompatibleWhisperModel {
     )
 
     $resolved = $Name.Trim().ToLowerInvariant()
-    if ($LanguageName -ne "en" -and $resolved.EndsWith(".en")) {
+    $builtIn = @("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en")
+    $isBuiltIn = $builtIn -contains $resolved
+    $isEnglishOnly = $resolved -match '\.en($|[-_])'
+    if ($LanguageName -eq "en" -and $isBuiltIn -and -not $isEnglishOnly) {
+        return "$resolved.en"
+    }
+    if ($LanguageName -ne "en" -and $isBuiltIn -and $isEnglishOnly) {
         return $resolved.Substring(0, $resolved.Length - 3)
+    }
+    if ($LanguageName -ne "en" -and -not $isBuiltIn -and $isEnglishOnly) {
+        return Resolve-DefaultModelForLanguage -LanguageName $LanguageName
     }
 
     return $resolved
@@ -417,6 +438,9 @@ function Resolve-ModelOption {
     )
 
     if ($modelProvided) {
+        if (-not (Test-WhisperModelName -Name $Model)) {
+            throw "Unknown Whisper model '$Model'. Use a built-in model or place ggml-$Model.bin in $ModelsDir."
+        }
         return Resolve-CompatibleWhisperModel -Name $Model -LanguageName $LanguageName
     }
     if ($Settings -and $Settings.model -and (Test-WhisperModelName -Name ([string]$Settings.model))) {
@@ -544,11 +568,22 @@ function Resolve-Model {
     }
 
     $entry = $models[$Name]
-    $path = Join-Path $ModelsDir $entry.File
+    if ($entry) {
+        $file = $entry.File
+        $url = $entry.Url
+    }
+    else {
+        $file = "ggml-$Name.bin"
+        $url = $null
+    }
+    $path = Join-Path $ModelsDir $file
+    if (-not $entry -and -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Custom Whisper model file was not found: $path"
+    }
     [pscustomobject]@{
         Name = $Name
         Path = $path
-        Url = $entry.Url
+        Url = $url
     }
 }
 
@@ -710,6 +745,9 @@ while ($true) {
 
     $modelInfo = Resolve-Model -Name $resolvedModel
     if (-not (Test-Path -LiteralPath $modelInfo.Path)) {
+        if ([string]::IsNullOrWhiteSpace([string]$modelInfo.Url)) {
+            throw "Whisper model $($modelInfo.Name) is not installed and has no built-in download URL."
+        }
         Write-Host "Downloading Whisper model $($modelInfo.Name)..." -ForegroundColor Cyan
         $tmp = "$($modelInfo.Path).download"
         if (Test-Path -LiteralPath $tmp) {

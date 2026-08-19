@@ -616,11 +616,9 @@ impl EnchantedTranscriptionSettings {
     fn normalized(mut self) -> Self {
         self.sources = normalize_transcription_sources(&self.sources);
         self.language = normalize_transcription_language(&self.language);
-        if !TRANSCRIPTION_MODEL_CHOICES.contains(&self.model.as_str()) {
-            self.model = default_model_for_language(&self.language);
-        } else {
-            self.model = compatible_model_for_language(&self.model, &self.language);
-        }
+        self.model = normalize_whisper_model_name(&self.model)
+            .map(|model| compatible_model_for_language(&model, &self.language))
+            .unwrap_or_else(|| default_model_for_language(&self.language));
         if !TRANSCRIPTION_WINDOW_CHOICES.contains(&self.chunk_seconds) {
             self.chunk_seconds = DEFAULT_CHUNK_SECONDS;
         }
@@ -751,20 +749,86 @@ fn default_model_for_language(language: &str) -> String {
     }
 }
 
+fn normalize_whisper_model_name(model: &str) -> Option<String> {
+    let model = model.trim().to_ascii_lowercase();
+    let mut characters = model.chars();
+    if model.len() > 100
+        || !characters
+            .next()
+            .is_some_and(|value| value.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    characters
+        .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_'))
+        .then_some(model)
+}
+
+fn whisper_model_name_from_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let model = file_name.strip_prefix("ggml-")?.strip_suffix(".bin")?;
+    normalize_whisper_model_name(model)
+}
+
+fn discover_whisper_models(model_dir: &Path) -> Result<Vec<String>> {
+    let entries = fs::read_dir(model_dir).with_context(|| {
+        format!(
+            "could not read Whisper model folder {}",
+            model_dir.display()
+        )
+    })?;
+    let mut models = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| whisper_model_name_from_path(&entry.path()))
+        .collect::<Vec<_>>();
+    models.sort_by_cached_key(|name| name.to_ascii_lowercase());
+    models.dedup();
+    Ok(models)
+}
+
+fn whisper_model_is_english_only(model: &str) -> bool {
+    model.ends_with(".en") || model.contains(".en-") || model.contains(".en_")
+}
+
 fn compatible_model_for_language(model: &str, language: &str) -> String {
-    if language != DEFAULT_LANGUAGE {
-        model.strip_suffix(".en").unwrap_or(model).to_string()
-    } else {
-        model.to_string()
+    let is_builtin = TRANSCRIPTION_MODEL_CHOICES.contains(&model);
+    match (
+        language == DEFAULT_LANGUAGE,
+        is_builtin,
+        whisper_model_is_english_only(model),
+    ) {
+        (true, true, false) => format!("{model}.en"),
+        (false, true, true) => model.trim_end_matches(".en").to_string(),
+        (false, false, true) => default_model_for_language(language),
+        _ => model.to_string(),
     }
 }
 
-fn transcription_model_choices_for_language(language: &str) -> Vec<&'static str> {
+fn standard_model_choices_for_language(language: &str) -> Vec<&'static str> {
     TRANSCRIPTION_MODEL_CHOICES
         .iter()
         .copied()
-        .filter(|model| language == DEFAULT_LANGUAGE || !model.ends_with(".en"))
+        .filter(|model| whisper_model_is_english_only(model) == (language == DEFAULT_LANGUAGE))
         .collect()
+}
+
+fn transcription_model_choices_for_language(
+    language: &str,
+    discovered_models: &[String],
+) -> Vec<String> {
+    let mut choices = standard_model_choices_for_language(language)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for model in discovered_models {
+        let is_builtin = TRANSCRIPTION_MODEL_CHOICES.contains(&model.as_str());
+        let is_compatible = language == DEFAULT_LANGUAGE || !whisper_model_is_english_only(model);
+        if !is_builtin && is_compatible && !choices.contains(model) {
+            choices.push(model.clone());
+        }
+    }
+    choices
 }
 
 fn normalize_choice(value: u64, choices: &[u64], fallback: u64) -> u64 {
@@ -1244,6 +1308,8 @@ struct TranscriptionSettingsState {
     snapshot: TranscriptionRestartSettings,
     fade_snapshot: Duration,
     transparency_generation: u64,
+    model_dir: PathBuf,
+    available_models: Vec<String>,
     context_dir: PathBuf,
     available_context_files: Vec<String>,
 }
@@ -2054,6 +2120,12 @@ impl AppState {
 impl TranscriptionSettingsState {
     fn from_config(config: &AppConfig) -> Self {
         let values = TranscriptionRestartSettings::from_settings(&config.transcription_settings);
+        let model_dir = config
+            .model_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let available_models = discover_whisper_models(&model_dir).unwrap_or_default();
         let context_dir = config.agent.context_dir.clone();
         let available_context_files = discover_context_files(&context_dir).unwrap_or_default();
         Self {
@@ -2068,6 +2140,8 @@ impl TranscriptionSettingsState {
             snapshot: values,
             fade_snapshot: config.fade_duration,
             transparency_generation: 0,
+            model_dir,
+            available_models,
             context_dir,
             available_context_files,
         }
@@ -2080,16 +2154,28 @@ impl TranscriptionSettingsState {
         self.confirm_close = false;
         self.snapshot = self.pending.clone();
         self.fade_snapshot = fade_duration;
+        let mut discovery_errors = Vec::new();
+        match discover_whisper_models(&self.model_dir) {
+            Ok(models) => self.available_models = models,
+            Err(err) => {
+                self.available_models.clear();
+                discovery_errors.push(format!(
+                    "Whisper model folder unavailable: {}",
+                    compact_error(&format!("{err:#}"), 120)
+                ));
+            }
+        }
         match discover_context_files(&self.context_dir) {
             Ok(files) => self.available_context_files = files,
             Err(err) => {
                 self.available_context_files.clear();
-                self.note = Some(format!(
+                discovery_errors.push(format!(
                     "Context folder unavailable: {}",
                     compact_error(&format!("{err:#}"), 120)
                 ));
             }
         }
+        self.note = (!discovery_errors.is_empty()).then(|| discovery_errors.join(" | "));
     }
 
     fn close(&mut self) {
@@ -3311,17 +3397,7 @@ fn default_temp_dir(model_path: &Path) -> PathBuf {
 }
 
 fn transcription_model_choice_from_path(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .trim_start_matches("ggml-")
-        .trim_end_matches(".bin");
-    if TRANSCRIPTION_MODEL_CHOICES.contains(&name) {
-        name.to_string()
-    } else {
-        default_transcription_model()
-    }
+    whisper_model_name_from_path(path).unwrap_or_else(default_transcription_model)
 }
 
 fn prepare_temp_dir(temp_dir: &PathBuf) -> Result<()> {
@@ -3424,6 +3500,12 @@ fn load_enchanted_transcription_settings(
         Ok(settings) => {
             let mut comparable = settings.clone();
             comparable.sources = normalize_transcription_sources(&comparable.sources);
+            if let Some(model) = normalize_whisper_model_name(&comparable.model) {
+                comparable.model = compatible_model_for_language(
+                    &model,
+                    &normalize_transcription_language(&comparable.language),
+                );
+            }
             let normalized = settings.clone().normalized();
             let load_error = (comparable != normalized).then(|| {
                 "Some saved transcription settings were adjusted to supported values. Review them before applying; the original file has not been changed."
@@ -7422,8 +7504,11 @@ fn change_transcription_setting(
         }
         3 => {
             let language = settings.pending.language.as_deref().unwrap_or("auto");
-            let choices = transcription_model_choices_for_language(language);
-            settings.pending.model = cycle_str_choice(&settings.pending.model, &choices, direction)
+            let choices =
+                transcription_model_choices_for_language(language, &settings.available_models);
+            let choice_refs = choices.iter().map(String::as_str).collect::<Vec<_>>();
+            settings.pending.model =
+                cycle_str_choice(&settings.pending.model, &choice_refs, direction)
         }
         4 => {
             settings.pending.chunk_seconds = cycle_usize_choice(
@@ -8434,13 +8519,24 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
     }
     if settings.selection == 3 {
         let language = pending.language.as_deref().unwrap_or("auto");
-        return transcription_model_choices_for_language(language)
+        let mut choices =
+            transcription_model_choices_for_language(language, &settings.available_models);
+        if !choices
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(&pending.model))
+        {
+            choices.insert(
+                0,
+                format!("Current model file is missing: {}", pending.model),
+            );
+        }
+        return choices
             .into_iter()
             .map(|model| {
                 if language == "es" && model == "medium" {
                     "medium (multilingual; Spanish-capable)".to_string()
                 } else {
-                    model.to_string()
+                    model
                 }
             })
             .collect();
@@ -8550,7 +8646,7 @@ fn transcription_setting_help(selection: usize) -> &'static str {
     match selection {
         0 => "How long older transcript words remain bright before fading to the readable floor. Applies immediately and does not restart capture.",
         1 => "Chooses microphone, system output, or both. Changing capture endpoints restarts the worker after settings are applied.",
-        2 => "Constrains Whisper to a language, or lets it auto-detect. A fixed language is usually faster and more accurate. Selecting Spanish or another non-English language automatically replaces an English-only .en model with its multilingual equivalent, then restarts Whisper.",
+        2 => "Constrains Whisper to a language, or lets it auto-detect. A fixed language is usually faster and more accurate. Selecting Spanish or another non-English language replaces a standard English-only .en model with its multilingual counterpart; an incompatible custom .en model falls back to multilingual medium. Whisper then restarts.",
         3 => "Selects the local Whisper model. The non-.en models are multilingual and support Spanish; medium is the largest Spanish-capable choice available here. English-only .en models are offered only when Language is English. Larger models improve recognition but use more memory and compute; changing the model downloads it if needed and restarts.",
         4 => "Controls the rolling audio context sent to local Whisper. Longer windows preserve context but increase inference work and latency; changing it restarts.",
         5 => "Enables the remote insight pane. Local capture and Whisper continue when this is off; applying the change restarts agent wiring.",

@@ -44,7 +44,9 @@ The Responses API requests use `store: false`. System-output transcript text is 
 
 ### Spanish transcription
 
-Choose **Language: Spanish (es)** and **Whisper model: medium** in F9. Whisper's `medium` model is multilingual and is the Spanish-capable counterpart to the English-only `medium.en`; there is no separate `medium.es` model. When Spanish or another non-English language is selected, the application automatically replaces a `.en` model with its multilingual equivalent. The launcher downloads `ggml-medium.bin` on first use.
+Choose **Language: Spanish (es)** and **Whisper model: medium** in F9. Whisper's `medium` model is multilingual and is the Spanish-capable counterpart to the English-only `medium.en`; there is no separate `medium.es` model. When Spanish or another non-English language is selected, the application automatically replaces a standard `.en` model with its multilingual counterpart. The launcher downloads `ggml-medium.bin` on first use.
+
+The model list follows the global language setting: English shows the four standard `.en` models, while Auto, Spanish, and other languages show the four standard multilingual models. This removes duplicate English choices. To add another whisper.cpp model, place a regular file named `ggml-<model-name>.bin` directly in `windows\models\whisper` and reopen F9. Detected models are added to the list; custom models carrying the English-only `.en` marker are offered only for English. Built-in models retain automatic downloads, while custom models must already exist in the folder.
 
 ### Answer modes
 
@@ -103,7 +105,7 @@ Options passed through `tk transcription` override saved values for the initial 
 | Option | Purpose |
 | --- | --- |
 | `-Cpu` | Build and run without the CUDA feature. |
-| `-Model <name>` | Select `tiny`, `base`, `small`, `medium`, or an English `.en` variant. |
+| `-Model <name>` | Select a built-in model or an installed `ggml-<name>.bin` model detected in the shared cache. |
 | `-Language <code>` | Use a language code or `auto`; English defaults to an `.en` model. |
 | `-FadeSeconds <5-180>` | Override transcript fading for this launch. |
 | `-AgentModel <id>` | Override the OpenAI model ID. |
