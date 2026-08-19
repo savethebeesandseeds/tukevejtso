@@ -7743,7 +7743,7 @@ fn render_transcription_mode(state: &AppState) -> Result<()> {
                 }
                 render_gap(&mut out, gap_width)?;
                 if let Some(line) = agent_rows.get(index) {
-                    render_right_styled_segment(&mut out, line, right_width)?;
+                    render_styled_segment(&mut out, line, right_width)?;
                 } else {
                     render_segment(&mut out, "", right_width, Color::White)?;
                 }
@@ -8904,23 +8904,6 @@ fn render_styled_segment(out: &mut io::Stdout, line: &StyledLine, width: usize) 
     }
 
     Ok(())
-}
-
-fn render_right_styled_segment(
-    out: &mut io::Stdout,
-    line: &StyledLine,
-    width: usize,
-) -> Result<()> {
-    if width == 0 {
-        return Ok(());
-    }
-
-    let content_width = styled_line_width(line).min(width);
-    let pad = width.saturating_sub(content_width);
-    if pad > 0 {
-        queue!(out, Print(" ".repeat(pad)))?;
-    }
-    render_styled_segment(out, line, content_width)
 }
 
 fn styled_line_width(line: &StyledLine) -> usize {
