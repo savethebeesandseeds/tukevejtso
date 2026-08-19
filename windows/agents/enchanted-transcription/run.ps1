@@ -334,6 +334,20 @@ function Test-WhisperModelName {
     return @("tiny", "base", "small", "medium", "tiny.en", "base.en", "small.en", "medium.en") -contains $Name
 }
 
+function Resolve-CompatibleWhisperModel {
+    param(
+        [string]$Name,
+        [string]$LanguageName
+    )
+
+    $resolved = $Name.Trim().ToLowerInvariant()
+    if ($LanguageName -ne "en" -and $resolved.EndsWith(".en")) {
+        return $resolved.Substring(0, $resolved.Length - 3)
+    }
+
+    return $resolved
+}
+
 function Get-DefaultTranscriptionSettings {
     [pscustomobject]@{
         sources = @("microphone", "system-output")
@@ -403,10 +417,10 @@ function Resolve-ModelOption {
     )
 
     if ($modelProvided) {
-        return $Model
+        return Resolve-CompatibleWhisperModel -Name $Model -LanguageName $LanguageName
     }
     if ($Settings -and $Settings.model -and (Test-WhisperModelName -Name ([string]$Settings.model))) {
-        return [string]$Settings.model
+        return Resolve-CompatibleWhisperModel -Name ([string]$Settings.model) -LanguageName $LanguageName
     }
     return Resolve-DefaultModelForLanguage -LanguageName $LanguageName
 }

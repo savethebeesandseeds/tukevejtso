@@ -618,6 +618,8 @@ impl EnchantedTranscriptionSettings {
         self.language = normalize_transcription_language(&self.language);
         if !TRANSCRIPTION_MODEL_CHOICES.contains(&self.model.as_str()) {
             self.model = default_model_for_language(&self.language);
+        } else {
+            self.model = compatible_model_for_language(&self.model, &self.language);
         }
         if !TRANSCRIPTION_WINDOW_CHOICES.contains(&self.chunk_seconds) {
             self.chunk_seconds = DEFAULT_CHUNK_SECONDS;
@@ -747,6 +749,22 @@ fn default_model_for_language(language: &str) -> String {
     } else {
         "medium".to_string()
     }
+}
+
+fn compatible_model_for_language(model: &str, language: &str) -> String {
+    if language != DEFAULT_LANGUAGE {
+        model.strip_suffix(".en").unwrap_or(model).to_string()
+    } else {
+        model.to_string()
+    }
+}
+
+fn transcription_model_choices_for_language(language: &str) -> Vec<&'static str> {
+    TRANSCRIPTION_MODEL_CHOICES
+        .iter()
+        .copied()
+        .filter(|model| language == DEFAULT_LANGUAGE || !model.ends_with(".en"))
+        .collect()
 }
 
 fn normalize_choice(value: u64, choices: &[u64], fallback: u64) -> u64 {
@@ -3683,7 +3701,8 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
             " Agent API requests are disabled until you explicitly review and apply settings.",
         );
     }
-    settings.model = transcription_model_choice_from_path(&model_path);
+    let loaded_model = transcription_model_choice_from_path(&model_path);
+    settings.model = loaded_model.clone();
     if args.language_provided {
         settings.language = transcription_language_setting(args.language.as_deref());
     }
@@ -3697,6 +3716,13 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
         settings.agent_enabled = false;
     }
     settings = settings.normalized();
+    if settings.model != loaded_model {
+        return Err(anyhow!(
+            "Whisper model {loaded_model} is English-only and cannot be used with language {}; use {} instead",
+            settings.language,
+            settings.model
+        ));
+    }
 
     let sources = settings.sources.clone();
     let mut agent = build_transcription_agent_config(&settings, &sources, &agent_root)?;
@@ -7390,13 +7416,14 @@ fn change_transcription_setting(
             let current = settings.pending.language.as_deref().unwrap_or("auto");
             let next = cycle_str_choice(current, &TRANSCRIPTION_LANGUAGE_CHOICES, direction);
             settings.pending.language = (next != "auto").then_some(next);
+            let language = settings.pending.language.as_deref().unwrap_or("auto");
+            settings.pending.model =
+                compatible_model_for_language(&settings.pending.model, language);
         }
         3 => {
-            settings.pending.model = cycle_str_choice(
-                &settings.pending.model,
-                &TRANSCRIPTION_MODEL_CHOICES,
-                direction,
-            )
+            let language = settings.pending.language.as_deref().unwrap_or("auto");
+            let choices = transcription_model_choices_for_language(language);
+            settings.pending.model = cycle_str_choice(&settings.pending.model, &choices, direction)
         }
         4 => {
             settings.pending.chunk_seconds = cycle_usize_choice(
@@ -8405,6 +8432,19 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
         }
         return choices;
     }
+    if settings.selection == 3 {
+        let language = pending.language.as_deref().unwrap_or("auto");
+        return transcription_model_choices_for_language(language)
+            .into_iter()
+            .map(|model| {
+                if language == "es" && model == "medium" {
+                    "medium (multilingual; Spanish-capable)".to_string()
+                } else {
+                    model.to_string()
+                }
+            })
+            .collect();
+    }
     let values: Vec<&str> = match settings.selection {
         0 => vec!["Range: 5s-180s", "Left/Right adjusts by 5s"],
         1 => vec!["Microphone + system output", "Microphone", "System output"],
@@ -8417,16 +8457,6 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
             "German (de)",
             "Italian (it)",
             "Other language codes from saved settings or CLI",
-        ],
-        3 => vec![
-            "tiny",
-            "base",
-            "small",
-            "medium",
-            "tiny.en",
-            "base.en",
-            "small.en",
-            "medium.en",
         ],
         4 => vec!["6s", "8s", "10s", "12s", "15s", "20s", "30s"],
         5 | 8 => vec!["On", "Off"],
@@ -8539,8 +8569,8 @@ fn transcription_setting_help(selection: usize) -> &'static str {
     match selection {
         0 => "How long older transcript words remain bright before fading to the readable floor. Applies immediately and does not restart capture.",
         1 => "Chooses microphone, system output, or both. Changing capture endpoints restarts the worker after settings are applied.",
-        2 => "Constrains Whisper to a language, or lets it auto-detect. A fixed language is usually faster and more accurate; changing it restarts Whisper.",
-        3 => "Selects the local Whisper model. Larger models improve recognition but use more memory and compute; changing it downloads if needed and restarts.",
+        2 => "Constrains Whisper to a language, or lets it auto-detect. A fixed language is usually faster and more accurate. Selecting Spanish or another non-English language automatically replaces an English-only .en model with its multilingual equivalent, then restarts Whisper.",
+        3 => "Selects the local Whisper model. The non-.en models are multilingual and support Spanish; medium is the largest Spanish-capable choice available here. English-only .en models are offered only when Language is English. Larger models improve recognition but use more memory and compute; changing the model downloads it if needed and restarts.",
         4 => "Controls the rolling audio context sent to local Whisper. Longer windows preserve context but increase inference work and latency; changing it restarts.",
         5 => "Enables the remote insight pane. Local capture and Whisper continue when this is off; applying the change restarts agent wiring.",
         6 => "Selects the OpenAI model used for insight updates. Model choice affects latency, quality, and API cost; changing it restarts agent wiring.",

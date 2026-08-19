@@ -42,6 +42,10 @@ Automatic Agent Insights updates wait for about 1.2 seconds of silence after new
 
 The Responses API requests use `store: false`. System-output transcript text is included when Agent Insights runs. Microphone transcript text remains local unless **Mic context** is enabled in F9.
 
+### Spanish transcription
+
+Choose **Language: Spanish (es)** and **Whisper model: medium** in F9. Whisper's `medium` model is multilingual and is the Spanish-capable counterpart to the English-only `medium.en`; there is no separate `medium.es` model. When Spanish or another non-English language is selected, the application automatically replaces a `.en` model with its multilingual equivalent. The launcher downloads `ggml-medium.bin` on first use.
+
 ### Answer modes
 
 - **Silhouette** is the default. It returns a short, content-free spoken-answer frame with `...` blanks for the user's own knowledge.
@@ -113,6 +117,7 @@ Example:
 
 ```cmd
 tk transcription -Cpu -Language auto -Model medium
+tk transcription -Language es -Model medium
 ```
 
 For direct PowerShell use from this directory:
