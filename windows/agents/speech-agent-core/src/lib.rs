@@ -8492,9 +8492,11 @@ fn transcription_settings_columns(
     let mut option_lines = Vec::new();
     for (index, (label, value)) in option_rows.iter().enumerate() {
         let selected = index == settings.selection;
-        option_lines.push(StyledLine::plain(
-            transcription_setting_option_line(label, value, selected, option_width.max(1)),
-            if selected { Color::Cyan } else { Color::White },
+        option_lines.push(transcription_setting_option_line(
+            label,
+            value,
+            selected,
+            option_width.max(1),
         ));
     }
 
@@ -8543,32 +8545,51 @@ fn transcription_setting_option_line(
     value: &str,
     selected: bool,
     width: usize,
-) -> String {
+) -> StyledLine {
     let marker = if selected { ">" } else { " " };
     let full = format!("{marker} {label}: {value}");
-    if full.chars().count() <= width {
-        return fit_line(&full, width);
-    }
-
-    let suffix = format!(": {value}");
-    let fixed_width = 2usize.saturating_add(suffix.chars().count());
-    if fixed_width + 2 <= width {
-        let label_width = width - fixed_width;
-        let abbreviated = if label.chars().count() > label_width {
-            format!(
-                "{}…",
-                label
-                    .chars()
-                    .take(label_width.saturating_sub(1))
-                    .collect::<String>()
-            )
-        } else {
-            label.to_string()
-        };
-        fit_line(&format!("{marker} {abbreviated}{suffix}"), width)
+    let displayed_label = if full.chars().count() <= width {
+        Some(label.to_string())
     } else {
-        fit_line(&format!("{marker} {value}"), width)
+        let suffix_width = 2usize.saturating_add(value.chars().count());
+        let fixed_width = 2usize.saturating_add(suffix_width);
+        if fixed_width + 2 <= width {
+            let label_width = width - fixed_width;
+            Some(if label.chars().count() > label_width {
+                format!(
+                    "{}…",
+                    label
+                        .chars()
+                        .take(label_width.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                label.to_string()
+            })
+        } else {
+            None
+        }
+    };
+
+    let mut segments = vec![StyledSegment {
+        text: format!("{marker} "),
+        color: if selected {
+            Color::Cyan
+        } else {
+            Color::DarkGrey
+        },
+    }];
+    if let Some(label) = displayed_label {
+        segments.push(StyledSegment {
+            text: format!("{label}: "),
+            color: Color::DarkGrey,
+        });
     }
+    segments.push(StyledSegment {
+        text: value.to_string(),
+        color: Color::White,
+    });
+    StyledLine { segments }
 }
 
 fn transcription_diagnostic_rows(state: &AppState, width: usize) -> Vec<StyledLine> {
