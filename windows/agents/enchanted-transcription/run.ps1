@@ -165,6 +165,17 @@ function Get-ForegroundTerminalWindowHandle {
     return [IntPtr]::Zero
 }
 
+function Get-ForegroundHostWindowHandle {
+    Add-TerminalKeyNativeType
+
+    $foregroundWindow = Get-RootWindowHandle -WindowHandle ([Tukevejtso.TerminalKeys]::GetForegroundWindow())
+    if ($foregroundWindow -ne [IntPtr]::Zero -and [Tukevejtso.TerminalKeys]::IsWindowVisible($foregroundWindow)) {
+        return $foregroundWindow
+    }
+
+    return [IntPtr]::Zero
+}
+
 function Get-CurrentTerminalWindowHandle {
     Add-TerminalKeyNativeType
 
@@ -174,10 +185,13 @@ function Get-CurrentTerminalWindowHandle {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($env:WT_SESSION)) {
-        return Get-ForegroundTerminalWindowHandle
+        $terminalWindow = Get-ForegroundTerminalWindowHandle
+        if ($terminalWindow -ne [IntPtr]::Zero) {
+            return $terminalWindow
+        }
     }
 
-    return [IntPtr]::Zero
+    return Get-ForegroundHostWindowHandle
 }
 
 function Invoke-OptionalFullScreen {

@@ -931,6 +931,7 @@ struct AppState {
     started_at: Instant,
     last_context_activity_at: Instant,
     hidden_since: Option<Instant>,
+    agent_inactive_since: Option<Instant>,
     agent_token_limit: Option<u64>,
     token_budget_prompt_open: bool,
     token_budget_prompt_dismissed: bool,
@@ -1175,6 +1176,7 @@ impl AppState {
             started_at: Instant::now(),
             last_context_activity_at: Instant::now(),
             hidden_since: None,
+            agent_inactive_since: None,
             agent_token_limit: (config.transcription_settings.agent_token_budget > 0)
                 .then_some(config.transcription_settings.agent_token_budget),
             token_budget_prompt_open: false,
@@ -1192,14 +1194,6 @@ impl AppState {
             };
             state.agent.status = message.to_string();
             state.record_error(message);
-        }
-        if config.mode == AppMode::Transcription
-            && config.transcription_settings.pause_agent_when_hidden
-            && config.terminal_hwnd.is_none()
-        {
-            state.record_error(
-                "Terminal visibility is unavailable; hidden API pausing is disabled for this session.",
-            );
         }
         state
     }
@@ -2186,9 +2180,9 @@ fn run(product: ProductMode) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let refresh_generation = Arc::new(AtomicU64::new(0));
     let agent_force_generation = Arc::new(AtomicU64::new(0));
-    // Visibility monitoring is initialized in the render loop. Starting open avoids
-    // silently disabling Agent Insights when a terminal handle cannot be resolved.
-    let agent_requests_allowed = Arc::new(AtomicBool::new(true));
+    let agent_requests_allowed = Arc::new(AtomicBool::new(
+        !config.transcription_settings.pause_agent_when_hidden || config.terminal_hwnd.is_some(),
+    ));
     let typing_intelligence_enabled = Arc::new(AtomicBool::new(
         config
             .typing
@@ -4382,7 +4376,7 @@ fn current_terminal_window_handle() -> Option<isize> {
 
 fn valid_terminal_window_handle(handle: isize) -> Option<isize> {
     let hwnd = root_window_handle(handle as HWND);
-    if is_terminal_window_handle(hwnd) {
+    if !hwnd.is_null() && unsafe { IsWindow(hwnd) } != 0 && unsafe { IsWindowVisible(hwnd) } != 0 {
         Some(hwnd as isize)
     } else {
         None
@@ -4390,13 +4384,16 @@ fn valid_terminal_window_handle(handle: isize) -> Option<isize> {
 }
 
 fn terminal_window_is_visible(handle: isize) -> bool {
+    terminal_window_visibility(handle).unwrap_or(false)
+}
+
+fn terminal_window_visibility(handle: isize) -> Option<bool> {
     let hwnd = root_window_handle(handle as HWND);
-    if hwnd.is_null()
-        || unsafe { IsWindow(hwnd) } == 0
-        || unsafe { IsWindowVisible(hwnd) } == 0
-        || unsafe { IsIconic(hwnd) } != 0
-    {
-        return false;
+    if hwnd.is_null() || unsafe { IsWindow(hwnd) } == 0 {
+        return None;
+    }
+    if unsafe { IsWindowVisible(hwnd) } == 0 || unsafe { IsIconic(hwnd) } != 0 {
+        return Some(false);
     }
 
     let mut cloaked = 0u32;
@@ -4408,7 +4405,17 @@ fn terminal_window_is_visible(handle: isize) -> bool {
             size_of::<u32>() as u32,
         )
     };
-    result < 0 || cloaked == 0
+    Some(result < 0 || cloaked == 0)
+}
+
+fn terminal_window_accepts_requests(handle: isize) -> Option<bool> {
+    if !terminal_window_visibility(handle)? {
+        return Some(false);
+    }
+
+    let monitored = root_window_handle(handle as HWND);
+    let foreground = root_window_handle(unsafe { GetForegroundWindow() });
+    Some(!foreground.is_null() && foreground == monitored)
 }
 
 fn root_window_handle(hwnd: HWND) -> HWND {
@@ -5421,15 +5428,29 @@ fn update_transcription_lifecycle(
 
     let now = Instant::now();
     let settings = &state.transcription_settings.active;
-    let visibility = state.terminal_hwnd.map(terminal_window_is_visible);
+    let visibility = state.terminal_hwnd.and_then(terminal_window_visibility);
+    let request_visibility = state
+        .terminal_hwnd
+        .and_then(terminal_window_accepts_requests);
     match visibility {
         Some(true) | None => state.hidden_since = None,
         Some(false) if state.hidden_since.is_none() => state.hidden_since = Some(now),
         Some(false) => {}
     }
+    match request_visibility {
+        Some(true) | None => state.agent_inactive_since = None,
+        Some(false) if state.agent_inactive_since.is_none() => {
+            state.agent_inactive_since = Some(now);
+        }
+        Some(false) => {}
+    }
 
     let hidden_elapsed = state
         .hidden_since
+        .map(|started| now.saturating_duration_since(started))
+        .unwrap_or_default();
+    let agent_inactive_elapsed = state
+        .agent_inactive_since
         .map(|started| now.saturating_duration_since(started))
         .unwrap_or_default();
     let idle_elapsed = now.saturating_duration_since(state.last_context_activity_at);
@@ -5462,8 +5483,9 @@ fn update_transcription_lifecycle(
         prompt_changed = true;
     }
     let hidden_pause = settings.pause_agent_when_hidden
-        && visibility == Some(false)
-        && hidden_elapsed >= Duration::from_secs(settings.hidden_pause_seconds);
+        && (request_visibility.is_none()
+            || (request_visibility == Some(false)
+                && agent_inactive_elapsed >= Duration::from_secs(settings.hidden_pause_seconds)));
     let allowed = state.agent.enabled && !hidden_pause && !budget_reached;
     requests_allowed.store(allowed, Ordering::SeqCst);
 
@@ -5471,8 +5493,10 @@ fn update_transcription_lifecycle(
         Some("paused; token budget reached (F1 to review)")
     } else if budget_reached {
         Some("paused; session token budget reached")
+    } else if request_visibility.is_none() && settings.pause_agent_when_hidden {
+        Some("paused; terminal visibility unavailable")
     } else if hidden_pause {
-        Some("paused; terminal hidden, local context continues")
+        Some("paused; terminal not foreground, local context continues")
     } else {
         None
     };
@@ -6423,115 +6447,60 @@ fn transcription_error_rows(
         return Vec::new();
     }
 
-    let diagnostic = format!(
-        "Agent status: {} | requests {}",
-        state.agent.status, state.agent.request_count
-    );
-    let visibility = match state.terminal_hwnd {
-        Some(handle) if terminal_window_is_visible(handle) => "visible",
-        Some(_) => "hidden",
-        None => "unavailable; API requests stay enabled",
-    };
-    let pause_setting = if state.transcription_settings.active.pause_agent_when_hidden {
-        format!(
-            "after {}s hidden",
-            state.transcription_settings.active.hidden_pause_seconds
-        )
-    } else {
-        "off".to_string()
-    };
-    let visibility_diagnostic =
-        format!("Window monitor: {visibility} | hidden API pause: {pause_setting}");
-    let diagnostic_color = if state.agent.enabled {
-        Color::DarkGrey
-    } else {
-        Color::Yellow
-    };
     let mut rows = Vec::new();
-
-    if !state.errors.is_empty() && available_rows <= 3 {
-        if available_rows == 1 {
-            if let Some(error) = state.errors.back() {
-                rows.push(StyledLine::plain(
-                    fit_line(&format_error_entry(error), width.max(1)),
-                    Color::Red,
-                ));
-            }
-            return rows;
-        }
-
-        let visible_count = (available_rows - 1).min(state.errors.len());
+    rows.push(StyledLine::plain("Agent status", Color::Cyan));
+    if rows.len() < available_rows {
         rows.push(StyledLine::plain(
-            format!(
-                "Recent errors (showing {visible_count} of {})",
-                state.errors.len()
+            fit_line(
+                &format!(
+                    "  {}; {} requests",
+                    state.agent.status, state.agent.request_count
+                ),
+                width.max(1),
             ),
-            Color::Red,
+            if state.agent.enabled {
+                Color::DarkGrey
+            } else {
+                Color::Yellow
+            },
         ));
-        for error in state.errors.iter().rev().take(visible_count) {
-            rows.push(StyledLine::plain(
-                fit_line(&format_error_entry(error), width.max(1)),
-                Color::Red,
-            ));
-        }
-        return rows;
     }
 
+    let monitor_unavailable = state
+        .terminal_hwnd
+        .and_then(terminal_window_visibility)
+        .is_none();
+    if monitor_unavailable && state.transcription_settings.active.pause_agent_when_hidden {
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain("Warnings (1)", Color::Yellow));
+        }
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain(
+                fit_line(
+                    "  Terminal visibility unavailable; API requests are paused.",
+                    width.max(1),
+                ),
+                Color::Yellow,
+            ));
+        }
+    }
+
+    if rows.len() < available_rows {
+        rows.push(StyledLine::plain(
+            format!("Recent errors ({})", state.errors.len()),
+            if state.errors.is_empty() {
+                Color::DarkGrey
+            } else {
+                Color::Red
+            },
+        ));
+    }
     if state.errors.is_empty() {
-        rows.push(StyledLine::plain("Recent errors", Color::DarkGrey));
         if rows.len() < available_rows {
-            rows.push(StyledLine::plain(
-                fit_line(&diagnostic, width.max(1)),
-                diagnostic_color,
-            ));
-        }
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain(
-                fit_line(&visibility_diagnostic, width.max(1)),
-                if state.terminal_hwnd.is_some() {
-                    Color::DarkGrey
-                } else {
-                    Color::Yellow
-                },
-            ));
-        }
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain(
-                "No errors recorded this session.",
-                Color::DarkGrey,
-            ));
+            rows.push(StyledLine::plain("  None.", Color::DarkGrey));
         }
     } else {
-        let visible_count = available_rows
-            .saturating_sub(3)
-            .max(1)
-            .min(state.errors.len());
-        let heading = if visible_count == state.errors.len() {
-            format!("Recent errors ({})", state.errors.len())
-        } else {
-            format!(
-                "Recent errors (showing {visible_count} of {})",
-                state.errors.len()
-            )
-        };
-        rows.push(StyledLine::plain(heading, Color::Red));
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain(
-                fit_line(&diagnostic, width.max(1)),
-                diagnostic_color,
-            ));
-        }
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain(
-                fit_line(&visibility_diagnostic, width.max(1)),
-                if state.terminal_hwnd.is_some() {
-                    Color::DarkGrey
-                } else {
-                    Color::Yellow
-                },
-            ));
-        }
-        for error in state.errors.iter().rev().take(visible_count) {
+        for error in state.errors.iter().rev() {
             if rows.len() >= available_rows {
                 break;
             }
@@ -6634,7 +6603,7 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         6 => "Selects the OpenAI model used for insight updates. Model choice affects latency, quality, and API cost; changing it restarts agent wiring.",
         7 => "Silhouette returns a content-free answer frame with blanks for your own knowledge. Natural Answer returns a concise, directly usable answer. Changing modes uses the normal automatic application restart.",
         8 => "Allows microphone transcript text to be included in API context. Off keeps local speech out of remote requests; changing it restarts agent wiring.",
-        9 => "Stops only new API requests after this terminal has remained hidden, minimized, or cloaked for the selected grace period. Audio capture, Whisper, and context buffering continue locally. If the terminal cannot be identified, requests remain enabled instead of being silently blocked.",
+        9 => "Stops only new API requests after this terminal has remained hidden, minimized, cloaked, or out of the foreground for the selected grace period. Audio capture, Whisper, and context buffering continue locally. If terminal visibility cannot be monitored, API requests pause and F9 shows a warning.",
         10 => "Closes the application after it remains hidden for this long. Off disables this shutdown rule; API pausing still follows its separately configured grace period.",
         11 => "Closes the application after no transcript changes for this long. Off allows an idle visible session to remain open indefinitely.",
         12 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
