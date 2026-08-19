@@ -1,0 +1,18 @@
+[package]
+name = "speech-agent-core"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+cuda = ["whisper-rs/cuda"]
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wasapi = "0.23"
+whisper-rs = { version = "0.16", default-features = false }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Console", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

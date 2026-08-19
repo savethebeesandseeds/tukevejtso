@@ -632,6 +632,7 @@ if ($Mode -ne "EnhancedTyping" -or $Transparency) {
     Invoke-OptionalTransparencySetup
 }
 Invoke-OptionalFullScreen
+$terminalWindowHandle = Get-CurrentTerminalWindowHandle
 $terminalRestoreSnapshot = Get-TerminalRestoreSnapshot
 Import-OpenAiApiKey
 
@@ -670,8 +671,8 @@ while ($true) {
     }
 
     $cargoArgs += @("--", "--model", $modelInfo.Path, "--mode", $Mode.Replace("EnhancedTyping", "enhanced-typing").Replace("Transcription", "transcription"), "--temp-dir", $TempDir, "--fade-seconds", $resolvedFadeSeconds, "--language", $resolvedLanguage, "--agent-root", $AgentRoot)
-    if ($terminalRestoreSnapshot -and $terminalRestoreSnapshot.WindowHandle -ne [IntPtr]::Zero) {
-        $cargoArgs += @("--terminal-window-handle", $terminalRestoreSnapshot.WindowHandle.ToInt64().ToString())
+    if ($terminalWindowHandle -ne [IntPtr]::Zero) {
+        $cargoArgs += @("--terminal-window-handle", $terminalWindowHandle.ToInt64().ToString())
     }
 
     if ($agentDisabled) {

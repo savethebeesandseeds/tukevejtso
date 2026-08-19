@@ -20,7 +20,9 @@ The first run downloads the selected model into the shared `windows\models\whisp
 
 The terminal uses a rolling Whisper window rather than waiting for isolated fixed chunks. It refreshes a live hypothesis every few seconds and periodically commits only the new text into the stable transcript pane.
 
-Press F9 during transcription to open settings. Transcript fade changes live with Left/Right. Source selection, language, model, rolling Whisper window, and agent wiring can be changed there and saved for future sessions. When you apply a worker-bound change, the launcher automatically restarts the agent with the saved settings.
+Press F9 during transcription to open settings. The bottom of the settings view explains the selected option, whether it applies live or after restart, and its privacy, cost, or performance impact. Transcript fade and API lifecycle controls apply without restarting. Source selection, language, model, rolling Whisper window, and agent wiring are saved and automatically restart the worker when required.
+
+The insight agent has layered API safeguards. By default, new API requests pause immediately whenever the terminal is hidden, minimized, cloaked on another virtual desktop, or no longer valid. Audio capture, local Whisper inference, rolling transcript history, and agent context continue while paused. Only API submission is held, and resuming uses the newest consolidated context without replaying a request backlog. The application exits after 15 minutes continuously hidden, 30 minutes without transcript activity, or a four-hour session. At 100,000 reported API tokens, new insight requests pause and the terminal asks before granting another 100,000-token block. Declining leaves only the API paused; F1 reopens the prompt. F9 can change or disable each limit.
 
 Terminal transparency is opt-in through the launcher flags and no longer prompts during normal startup.
 
@@ -31,6 +33,8 @@ tk openai-key
 ```
 
 The key is encrypted with Windows DPAPI for the current user and stored under `%APPDATA%\tukevejtso\secrets`.
+
+Enchanted Transcription and Enhanced Typing are separate thin binaries over `..\speech-agent-core`. Shared capture, Whisper, transcript reconciliation, API transport, and terminal lifecycle behavior is implemented once in that crate; product-specific entrypoints select the transcription or typing experience.
 
 To force CPU mode:
 
