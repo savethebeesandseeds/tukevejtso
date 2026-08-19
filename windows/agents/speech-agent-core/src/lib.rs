@@ -11,7 +11,9 @@ use serde_json::{json, Map, Value};
 use std::{
     cell::Cell,
     collections::{HashMap, VecDeque},
-    env, fs,
+    env,
+    error::Error as StdError,
+    fs,
     fs::OpenOptions,
     io::{self, Write},
     mem::size_of,
@@ -94,7 +96,9 @@ const TYPING_INSTRUCTIONS_FILE: &str = "enhanced-typing-agent-instructions.md";
 const TRANSCRIPTION_SETTINGS_FILE: &str = "enchanted-transcription-settings.json";
 const TYPING_SETTINGS_FILE: &str = "enhanced-typing-settings.json";
 const AGENT_REFRESH_INTERVAL: Duration = Duration::from_secs(6);
-const AGENT_HTTP_TIMEOUT: Duration = Duration::from_secs(14);
+const AGENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const AGENT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_FIRST_HTTP_TIMEOUT: Duration = Duration::from_secs(75);
 const AGENT_RETRY_LIMIT: u32 = 3;
 const AGENT_RETRY_BASE_SECONDS: u64 = 2;
 const AGENT_RETRY_MAX_SECONDS: u64 = 8;
@@ -1024,6 +1028,11 @@ enum UiEvent {
     AgentStatus(String),
     AgentRequestStarted {
         query_bytes: usize,
+        generation: u64,
+    },
+    AgentRequestRetrying {
+        message: String,
+        usage: Option<AgentUsage>,
         generation: u64,
     },
     AgentRequestFailed {
@@ -2144,6 +2153,19 @@ impl AppState {
                     return true;
                 }
                 self.agent.start_request(query_bytes);
+                true
+            }
+            UiEvent::AgentRequestRetrying {
+                message,
+                usage,
+                generation,
+            } => {
+                self.agent.record_usage(usage);
+                if generation != self.agent_generation {
+                    return usage.is_some();
+                }
+                self.agent.finish_request();
+                self.agent.status = message;
                 true
             }
             UiEvent::AgentRequestFailed {
@@ -5006,7 +5028,7 @@ fn agent_loop(
         .ok_or_else(|| anyhow!("missing OpenAI API key"))?
         .to_string();
     let client = reqwest::blocking::Client::builder()
-        .timeout(AGENT_HTTP_TIMEOUT)
+        .connect_timeout(AGENT_CONNECT_TIMEOUT)
         .build()
         .context("failed to create OpenAI HTTP client")?;
 
@@ -5018,6 +5040,7 @@ fn agent_loop(
     let mut retry_signature: Option<String> = None;
     let mut retry_count = 0u32;
     let mut retry_not_before: Option<Instant> = None;
+    let mut received_successful_response = false;
     let mut seen_refresh_generation = refresh_generation.load(Ordering::SeqCst);
     let mut was_allowed = true;
 
@@ -5156,8 +5179,20 @@ fn agent_loop(
             generation: request_generation,
         });
 
-        match request_agent_result(&client, &api_key, request_body, &config.fields) {
+        let request_timeout = if received_successful_response {
+            AGENT_HTTP_TIMEOUT
+        } else {
+            AGENT_FIRST_HTTP_TIMEOUT
+        };
+        match request_agent_result(
+            &client,
+            &api_key,
+            request_body,
+            &config.fields,
+            request_timeout,
+        ) {
             Ok(call_result) => {
+                received_successful_response = true;
                 last_submitted = input_signature;
                 last_successful_input = Some(input.clone());
                 let result =
@@ -5182,30 +5217,34 @@ fn agent_loop(
                     retryable,
                 } = failure;
                 let retry_scheduled = retryable && retry_count < AGENT_RETRY_LIMIT;
-                let message = if retry_scheduled {
+                if retry_scheduled {
                     retry_count += 1;
                     let delay = agent_retry_delay(retry_count);
                     retry_signature = Some(input_signature.clone());
                     retry_not_before = Some(Instant::now() + delay);
-                    format!(
-                        "OpenAI request failed: {}; retry {}/{} in {}s",
-                        compact_error(&message, 90),
+                    let message = format!(
+                        "Temporary API failure; retry {}/{} in {}s: {}",
                         retry_count,
                         AGENT_RETRY_LIMIT,
-                        delay.as_secs()
-                    )
+                        delay.as_secs(),
+                        compact_error(&message, 90),
+                    );
+                    let _ = ui_tx.send(UiEvent::AgentRequestRetrying {
+                        message,
+                        usage,
+                        generation: request_generation,
+                    });
                 } else {
                     last_submitted = input_signature;
                     retry_signature = None;
                     retry_count = 0;
                     retry_not_before = None;
-                    format!("OpenAI request failed: {}", compact_error(&message, 90))
-                };
-                let _ = ui_tx.send(UiEvent::AgentRequestFailed {
-                    message,
-                    usage,
-                    generation: request_generation,
-                });
+                    let _ = ui_tx.send(UiEvent::AgentRequestFailed {
+                        message: format!("OpenAI request failed: {}", compact_error(&message, 90)),
+                        usage,
+                        generation: request_generation,
+                    });
+                }
             }
         }
         request_in_flight.store(false, Ordering::SeqCst);
@@ -5263,7 +5302,7 @@ fn typing_loop(
     request_in_flight: Arc<AtomicBool>,
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(AGENT_HTTP_TIMEOUT)
+        .connect_timeout(AGENT_CONNECT_TIMEOUT)
         .build()
         .context("failed to create OpenAI HTTP client")?;
     let mut last_submitted = String::new();
@@ -5533,25 +5572,34 @@ fn request_agent_result(
     api_key: &str,
     body: Value,
     fields: &[AgentFieldConfig],
+    timeout: Duration,
 ) -> std::result::Result<AgentCallResult, AgentCallFailure> {
     let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
         .json(&body)
+        .timeout(timeout)
         .send()
         .map_err(|err| {
+            let retryable = err.is_connect();
             AgentCallFailure::new(
-                format!("failed to call OpenAI Responses API: {err}"),
+                format!(
+                    "failed to call OpenAI Responses API: {}",
+                    reqwest_error_message(&err)
+                ),
                 None,
-                true,
+                retryable,
             )
         })?;
     let status = response.status();
     let response_text = response.text().map_err(|err| {
         AgentCallFailure::new(
-            format!("failed to read OpenAI response body: {err}"),
+            format!(
+                "failed to read OpenAI response body: {}",
+                reqwest_error_message(&err)
+            ),
             None,
-            true,
+            false,
         )
     })?;
 
@@ -5611,10 +5659,14 @@ fn request_typing_result(
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
         .json(&body)
+        .timeout(AGENT_HTTP_TIMEOUT)
         .send()
         .map_err(|err| {
             AgentCallFailure::new(
-                format!("failed to call OpenAI Responses API: {err}"),
+                format!(
+                    "failed to call OpenAI Responses API: {}",
+                    reqwest_error_message(&err)
+                ),
                 None,
                 false,
             )
@@ -5622,7 +5674,10 @@ fn request_typing_result(
     let status = response.status();
     let response_text = response.text().map_err(|err| {
         AgentCallFailure::new(
-            format!("failed to read OpenAI response body: {err}"),
+            format!(
+                "failed to read OpenAI response body: {}",
+                reqwest_error_message(&err)
+            ),
             None,
             false,
         )
@@ -6654,6 +6709,33 @@ fn compact_error(text: &str, max_chars: usize) -> String {
         compact
     } else {
         format!("{}...", compact.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn reqwest_error_message(err: &reqwest::Error) -> String {
+    let category = if err.is_timeout() {
+        "request timed out"
+    } else if err.is_connect() {
+        "connection failed"
+    } else if err.is_body() {
+        "response body failed"
+    } else {
+        "network request failed"
+    };
+    let mut details = Vec::new();
+    let mut source = StdError::source(err);
+    while let Some(cause) = source {
+        let detail = cause.to_string();
+        if !detail.trim().is_empty() && details.last() != Some(&detail) {
+            details.push(detail);
+        }
+        source = cause.source();
+    }
+
+    if details.is_empty() {
+        format!("{category}: {err}")
+    } else {
+        format!("{category}: {}", details.join(": "))
     }
 }
 
@@ -9646,38 +9728,86 @@ fn visible_agent_field_rows(state: &AppState, width: usize, max_lines: usize) ->
         return Vec::new();
     }
 
-    let gaps = active_fields.len().saturating_sub(1).min(max_lines);
-    let available = max_lines.saturating_sub(gaps);
+    let desired_heights = active_fields
+        .iter()
+        .map(|field| {
+            wrap_agent_lines(&field.lines, width)
+                .len()
+                .saturating_add(1)
+        })
+        .collect::<Vec<_>>();
+    let full_gap_count = active_fields.len().saturating_sub(1);
+    let desired_with_gaps = desired_heights
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_add(full_gap_count);
+    let gap_rows = usize::from(desired_with_gaps <= max_lines);
+    let available = max_lines.saturating_sub(full_gap_count.saturating_mul(gap_rows));
     if available == 0 {
         return Vec::new();
     }
 
-    let base = (available / active_fields.len()).max(1);
-    let mut extra = available % active_fields.len();
-    let mut rows = Vec::new();
-    for (index, field) in active_fields.iter().enumerate() {
-        if index > 0 && rows.len() < max_lines {
-            rows.push(StyledLine::plain("", Color::White));
-        }
+    let mut section_heights = vec![0usize; active_fields.len()];
+    let titled_fields = available.min(active_fields.len());
+    section_heights
+        .iter_mut()
+        .take(titled_fields)
+        .for_each(|height| *height = 1);
+    let mut remaining = available.saturating_sub(titled_fields);
 
-        let mut section_height = base;
-        if extra > 0 {
-            section_height += 1;
-            extra -= 1;
+    // The directly usable answer is the primary purpose of this pane. Give it
+    // enough rows for its complete wrapped value before distributing spare rows
+    // across the supporting fields. The old equal split silently hid most of a
+    // natural answer whenever all five sections were present.
+    if let Some(answer_index) = active_fields
+        .iter()
+        .position(|field| field.config.key == "answer_guidance")
+        .filter(|index| section_heights[*index] > 0)
+    {
+        let extra = desired_heights[answer_index]
+            .saturating_sub(section_heights[answer_index])
+            .min(remaining);
+        section_heights[answer_index] += extra;
+        remaining -= extra;
+    }
+
+    while remaining > 0 {
+        let mut added = false;
+        for index in 0..section_heights.len() {
+            if section_heights[index] < desired_heights[index] {
+                section_heights[index] += 1;
+                remaining -= 1;
+                added = true;
+                if remaining == 0 {
+                    break;
+                }
+            }
         }
-        let remaining = max_lines.saturating_sub(rows.len());
-        section_height = section_height.min(remaining);
-        if section_height == 0 {
+        if !added {
             break;
         }
+    }
 
+    let mut rows = Vec::new();
+    let mut rendered_fields = 0usize;
+    let now = Instant::now();
+    for (index, field) in active_fields.iter().enumerate() {
+        let section_height = section_heights[index];
+        if section_height == 0 {
+            continue;
+        }
+        if rendered_fields > 0 && gap_rows > 0 && rows.len() < max_lines {
+            rows.push(StyledLine::plain("", Color::White));
+        }
         rows.extend(agent_field_rows(
             field,
             width,
             section_height,
-            Instant::now(),
+            now,
             state.fade_duration,
         ));
+        rendered_fields += 1;
     }
     rows
 }
@@ -9742,8 +9872,22 @@ fn agent_field_rows(
         .into_iter()
         .map(|line| StyledLine::plain(line, agent_value_color(field, age, fade_duration)))
         .collect::<Vec<_>>();
-    let start = wrapped.len().saturating_sub(body_rows);
-    rows.extend_from_slice(&wrapped[start..]);
+    let truncated = wrapped.len() > body_rows;
+    rows.extend(wrapped.into_iter().take(body_rows));
+    if truncated {
+        if let Some(segment) = rows.last_mut().and_then(|line| line.segments.last_mut()) {
+            if width <= 1 {
+                segment.text = "…".to_string();
+            } else {
+                let prefix = segment
+                    .text
+                    .chars()
+                    .take(width.saturating_sub(2))
+                    .collect::<String>();
+                segment.text = format!("{} …", prefix.trim_end());
+            }
+        }
+    }
     rows
 }
 

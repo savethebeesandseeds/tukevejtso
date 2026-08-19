@@ -15,8 +15,7 @@
       "min_display_seconds": 10,
       "preserve_on_empty": true,
       "schema": {
-        "type": "string",
-        "maxLength": 700
+        "type": "string"
       }
     },
     {
