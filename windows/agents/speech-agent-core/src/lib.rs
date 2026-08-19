@@ -1808,30 +1808,36 @@ impl AppState {
             .iter()
             .map(|field| field.config.clone())
             .collect::<Vec<_>>();
-        if agent_result_matches_fields(&context.agent_result, &agent_field_configs) {
-            self.agent.canonical_result = context.agent_result.clone();
-            if value_has_content(&context.agent_result) {
-                let _ = self.agent.apply_result(context.agent_result.clone(), true);
+        // A forced refresh means the Agent contract changed (for example, its
+        // answer mode or reference context). Keep the transcript, but do not
+        // seed the new worker with an answer or delta baseline produced under
+        // the previous contract.
+        if !saved.force_agent_update {
+            if agent_result_matches_fields(&context.agent_result, &agent_field_configs) {
+                self.agent.canonical_result = context.agent_result.clone();
+                if value_has_content(&context.agent_result) {
+                    let _ = self.agent.apply_result(context.agent_result.clone(), true);
+                }
             }
+            self.agent.last_successful_input =
+                context
+                    .agent_last_successful_input
+                    .clone()
+                    .map(|mut input| {
+                        input.force = false;
+                        input.generation = self.agent_generation;
+                        if !self.transcription_settings.active.include_microphone
+                            || !self
+                                .transcription_settings
+                                .active
+                                .sources
+                                .contains(&SourceKind::Microphone)
+                        {
+                            input.microphone_transcript = None;
+                        }
+                        input
+                    });
         }
-        self.agent.last_successful_input =
-            context
-                .agent_last_successful_input
-                .clone()
-                .map(|mut input| {
-                    input.force = false;
-                    input.generation = self.agent_generation;
-                    if !self.transcription_settings.active.include_microphone
-                        || !self
-                            .transcription_settings
-                            .active
-                            .sources
-                            .contains(&SourceKind::Microphone)
-                    {
-                        input.microphone_transcript = None;
-                    }
-                    input
-                });
 
         let skipped = context.errors.len().saturating_sub(ERROR_BUFFER_CAPACITY);
         let skipped_repeats = context
@@ -3995,6 +4001,7 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
     let mut agent = build_transcription_agent_config(&settings, &sources, &agent_root)?;
     if let Some(restored_context) = restart_state
         .as_ref()
+        .filter(|state| !state.force_agent_update)
         .and_then(|state| state.context.as_ref())
     {
         if agent_result_matches_fields(&restored_context.agent_result, &agent.fields) {
@@ -7615,10 +7622,12 @@ fn apply_transcription_settings(
                             input.microphone_transcript = None;
                         }
                     }
-                } else if answer_mode_changed {
+                }
+                if answer_mode_changed {
                     if let Some(result) = state.agent.canonical_result.as_object_mut() {
                         result.insert("answer_guidance".to_string(), Value::String(String::new()));
                     }
+                    state.agent.last_successful_input = None;
                 }
                 state.status = "Settings saved; restarting".to_string();
                 state.restart_requested = true;
