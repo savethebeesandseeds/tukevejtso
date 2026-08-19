@@ -46,6 +46,8 @@ The Responses API requests use `store: false`. System-output transcript text is 
 
 Choose **Language: Spanish (es)** and **Whisper model: medium** in F9. Whisper's `medium` model is multilingual and is the Spanish-capable counterpart to the English-only `medium.en`; there is no separate `medium.es` model. When Spanish or another non-English language is selected, the application automatically replaces a standard `.en` model with its multilingual counterpart. The launcher downloads `ggml-medium.bin` on first use.
 
+Language and Whisper model are session choices. Each independent launch starts in English with `medium.en`; an F9 worker restart keeps the choices made during the current session. Explicit `-Language` and `-Model` launch options still override these defaults.
+
 The model list follows the global language setting: English shows the four standard `.en` models, while Auto, Spanish, and other languages show the four standard multilingual models. This removes duplicate English choices. To add another whisper.cpp model, place a regular file named `ggml-<model-name>.bin` directly in `windows\models\whisper` and reopen F9. Detected models are added to the list; custom models carrying the English-only `.en` marker are offered only for English. Built-in models retain automatic downloads, while custom models must already exist in the folder.
 
 ### Answer modes
@@ -64,7 +66,7 @@ Place private UTF-8 `.md`, `.txt`, `.json`, or `.csv` files in `contexts`, besid
     - **Soft** uses it as helpful background while allowing transcript evidence and reliable general knowledge.
     - **Strong** treats it as authoritative factual grounding, avoids outside facts, and states when the available context is insufficient.
 
-The selected file is loaded fresh and sent in full with every Agent Insights request. Editing it takes effect on the next request without another restart. Files are limited to 32 KiB, both to bound API cost and to prevent accidentally selecting a large export. Missing, empty, unreadable, non-UTF-8, symbolic-link, or oversized files stop before the API call and produce an F9 error.
+The selected file is loaded fresh and sent in full with every Agent Insights request. Editing it takes effect on the next request without another restart. Context-file selection is session-only and returns to **None** on every independent launch; F9 worker restarts preserve it within the current session. Context strictness remains persistent. Files are limited to 32 KiB, both to bound API cost and to prevent accidentally selecting a large export. Missing, empty, unreadable, non-UTF-8, symbolic-link, or oversized files stop before the API call and produce an F9 error.
 
 Changing the selected file or strictness clears Agent results derived under the old context and requests a fresh update. Document content is sent as untrusted user data; a higher-priority developer policy tells the model never to treat instructions inside the document as prompt instructions. Private context files are ignored by Git, and only `example.md` is tracked. This is lightweight whole-document grounding, not chunked retrieval or full RAG.
 
@@ -73,8 +75,10 @@ Changing the selected file or strictness clears Agent results derived under the 
 | Group | Settings | Application behavior |
 | --- | --- | --- |
 | Transcription | Transcript fade | Applies immediately. |
-| Transcription | Sources, language, Whisper model, Whisper window | Saved and applied through an automatic worker restart. |
-| Agent | Agent on/off, Agent model, Answer mode, Mic context, Reference context, Context strictness | Saved and applied through an automatic worker restart. |
+| Transcription | Sources, Whisper window | Persistent and applied through an automatic worker restart. |
+| Transcription | Language, Whisper model | Session-only; defaults to English with `medium.en` on a fresh launch and survives automatic worker restarts. |
+| Agent | Agent on/off, Agent model, Answer mode, Mic context, Context strictness | Persistent and applied through an automatic worker restart. |
+| Agent | Reference context | Session-only; defaults to **None** on a fresh launch and survives automatic worker restarts. |
 | API safeguards | Hidden API pause, hidden exit, idle exit, maximum session, token budget | Applies without restarting capture. |
 | Appearance | Transparency | Applies immediately through the existing terminal-transparency tool. |
 

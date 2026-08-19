@@ -3783,6 +3783,11 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
             " Agent API requests are disabled until you explicitly review and apply settings.",
         );
     }
+    if restart_state.is_none() {
+        settings.language = default_transcription_language();
+        settings.model = default_transcription_model();
+        settings.context_file = None;
+    }
     let loaded_model = transcription_model_choice_from_path(&model_path);
     settings.model = loaded_model.clone();
     if args.language_provided {

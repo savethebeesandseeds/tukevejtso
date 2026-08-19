@@ -384,6 +384,8 @@ function Get-DefaultTranscriptionSettings {
 }
 
 function Read-TranscriptionSettings {
+    param([switch]$IncludeSessionChoices)
+
     $settings = Get-DefaultTranscriptionSettings
     if (-not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
         return $settings
@@ -391,10 +393,10 @@ function Read-TranscriptionSettings {
 
     try {
         $saved = Get-Content -Raw -LiteralPath $SettingsPath | ConvertFrom-Json
-        if ($saved.language) {
+        if ($IncludeSessionChoices -and $saved.language) {
             $settings.language = ConvertTo-WhisperLanguage -Value ([string]$saved.language)
         }
-        if ($saved.model -and (Test-WhisperModelName -Name ([string]$saved.model))) {
+        if ($IncludeSessionChoices -and $saved.model -and (Test-WhisperModelName -Name ([string]$saved.model))) {
             $settings.model = [string]$saved.model
         }
         if ($null -ne $saved.fade_seconds -and [int]$saved.fade_seconds -ge 5 -and [int]$saved.fade_seconds -le 180) {
@@ -766,6 +768,7 @@ $openAiApiKeyEnvironmentExisted = Test-Path Env:OPENAI_API_KEY
 $previousOpenAiApiKeyEnvironment = $env:OPENAI_API_KEY
 $restartStatePath = $null
 $agentExitCode = 0
+$continuingSession = $false
 
 try {
 if ($TranscriptDump) {
@@ -783,7 +786,7 @@ $manifest = Join-Path $AgentRoot "Cargo.toml"
 
 while ($true) {
     $agentExitCode = 0
-    $settings = Read-TranscriptionSettings
+    $settings = Read-TranscriptionSettings -IncludeSessionChoices:$continuingSession
     Invoke-OptionalTransparencySetup -Settings $settings
     $resolvedLanguage = Resolve-LanguageOption -Settings $settings
     $resolvedModel = Resolve-ModelOption -Settings $settings -LanguageName $resolvedLanguage
@@ -870,6 +873,7 @@ while ($true) {
         $NoAgent = $false
         $SetupOpenAiKey = $false
         $Transparency = $false
+        $continuingSession = $true
         Import-OpenAiApiKey
         $agentExitCode = 0
         continue
