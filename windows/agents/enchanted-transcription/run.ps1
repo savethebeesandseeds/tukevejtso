@@ -554,6 +554,7 @@ function Resolve-Model {
             File = "ggml-medium.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
             MinimumBytes = 1400MB
+            Sha256 = "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208"
         }
         "tiny.en" = @{
             File = "ggml-tiny.en.bin"
@@ -582,11 +583,13 @@ function Resolve-Model {
         $file = $entry.File
         $url = $entry.Url
         $minimumBytes = [long]$entry.MinimumBytes
+        $sha256 = [string]$entry["Sha256"]
     }
     else {
         $file = "ggml-$Name.bin"
         $url = $null
         $minimumBytes = 1MB
+        $sha256 = $null
     }
     $path = Join-Path $ModelsDir $file
     if (-not $entry -and -not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -597,6 +600,48 @@ function Resolve-Model {
         Path = $path
         Url = $url
         MinimumBytes = $minimumBytes
+        Sha256 = $sha256
+    }
+}
+
+function Invoke-ResumableWhisperModelDownload {
+    param(
+        [string]$Url,
+        [string]$Destination
+    )
+
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if (-not $curl) {
+        throw "curl.exe is required for resumable Whisper model downloads."
+    }
+
+    $existingBytes = if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        (Get-Item -LiteralPath $Destination).Length
+    }
+    else {
+        0
+    }
+    if ($existingBytes -gt 0) {
+        Write-Host "Resuming at $([math]::Round($existingBytes / 1MB, 1)) MiB..." -ForegroundColor Cyan
+    }
+
+    $curlArgs = @(
+        "--location",
+        "--fail",
+        "--show-error",
+        "--retry", "100",
+        "--retry-all-errors",
+        "--retry-delay", "5",
+        "--connect-timeout", "30",
+        "--speed-limit", "1024",
+        "--speed-time", "120",
+        "--continue-at", "-",
+        "--output", $Destination,
+        $Url
+    )
+    & $curl.Source @curlArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Whisper model download paused after repeated network failures. The partial file was retained and the next run will resume it."
     }
 }
 
@@ -799,28 +844,41 @@ while ($true) {
         if ([string]::IsNullOrWhiteSpace([string]$modelInfo.Url)) {
             throw "Custom Whisper model $($modelInfo.Name) is incomplete or invalid: $($modelInfo.Path)"
         }
+        $tmp = "$($modelInfo.Path).download"
         if (Test-Path -LiteralPath $modelInfo.Path -PathType Leaf) {
-            Write-Host "Cached Whisper model $($modelInfo.Name) is incomplete; downloading it again..." -ForegroundColor Yellow
+            $cachedBytes = (Get-Item -LiteralPath $modelInfo.Path).Length
+            $partialBytes = if (Test-Path -LiteralPath $tmp -PathType Leaf) {
+                (Get-Item -LiteralPath $tmp).Length
+            }
+            else {
+                0
+            }
+            if ($cachedBytes -gt $partialBytes) {
+                if (Test-Path -LiteralPath $tmp) {
+                    Remove-Item -LiteralPath $tmp -Force
+                }
+                Move-Item -LiteralPath $modelInfo.Path -Destination $tmp -Force
+            }
+            Write-Host "Cached Whisper model $($modelInfo.Name) is incomplete; resuming its download..." -ForegroundColor Yellow
+        }
+        elseif (Test-Path -LiteralPath $tmp -PathType Leaf) {
+            Write-Host "Resuming Whisper model $($modelInfo.Name) download..." -ForegroundColor Cyan
         }
         else {
             Write-Host "Downloading Whisper model $($modelInfo.Name)..." -ForegroundColor Cyan
         }
-        $tmp = "$($modelInfo.Path).download"
-        try {
-            if (Test-Path -LiteralPath $tmp) {
-                Remove-Item -LiteralPath $tmp -Force
-            }
-            Invoke-WebRequest -Uri $modelInfo.Url -OutFile $tmp
-            if (-not (Test-WhisperModelFile -Path $tmp -MinimumBytes $modelInfo.MinimumBytes)) {
-                throw "The Whisper model download was incomplete or invalid. Please run the command again to retry."
-            }
-            Move-Item -LiteralPath $tmp -Destination $modelInfo.Path -Force
+        Invoke-ResumableWhisperModelDownload -Url $modelInfo.Url -Destination $tmp
+        if (-not (Test-WhisperModelFile -Path $tmp -MinimumBytes $modelInfo.MinimumBytes)) {
+            throw "The Whisper model download is still incomplete or invalid. Its partial file was retained for the next resume attempt."
         }
-        finally {
-            if (Test-Path -LiteralPath $tmp) {
-                Remove-Item -LiteralPath $tmp -Force
+        if (-not [string]::IsNullOrWhiteSpace($modelInfo.Sha256)) {
+            Write-Host "Verifying Whisper model integrity..." -ForegroundColor Cyan
+            $actualSha256 = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualSha256 -ne $modelInfo.Sha256.ToLowerInvariant()) {
+                throw "The completed Whisper model does not match the official SHA-256 checksum. The partial file was retained for inspection rather than silently starting over."
             }
         }
+        Move-Item -LiteralPath $tmp -Destination $modelInfo.Path -Force
     }
 
     $cargoArgs = @("run", "--release", "--manifest-path", $manifest)
