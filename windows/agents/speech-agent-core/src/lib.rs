@@ -203,6 +203,7 @@ const TRANSCRIPTION_MODEL_CHOICES: [&str; 8] = [
     "medium.en",
 ];
 const TRANSCRIPTION_WINDOW_CHOICES: [usize; 7] = [6, 8, 10, 12, 15, 20, 30];
+const HIDDEN_PAUSE_SECOND_CHOICES: [u64; 6] = [0, 5, 10, 15, 30, 60];
 const HIDDEN_EXIT_MINUTE_CHOICES: [u64; 6] = [0, 5, 10, 15, 30, 60];
 const IDLE_EXIT_MINUTE_CHOICES: [u64; 6] = [0, 15, 30, 60, 120, 240];
 const SESSION_MINUTE_CHOICES: [u64; 6] = [0, 60, 120, 240, 480, 720];
@@ -466,6 +467,8 @@ struct EnchantedTranscriptionSettings {
     include_microphone: bool,
     #[serde(default = "default_pause_when_hidden")]
     pause_agent_when_hidden: bool,
+    #[serde(default = "default_hidden_pause_seconds")]
+    hidden_pause_seconds: u64,
     #[serde(default = "default_hidden_exit_minutes")]
     hidden_exit_minutes: u64,
     #[serde(default = "default_idle_exit_minutes")]
@@ -489,6 +492,7 @@ impl Default for EnchantedTranscriptionSettings {
             answer_mode: default_transcription_answer_mode(),
             include_microphone: false,
             pause_agent_when_hidden: default_pause_when_hidden(),
+            hidden_pause_seconds: default_hidden_pause_seconds(),
             hidden_exit_minutes: default_hidden_exit_minutes(),
             idle_exit_minutes: default_idle_exit_minutes(),
             max_session_minutes: default_session_minutes(),
@@ -510,6 +514,14 @@ impl EnchantedTranscriptionSettings {
         self.fade_seconds = self.fade_seconds.clamp(5, 180);
         if self.agent_model.trim().is_empty() {
             self.agent_model = DEFAULT_AGENT_MODEL.to_string();
+        }
+        self.hidden_pause_seconds = normalize_choice(
+            self.hidden_pause_seconds,
+            &HIDDEN_PAUSE_SECOND_CHOICES,
+            default_hidden_pause_seconds(),
+        );
+        if self.hidden_pause_seconds == 0 {
+            self.pause_agent_when_hidden = false;
         }
         self.hidden_exit_minutes = normalize_choice(
             self.hidden_exit_minutes,
@@ -651,6 +663,10 @@ fn default_transcription_answer_mode() -> TranscriptionAnswerMode {
 
 fn default_pause_when_hidden() -> bool {
     true
+}
+
+fn default_hidden_pause_seconds() -> u64 {
+    15
 }
 
 fn default_hidden_exit_minutes() -> u64 {
@@ -966,6 +982,7 @@ struct TranscriptionRestartSettings {
     answer_mode: TranscriptionAnswerMode,
     include_microphone: bool,
     pause_agent_when_hidden: bool,
+    hidden_pause_seconds: u64,
     hidden_exit_minutes: u64,
     idle_exit_minutes: u64,
     max_session_minutes: u64,
@@ -1077,7 +1094,7 @@ struct TranscriptWord {
 impl AppState {
     fn new(config: &AppConfig) -> Self {
         let typing = config.typing.as_ref();
-        Self {
+        let mut state = Self {
             mode: config.mode,
             model_path: config.model_path.clone(),
             dump_path: session_dump_path(&config.temp_dir),
@@ -1162,7 +1179,29 @@ impl AppState {
                 .then_some(config.transcription_settings.agent_token_budget),
             token_budget_prompt_open: false,
             token_budget_prompt_dismissed: false,
+        };
+
+        if config.mode == AppMode::Transcription
+            && config.transcription_settings.agent_enabled
+            && !config.agent.enabled
+        {
+            let message = if !config.sources.contains(&SourceKind::SystemOutput) {
+                "Agent Insights unavailable: System output capture is disabled."
+            } else {
+                "Agent Insights unavailable: the OpenAI API key was not loaded."
+            };
+            state.agent.status = message.to_string();
+            state.record_error(message);
         }
+        if config.mode == AppMode::Transcription
+            && config.transcription_settings.pause_agent_when_hidden
+            && config.terminal_hwnd.is_none()
+        {
+            state.record_error(
+                "Terminal visibility is unavailable; hidden API pausing is disabled for this session.",
+            );
+        }
+        state
     }
 
     fn update_transcript(&mut self, source: SourceKind, text: &str) -> bool {
@@ -1497,6 +1536,7 @@ impl TranscriptionSettingsState {
             answer_mode: self.pending.answer_mode,
             include_microphone: self.pending.include_microphone,
             pause_agent_when_hidden: self.pending.pause_agent_when_hidden,
+            hidden_pause_seconds: self.pending.hidden_pause_seconds,
             hidden_exit_minutes: self.pending.hidden_exit_minutes,
             idle_exit_minutes: self.pending.idle_exit_minutes,
             max_session_minutes: self.pending.max_session_minutes,
@@ -1518,6 +1558,7 @@ impl TranscriptionRestartSettings {
             answer_mode: settings.answer_mode,
             include_microphone: settings.include_microphone,
             pause_agent_when_hidden: settings.pause_agent_when_hidden,
+            hidden_pause_seconds: settings.hidden_pause_seconds,
             hidden_exit_minutes: settings.hidden_exit_minutes,
             idle_exit_minutes: settings.idle_exit_minutes,
             max_session_minutes: settings.max_session_minutes,
@@ -2145,14 +2186,9 @@ fn run(product: ProductMode) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let refresh_generation = Arc::new(AtomicU64::new(0));
     let agent_force_generation = Arc::new(AtomicU64::new(0));
-    let agent_requests_allowed = Arc::new(AtomicBool::new(
-        config.mode != AppMode::Transcription
-            || !config.transcription_settings.pause_agent_when_hidden
-            || config
-                .terminal_hwnd
-                .map(terminal_window_is_visible)
-                .unwrap_or(false),
-    ));
+    // Visibility monitoring is initialized in the render loop. Starting open avoids
+    // silently disabling Agent Insights when a terminal handle cannot be resolved.
+    let agent_requests_allowed = Arc::new(AtomicBool::new(true));
     let typing_intelligence_enabled = Arc::new(AtomicBool::new(
         config
             .typing
@@ -3417,7 +3453,8 @@ fn whisper_loop(
                                 rms: energy,
                             });
                             if source == SourceKind::SystemOutput {
-                                stream.agent_update_pending = true;
+                                stream.agent_update_pending = false;
+                                agent_update_needed = true;
                             }
                         }
                     }
@@ -5384,14 +5421,11 @@ fn update_transcription_lifecycle(
 
     let now = Instant::now();
     let settings = &state.transcription_settings.active;
-    let visible = state
-        .terminal_hwnd
-        .map(terminal_window_is_visible)
-        .unwrap_or(false);
-    if visible {
-        state.hidden_since = None;
-    } else if state.hidden_since.is_none() {
-        state.hidden_since = Some(now);
+    let visibility = state.terminal_hwnd.map(terminal_window_is_visible);
+    match visibility {
+        Some(true) | None => state.hidden_since = None,
+        Some(false) if state.hidden_since.is_none() => state.hidden_since = Some(now),
+        Some(false) => {}
     }
 
     let hidden_elapsed = state
@@ -5404,15 +5438,16 @@ fn update_transcription_lifecycle(
         minutes > 0 && elapsed >= Duration::from_secs(minutes.saturating_mul(60))
     };
 
-    let exit_reason = if !visible && expired(hidden_elapsed, settings.hidden_exit_minutes) {
-        Some("Auto-exit: terminal remained hidden")
-    } else if expired(idle_elapsed, settings.idle_exit_minutes) {
-        Some("Auto-exit: no transcript activity")
-    } else if expired(session_elapsed, settings.max_session_minutes) {
-        Some("Auto-exit: maximum session reached")
-    } else {
-        None
-    };
+    let exit_reason =
+        if visibility == Some(false) && expired(hidden_elapsed, settings.hidden_exit_minutes) {
+            Some("Auto-exit: terminal remained hidden")
+        } else if expired(idle_elapsed, settings.idle_exit_minutes) {
+            Some("Auto-exit: no transcript activity")
+        } else if expired(session_elapsed, settings.max_session_minutes) {
+            Some("Auto-exit: maximum session reached")
+        } else {
+            None
+        };
     if let Some(reason) = exit_reason {
         let changed = state.status != reason;
         state.status = reason.to_string();
@@ -5426,7 +5461,9 @@ fn update_transcription_lifecycle(
         state.token_budget_prompt_open = true;
         prompt_changed = true;
     }
-    let hidden_pause = settings.pause_agent_when_hidden && !visible;
+    let hidden_pause = settings.pause_agent_when_hidden
+        && visibility == Some(false)
+        && hidden_elapsed >= Duration::from_secs(settings.hidden_pause_seconds);
     let allowed = state.agent.enabled && !hidden_pause && !budget_reached;
     requests_allowed.store(allowed, Ordering::SeqCst);
 
@@ -5660,7 +5697,16 @@ fn change_transcription_setting(
         }
         7 => settings.pending.answer_mode = settings.pending.answer_mode.cycle(direction),
         8 => settings.pending.include_microphone = !settings.pending.include_microphone,
-        9 => settings.pending.pause_agent_when_hidden = !settings.pending.pause_agent_when_hidden,
+        9 => {
+            let current = if settings.pending.pause_agent_when_hidden {
+                settings.pending.hidden_pause_seconds
+            } else {
+                0
+            };
+            let next = cycle_u64_choice(current, &HIDDEN_PAUSE_SECOND_CHOICES, direction);
+            settings.pending.pause_agent_when_hidden = next > 0;
+            settings.pending.hidden_pause_seconds = next;
+        }
         10 => {
             settings.pending.hidden_exit_minutes = cycle_u64_choice(
                 settings.pending.hidden_exit_minutes,
@@ -6200,11 +6246,28 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
     let (width, height) = terminal::size()?;
     let usable_width = width.saturating_sub(1).max(1) as usize;
     let footer_row = height.saturating_sub(1);
-    let rows = transcription_settings_rows(state, usable_width, footer_row as usize);
+    let gap_width = if usable_width >= 64 { 4 } else { 2 }.min(usable_width.saturating_sub(2));
+    let columns_width = usable_width.saturating_sub(gap_width);
+    let left_width = if columns_width > 1 {
+        (columns_width * 45 / 100).clamp(1, columns_width - 1)
+    } else {
+        columns_width
+    };
+    let right_width = columns_width.saturating_sub(left_width);
+    let (option_rows, detail_rows) = transcription_settings_columns(state, left_width, right_width);
+    let column_start = 1usize;
+    let column_height = option_rows.len().max(detail_rows.len());
+    let error_start = column_start + column_height + 2;
+    let error_rows = transcription_error_rows(
+        state,
+        usable_width,
+        (footer_row as usize).saturating_sub(error_start),
+    );
     let mut out = io::stdout();
 
     for row in 0..height {
         queue!(out, cursor::MoveTo(0, row))?;
+        let row_index = row as usize;
         if row == footer_row {
             let footer = if state.transcription_settings.confirm_close {
                 "Enter/A apply | D discard | Esc returns"
@@ -6212,8 +6275,32 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
                 "F9/Esc close | Up/Down select | Left/Right change | Ctrl+C exits"
             };
             render_segment(&mut out, footer, usable_width, Color::DarkGrey)?;
-        } else if let Some(line) = rows.get(row as usize) {
-            render_styled_segment(&mut out, line, usable_width)?;
+        } else if row_index == 0 {
+            render_segment(
+                &mut out,
+                "Transcription settings",
+                usable_width,
+                Color::White,
+            )?;
+        } else if (column_start..column_start + column_height).contains(&row_index) {
+            let index = row_index - column_start;
+            if let Some(line) = option_rows.get(index) {
+                render_styled_segment(&mut out, line, left_width)?;
+            } else {
+                render_segment(&mut out, "", left_width, Color::White)?;
+            }
+            render_gap(&mut out, gap_width)?;
+            if let Some(line) = detail_rows.get(index) {
+                render_styled_segment(&mut out, line, right_width)?;
+            } else {
+                render_segment(&mut out, "", right_width, Color::White)?;
+            }
+        } else if row_index >= error_start {
+            if let Some(line) = error_rows.get(row_index - error_start) {
+                render_styled_segment(&mut out, line, usable_width)?;
+            } else {
+                render_segment(&mut out, "", usable_width, Color::White)?;
+            }
         } else {
             render_segment(&mut out, "", usable_width, Color::White)?;
         }
@@ -6222,11 +6309,11 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-fn transcription_settings_rows(
+fn transcription_settings_columns(
     state: &AppState,
-    width: usize,
-    available_rows: usize,
-) -> Vec<StyledLine> {
+    option_width: usize,
+    detail_width: usize,
+) -> (Vec<StyledLine>, Vec<StyledLine>) {
     let settings = &state.transcription_settings;
     let pending = &settings.pending;
     let option_rows = vec![
@@ -6256,7 +6343,10 @@ fn transcription_settings_rows(
         ),
         (
             "Pause API when hidden",
-            on_off(pending.pause_agent_when_hidden).to_string(),
+            hidden_pause_text(
+                pending.pause_agent_when_hidden,
+                pending.hidden_pause_seconds,
+            ),
         ),
         (
             "Exit while hidden",
@@ -6270,59 +6360,150 @@ fn transcription_settings_rows(
         ),
     ];
 
-    let mut rows = vec![StyledLine::plain("Transcription settings", Color::White)];
+    let mut option_lines = Vec::new();
     for (index, (label, value)) in option_rows.iter().enumerate() {
         let selected = index == settings.selection;
-        rows.push(StyledLine::plain(
+        option_lines.push(StyledLine::plain(
             fit_line(
                 &format!("{} {label}: {value}", if selected { ">" } else { " " }),
-                width.max(1),
+                option_width.max(1),
             ),
             if selected { Color::Cyan } else { Color::White },
         ));
     }
 
     let mut detail_rows = vec![StyledLine::plain("Settings details", Color::Yellow)];
-    for line in wrap_plain_text(transcription_setting_help(settings.selection), width.max(1)) {
+    for line in wrap_plain_text(
+        transcription_setting_help(settings.selection),
+        detail_width.max(1),
+    ) {
         detail_rows.push(StyledLine::plain(line, Color::DarkGrey));
     }
+    detail_rows.push(StyledLine::plain("", Color::White));
     detail_rows.push(StyledLine::plain("Choices", Color::Cyan));
     for line in wrap_choice_list(
         transcription_setting_choices(settings.selection),
-        width.max(1),
+        detail_width.max(1),
     ) {
         detail_rows.push(StyledLine::plain(line, Color::DarkGrey));
     }
 
-    let mut notice_rows = Vec::new();
     if settings.has_restart_changes() {
-        notice_rows.push(StyledLine::plain(
+        detail_rows.push(StyledLine::plain("", Color::White));
+        detail_rows.push(StyledLine::plain(
             fit_line(
                 "Pending worker changes will restart capture after you apply them.",
-                width.max(1),
+                detail_width.max(1),
             ),
             Color::Yellow,
         ));
     }
     if let Some(note) = &settings.note {
-        notice_rows.push(StyledLine::plain(
-            fit_line(note, width.max(1)),
+        detail_rows.push(StyledLine::plain(
+            fit_line(note, detail_width.max(1)),
             Color::Yellow,
         ));
     }
     if settings.confirm_close {
-        notice_rows.push(StyledLine::plain(
-            fit_line("Apply these changes or discard them?", width.max(1)),
+        detail_rows.push(StyledLine::plain(
+            fit_line("Apply these changes or discard them?", detail_width.max(1)),
             Color::Yellow,
         ));
     }
 
-    if state.errors.is_empty() {
-        rows.push(StyledLine::plain("Recent errors: none", Color::DarkGrey));
+    (option_lines, detail_rows)
+}
+
+fn transcription_error_rows(
+    state: &AppState,
+    width: usize,
+    available_rows: usize,
+) -> Vec<StyledLine> {
+    if available_rows == 0 {
+        return Vec::new();
+    }
+
+    let diagnostic = format!(
+        "Agent status: {} | requests {}",
+        state.agent.status, state.agent.request_count
+    );
+    let visibility = match state.terminal_hwnd {
+        Some(handle) if terminal_window_is_visible(handle) => "visible",
+        Some(_) => "hidden",
+        None => "unavailable; API requests stay enabled",
+    };
+    let pause_setting = if state.transcription_settings.active.pause_agent_when_hidden {
+        format!(
+            "after {}s hidden",
+            state.transcription_settings.active.hidden_pause_seconds
+        )
     } else {
-        let reserved_rows = rows.len() + detail_rows.len() + notice_rows.len() + 1;
+        "off".to_string()
+    };
+    let visibility_diagnostic =
+        format!("Window monitor: {visibility} | hidden API pause: {pause_setting}");
+    let diagnostic_color = if state.agent.enabled {
+        Color::DarkGrey
+    } else {
+        Color::Yellow
+    };
+    let mut rows = Vec::new();
+
+    if !state.errors.is_empty() && available_rows <= 3 {
+        if available_rows == 1 {
+            if let Some(error) = state.errors.back() {
+                rows.push(StyledLine::plain(
+                    fit_line(&format_error_entry(error), width.max(1)),
+                    Color::Red,
+                ));
+            }
+            return rows;
+        }
+
+        let visible_count = (available_rows - 1).min(state.errors.len());
+        rows.push(StyledLine::plain(
+            format!(
+                "Recent errors (showing {visible_count} of {})",
+                state.errors.len()
+            ),
+            Color::Red,
+        ));
+        for error in state.errors.iter().rev().take(visible_count) {
+            rows.push(StyledLine::plain(
+                fit_line(&format_error_entry(error), width.max(1)),
+                Color::Red,
+            ));
+        }
+        return rows;
+    }
+
+    if state.errors.is_empty() {
+        rows.push(StyledLine::plain("Recent errors", Color::DarkGrey));
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain(
+                fit_line(&diagnostic, width.max(1)),
+                diagnostic_color,
+            ));
+        }
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain(
+                fit_line(&visibility_diagnostic, width.max(1)),
+                if state.terminal_hwnd.is_some() {
+                    Color::DarkGrey
+                } else {
+                    Color::Yellow
+                },
+            ));
+        }
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain(
+                "No errors recorded this session.",
+                Color::DarkGrey,
+            ));
+        }
+    } else {
         let visible_count = available_rows
-            .saturating_sub(reserved_rows)
+            .saturating_sub(3)
             .max(1)
             .min(state.errors.len());
         let heading = if visible_count == state.errors.len() {
@@ -6334,16 +6515,32 @@ fn transcription_settings_rows(
             )
         };
         rows.push(StyledLine::plain(heading, Color::Red));
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain(
+                fit_line(&diagnostic, width.max(1)),
+                diagnostic_color,
+            ));
+        }
+        if rows.len() < available_rows {
+            rows.push(StyledLine::plain(
+                fit_line(&visibility_diagnostic, width.max(1)),
+                if state.terminal_hwnd.is_some() {
+                    Color::DarkGrey
+                } else {
+                    Color::Yellow
+                },
+            ));
+        }
         for error in state.errors.iter().rev().take(visible_count) {
+            if rows.len() >= available_rows {
+                break;
+            }
             rows.push(StyledLine::plain(
                 fit_line(&format_error_entry(error), width.max(1)),
                 Color::Red,
             ));
         }
     }
-
-    rows.extend(detail_rows);
-    rows.extend(notice_rows);
     rows
 }
 
@@ -6371,9 +6568,17 @@ fn transcription_setting_choices(selection: usize) -> &'static [&'static str] {
             "medium.en",
         ],
         4 => &["6s", "8s", "10s", "12s", "15s", "20s", "30s"],
-        5 | 8 | 9 => &["On", "Off"],
+        5 | 8 => &["On", "Off"],
         6 => &["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"],
         7 => &["Silhouette", "Natural Answer"],
+        9 => &[
+            "Off",
+            "After 5s",
+            "After 10s",
+            "After 15s",
+            "After 30s",
+            "After 60s",
+        ],
         10 => &["Off", "5m", "10m", "15m", "30m", "60m"],
         11 => &["Off", "15m", "30m", "60m", "120m", "240m"],
         12 => &["Off", "60m", "120m", "240m", "480m", "720m"],
@@ -6429,8 +6634,8 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         6 => "Selects the OpenAI model used for insight updates. Model choice affects latency, quality, and API cost; changing it restarts agent wiring.",
         7 => "Silhouette returns a content-free answer frame with blanks for your own knowledge. Natural Answer returns a concise, directly usable answer. Changing modes uses the normal automatic application restart.",
         8 => "Allows microphone transcript text to be included in API context. Off keeps local speech out of remote requests; changing it restarts agent wiring.",
-        9 => "Stops only new API requests while this terminal is hidden, minimized, cloaked, or invalid. Audio capture, Whisper, and context buffering continue locally.",
-        10 => "Closes the application after it remains hidden for this long. Off disables this shutdown rule; API pausing can still happen immediately.",
+        9 => "Stops only new API requests after this terminal has remained hidden, minimized, or cloaked for the selected grace period. Audio capture, Whisper, and context buffering continue locally. If the terminal cannot be identified, requests remain enabled instead of being silently blocked.",
+        10 => "Closes the application after it remains hidden for this long. Off disables this shutdown rule; API pausing still follows its separately configured grace period.",
         11 => "Closes the application after no transcript changes for this long. Off allows an idle visible session to remain open indefinitely.",
         12 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
         13 => "Pauses new insight requests at this reported API-token threshold and asks before granting another block of the same size. Local transcription and context collection keep running; Off removes the prompt and cap.",
@@ -6455,6 +6660,14 @@ fn on_off(value: bool) -> &'static str {
         "on"
     } else {
         "off"
+    }
+}
+
+fn hidden_pause_text(enabled: bool, seconds: u64) -> String {
+    if enabled {
+        format!("after {seconds}s")
+    } else {
+        "off".to_string()
     }
 }
 
