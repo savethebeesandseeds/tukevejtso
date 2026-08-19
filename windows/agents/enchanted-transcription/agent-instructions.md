@@ -13,6 +13,7 @@
       "title_color": "#FFD85C",
       "value_color": "#FFEEAA",
       "min_display_seconds": 10,
+      "preserve_on_empty": true,
       "schema": {
         "type": "string",
         "maxLength": 700
@@ -119,10 +120,13 @@ Valid forms include:
 Return a concise, directly usable answer to the latest explicit question or request from the system-output speaker.
 
 - Write the answer itself, with no label, preamble, coaching, or explanation of how to answer.
+- Never return a content-free sentence frame, rhetorical template, or `...` blanks; those belong only to silhouette mode.
 - Prefer one to four natural spoken sentences.
 - Use relevant transcript evidence and reliable general knowledge, but never invent missing facts.
 - State uncertainty plainly when the available context is insufficient.
-- If there is no clear question or request to answer, return an empty string.
+- If there is a newer clear question or request, replace `answer_guidance` with its answer.
+- If there is no newer clear question or request and `current_agent_state.answer_guidance` already contains an answer, preserve it unchanged.
+- Return an empty string only when there is no clear question or request and the current answer is already empty.
 
 ## Other fields
 

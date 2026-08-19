@@ -180,6 +180,17 @@ impl TranscriptionAnswerMode {
         }
     }
 
+    fn developer_instruction(self) -> &'static str {
+        match self {
+            Self::Silhouette => {
+                "The active answer mode is silhouette. Return only a content-free answer frame in answer_guidance. Never provide a natural answer or fill the blanks."
+            }
+            Self::NaturalAnswer => {
+                "The active answer mode is natural-answer. Return the directly usable answer itself in answer_guidance. Never return a silhouette, generic answer frame, or `...` blanks."
+            }
+        }
+    }
+
     fn cycle(self, direction: TypingSettingDirection) -> Self {
         match (self, direction) {
             (Self::Silhouette, TypingSettingDirection::Next)
@@ -714,6 +725,7 @@ struct AgentFieldConfig {
     title_rgb: (u8, u8, u8),
     value_rgb: (u8, u8, u8),
     min_display: Duration,
+    preserve_on_empty: bool,
     schema: Value,
 }
 
@@ -739,6 +751,8 @@ struct RawAgentFieldConfig {
     title_color: String,
     value_color: String,
     min_display_seconds: Option<u64>,
+    #[serde(default)]
+    preserve_on_empty: bool,
     schema: Value,
 }
 
@@ -1620,7 +1634,20 @@ impl AgentPaneState {
     fn apply_result(&mut self, result: Value, force_delayed_fields: bool) -> bool {
         let mut changed = false;
         for field in &mut self.fields {
-            let lines = agent_field_value_lines(&field.config, result.get(&field.config.key));
+            let value = result.get(&field.config.key);
+            let has_displayed_value = field
+                .lines
+                .iter()
+                .any(|line| line.trim() != field.config.empty);
+            if field.config.preserve_on_empty
+                && has_displayed_value
+                && !value.is_some_and(value_has_content)
+            {
+                field.pending_lines = None;
+                continue;
+            }
+
+            let lines = agent_field_value_lines(&field.config, value);
             changed |= update_agent_field(field, lines, force_delayed_fields);
         }
         changed
@@ -2756,6 +2783,12 @@ fn build_transcription_agent_config(
     {
         answer_field.title = settings.answer_mode.display_name().to_string();
     }
+    agent_context
+        .instructions
+        .push_str("\n\n## Active answer mode\n\n");
+    agent_context
+        .instructions
+        .push_str(settings.answer_mode.developer_instruction());
     Ok(AgentConfig {
         enabled: true,
         model: settings.agent_model.clone(),
@@ -2929,6 +2962,7 @@ fn parse_agent_config(config_text: &str) -> Result<ParsedAgentConfig> {
             value_rgb: parse_hex_color(&raw_field.value_color)
                 .with_context(|| format!("invalid value_color for field #{field_number}"))?,
             min_display: Duration::from_secs(raw_field.min_display_seconds.unwrap_or(0)),
+            preserve_on_empty: raw_field.preserve_on_empty,
             schema: raw_field.schema,
         });
     }
