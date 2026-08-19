@@ -121,7 +121,7 @@ Return a concise, directly usable answer to the latest explicit question or requ
 
 - Write the answer itself, with no label, preamble, coaching, or explanation of how to answer.
 - Never return a content-free sentence frame, rhetorical template, or `...` blanks; those belong only to silhouette mode.
-- Prefer one to four natural spoken sentences.
+- Prefer one to four natural spoken sentences. Keep it short.
 - Use relevant transcript evidence and reliable general knowledge, but never invent missing facts.
 - State uncertainty plainly when the available context is insufficient.
 - If there is a newer clear question or request, replace `answer_guidance` with its answer.
