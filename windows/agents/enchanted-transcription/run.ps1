@@ -536,34 +536,42 @@ function Resolve-Model {
         "tiny" = @{
             File = "ggml-tiny.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+            MinimumBytes = 70MB
         }
         "base" = @{
             File = "ggml-base.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+            MinimumBytes = 130MB
         }
         "small" = @{
             File = "ggml-small.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+            MinimumBytes = 450MB
         }
         "medium" = @{
             File = "ggml-medium.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
+            MinimumBytes = 1400MB
         }
         "tiny.en" = @{
             File = "ggml-tiny.en.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+            MinimumBytes = 70MB
         }
         "base.en" = @{
             File = "ggml-base.en.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+            MinimumBytes = 130MB
         }
         "small.en" = @{
             File = "ggml-small.en.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
+            MinimumBytes = 450MB
         }
         "medium.en" = @{
             File = "ggml-medium.en.bin"
             Url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin"
+            MinimumBytes = 1400MB
         }
     }
 
@@ -571,10 +579,12 @@ function Resolve-Model {
     if ($entry) {
         $file = $entry.File
         $url = $entry.Url
+        $minimumBytes = [long]$entry.MinimumBytes
     }
     else {
         $file = "ggml-$Name.bin"
         $url = $null
+        $minimumBytes = 1MB
     }
     $path = Join-Path $ModelsDir $file
     if (-not $entry -and -not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -584,6 +594,44 @@ function Resolve-Model {
         Name = $Name
         Path = $path
         Url = $url
+        MinimumBytes = $minimumBytes
+    }
+}
+
+function Test-WhisperModelFile {
+    param(
+        [string]$Path,
+        [long]$MinimumBytes
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $file = Get-Item -LiteralPath $Path
+        if ($file.Length -lt $MinimumBytes) {
+            return $false
+        }
+
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $magic = New-Object byte[] 4
+            if ($stream.Read($magic, 0, $magic.Length) -ne $magic.Length) {
+                return $false
+            }
+
+            return $magic[0] -eq 0x6c -and
+                $magic[1] -eq 0x6d -and
+                $magic[2] -eq 0x67 -and
+                $magic[3] -eq 0x67
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    catch {
+        return $false
     }
 }
 
@@ -744,17 +792,32 @@ while ($true) {
     $agentDisabled = Resolve-AgentDisabledOption -Settings $settings
 
     $modelInfo = Resolve-Model -Name $resolvedModel
-    if (-not (Test-Path -LiteralPath $modelInfo.Path)) {
+    if (-not (Test-WhisperModelFile -Path $modelInfo.Path -MinimumBytes $modelInfo.MinimumBytes)) {
         if ([string]::IsNullOrWhiteSpace([string]$modelInfo.Url)) {
-            throw "Whisper model $($modelInfo.Name) is not installed and has no built-in download URL."
+            throw "Custom Whisper model $($modelInfo.Name) is incomplete or invalid: $($modelInfo.Path)"
         }
-        Write-Host "Downloading Whisper model $($modelInfo.Name)..." -ForegroundColor Cyan
+        if (Test-Path -LiteralPath $modelInfo.Path -PathType Leaf) {
+            Write-Host "Cached Whisper model $($modelInfo.Name) is incomplete; downloading it again..." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "Downloading Whisper model $($modelInfo.Name)..." -ForegroundColor Cyan
+        }
         $tmp = "$($modelInfo.Path).download"
-        if (Test-Path -LiteralPath $tmp) {
-            Remove-Item -LiteralPath $tmp -Force
+        try {
+            if (Test-Path -LiteralPath $tmp) {
+                Remove-Item -LiteralPath $tmp -Force
+            }
+            Invoke-WebRequest -Uri $modelInfo.Url -OutFile $tmp
+            if (-not (Test-WhisperModelFile -Path $tmp -MinimumBytes $modelInfo.MinimumBytes)) {
+                throw "The Whisper model download was incomplete or invalid. Please run the command again to retry."
+            }
+            Move-Item -LiteralPath $tmp -Destination $modelInfo.Path -Force
         }
-        Invoke-WebRequest -Uri $modelInfo.Url -OutFile $tmp
-        Move-Item -LiteralPath $tmp -Destination $modelInfo.Path -Force
+        finally {
+            if (Test-Path -LiteralPath $tmp) {
+                Remove-Item -LiteralPath $tmp -Force
+            }
+        }
     }
 
     $cargoArgs = @("run", "--release", "--manifest-path", $manifest)
