@@ -391,6 +391,7 @@ struct AppConfig {
     chunk_seconds: usize,
     language: Option<String>,
     fade_duration: Duration,
+    transparency_tool: PathBuf,
     agent: AgentConfig,
     typing: Option<TypingConfig>,
 }
@@ -455,7 +456,6 @@ struct TypingConfig {
     max_output_tokens: u64,
     input_source: SourceKind,
     terminal_hwnd: Option<isize>,
-    transparency_tool: PathBuf,
     settings_path: PathBuf,
     settings_load_error: Option<String>,
     transparency_index: usize,
@@ -517,6 +517,8 @@ struct EnchantedTranscriptionSettings {
     max_session_minutes: u64,
     #[serde(default = "default_agent_token_budget")]
     agent_token_budget: u64,
+    #[serde(default = "default_typing_transparency_label")]
+    transparency_label: String,
 }
 
 impl Default for EnchantedTranscriptionSettings {
@@ -537,6 +539,7 @@ impl Default for EnchantedTranscriptionSettings {
             idle_exit_minutes: default_idle_exit_minutes(),
             max_session_minutes: default_session_minutes(),
             agent_token_budget: default_agent_token_budget(),
+            transparency_label: default_typing_transparency_label(),
         }
     }
 }
@@ -583,6 +586,9 @@ impl EnchantedTranscriptionSettings {
             &AGENT_TOKEN_BUDGET_CHOICES,
             default_agent_token_budget(),
         );
+        if typing_transparency_preset_index(&self.transparency_label).is_none() {
+            self.transparency_label = default_typing_transparency_label();
+        }
         self
     }
 }
@@ -859,7 +865,8 @@ enum UiEvent {
         paste_status: String,
         generation: u64,
     },
-    TypingTransparencyFailed {
+    TransparencyFailed {
+        mode: AppMode,
         generation: u64,
         message: String,
     },
@@ -882,6 +889,7 @@ struct TypingInput {
 
 #[derive(Clone, Copy)]
 struct TypingTransparencyRequest {
+    mode: AppMode,
     generation: u64,
     preset: TypingTransparencyPreset,
 }
@@ -1103,6 +1111,7 @@ struct TranscriptionSettingsState {
     pending: TranscriptionRestartSettings,
     snapshot: TranscriptionRestartSettings,
     fade_snapshot: Duration,
+    transparency_generation: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1121,6 +1130,7 @@ struct TranscriptionRestartSettings {
     idle_exit_minutes: u64,
     max_session_minutes: u64,
     agent_token_budget: u64,
+    transparency_label: String,
 }
 
 struct TypingPaneState {
@@ -1867,17 +1877,25 @@ impl AppState {
                 self.status = format!("enhanced typing updated in {} ms", elapsed_ms);
                 true
             }
-            UiEvent::TypingTransparencyFailed {
+            UiEvent::TransparencyFailed {
+                mode,
                 generation,
                 message,
             } => {
-                if generation != self.typing.transparency_generation {
-                    return false;
+                match mode {
+                    AppMode::Transcription => {
+                        if generation != self.transcription_settings.transparency_generation {
+                            return false;
+                        }
+                        self.transcription_settings.note = Some(message.clone());
+                    }
+                    AppMode::EnhancedTyping => {
+                        if generation != self.typing.transparency_generation {
+                            return false;
+                        }
+                        self.typing.settings_note = Some(message.clone());
+                    }
                 }
-                if self.typing.settings_note.as_deref() == Some(message.as_str()) {
-                    return false;
-                }
-                self.typing.settings_note = Some(message.clone());
                 self.record_error(format!("Transparency update failed: {message}"));
                 true
             }
@@ -1899,6 +1917,7 @@ impl TranscriptionSettingsState {
             pending: values.clone(),
             snapshot: values,
             fade_snapshot: config.fade_duration,
+            transparency_generation: 0,
         }
     }
 
@@ -1964,6 +1983,7 @@ impl TranscriptionSettingsState {
             idle_exit_minutes: self.pending.idle_exit_minutes,
             max_session_minutes: self.pending.max_session_minutes,
             agent_token_budget: self.pending.agent_token_budget,
+            transparency_label: self.pending.transparency_label.clone(),
         }
         .normalized()
     }
@@ -1986,6 +2006,7 @@ impl TranscriptionRestartSettings {
             idle_exit_minutes: settings.idle_exit_minutes,
             max_session_minutes: settings.max_session_minutes,
             agent_token_budget: settings.agent_token_budget,
+            transparency_label: settings.transparency_label.clone(),
         }
     }
 }
@@ -2843,18 +2864,14 @@ fn run(product: ProductMode) -> Result<()> {
     let typing_paused = Arc::new(AtomicBool::new(false));
     let (audio_tx, audio_rx) = mpsc::channel::<AudioFrame>();
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
-    let typing_transparency_tx = if let Some(typing_config) = config.typing.as_ref() {
-        let (transparency_tx, transparency_rx) = mpsc::channel::<TypingTransparencyRequest>();
-        spawn_typing_transparency_thread(
-            typing_config.transparency_tool.clone(),
-            transparency_rx,
-            ui_tx.clone(),
-            stop.clone(),
-        );
-        Some(transparency_tx)
-    } else {
-        None
-    };
+    let (transparency_tx, transparency_rx) = mpsc::channel::<TypingTransparencyRequest>();
+    spawn_typing_transparency_thread(
+        config.transparency_tool.clone(),
+        transparency_rx,
+        ui_tx.clone(),
+        stop.clone(),
+    );
+    let typing_transparency_tx = Some(transparency_tx);
     let agent_tx = if config.agent.enabled {
         let (agent_tx, agent_rx) = mpsc::channel::<AgentInput>();
         spawn_agent_thread(
@@ -2918,6 +2935,7 @@ fn run(product: ProductMode) -> Result<()> {
         {
             if let Some(transparency_tx) = &typing_transparency_tx {
                 let _ = transparency_tx.send(TypingTransparencyRequest {
+                    mode: AppMode::EnhancedTyping,
                     generation: state.typing.transparency_generation,
                     preset: state.typing.transparency_preset(),
                 });
@@ -3474,6 +3492,14 @@ fn saved_typing_refiner_model(settings: &EnhancedTypingSettings, fallback: &str)
     }
 }
 
+fn terminal_transparency_tool_path(agent_root: &Path) -> PathBuf {
+    agent_root
+        .parent()
+        .and_then(|agents_dir| agents_dir.parent())
+        .map(|windows_dir| windows_dir.join("tools").join("terminal-transparency.ps1"))
+        .unwrap_or_else(|| PathBuf::from("terminal-transparency.ps1"))
+}
+
 fn build_config(args: CliArgs) -> Result<AppConfig> {
     let model_path = args.model_path.clone();
     let agent_root = args
@@ -3563,6 +3589,7 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
         chunk_seconds: settings.chunk_seconds,
         language: transcription_language_option(&settings.language),
         fade_duration: Duration::from_secs(settings.fade_seconds),
+        transparency_tool: terminal_transparency_tool_path(&agent_root),
         agent,
         typing: None,
     })
@@ -3591,11 +3618,7 @@ fn build_enhanced_typing_config(
         typing_transparency_preset_index(&settings.transparency_label).unwrap_or(0);
     let typing_speed_index = typing_speed_preset_index(&settings.typing_speed_label).unwrap_or(1);
     let intelligence_available = api_key.is_some();
-    let transparency_tool = agent_root
-        .parent()
-        .and_then(|agents_dir| agents_dir.parent())
-        .map(|windows_dir| windows_dir.join("tools").join("terminal-transparency.ps1"))
-        .unwrap_or_else(|| PathBuf::from("terminal-transparency.ps1"));
+    let transparency_tool = terminal_transparency_tool_path(agent_root);
 
     Ok(AppConfig {
         mode: AppMode::EnhancedTyping,
@@ -3615,6 +3638,7 @@ fn build_enhanced_typing_config(
             Some(DEFAULT_LANGUAGE.to_string())
         },
         fade_duration: Duration::from_secs(args.fade_seconds),
+        transparency_tool,
         agent: AgentConfig::disabled(args.agent_model.clone()),
         typing: Some(TypingConfig {
             model: refiner_model,
@@ -3624,7 +3648,6 @@ fn build_enhanced_typing_config(
             max_output_tokens: 256,
             input_source: settings.input_source,
             terminal_hwnd,
-            transparency_tool,
             settings_path,
             settings_load_error,
             transparency_index,
@@ -4945,7 +4968,8 @@ fn typing_transparency_loop(
         }
 
         if let Err(err) = apply_typing_transparency(&tool_path, request.preset) {
-            let _ = ui_tx.send(UiEvent::TypingTransparencyFailed {
+            let _ = ui_tx.send(UiEvent::TransparencyFailed {
+                mode: request.mode,
                 generation: request.generation,
                 message: format!(
                     "Transparency failed: {}",
@@ -6615,7 +6639,7 @@ fn render_loop(
                 }
 
                 if state.mode == AppMode::Transcription {
-                    match handle_transcription_key(state, &key) {
+                    match handle_transcription_key(state, &key, typing_transparency_tx.as_ref()) {
                         TypingKeyOutcome::Changed => {
                             render(state)?;
                             if state.restart_requested {
@@ -6835,7 +6859,11 @@ fn keep_token_budget_paused(state: &mut AppState) {
     state.agent.status = "paused; token budget reached (F1 to review)".to_string();
 }
 
-fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> TypingKeyOutcome {
+fn handle_transcription_key(
+    state: &mut AppState,
+    key: &event::KeyEvent,
+    transparency_tx: Option<&Sender<TypingTransparencyRequest>>,
+) -> TypingKeyOutcome {
     if state.token_budget_prompt_open {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return TypingKeyOutcome::Ignored;
@@ -6894,7 +6922,7 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
     if state.transcription_settings.confirm_close {
         return match key.code {
             KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('A') => {
-                apply_transcription_settings(state);
+                apply_transcription_settings(state, transparency_tx);
                 TypingKeyOutcome::Changed
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
@@ -6940,7 +6968,10 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
     }
 }
 
-fn apply_transcription_settings(state: &mut AppState) {
+fn apply_transcription_settings(
+    state: &mut AppState,
+    transparency_tx: Option<&Sender<TypingTransparencyRequest>>,
+) {
     let restart_needed = state.transcription_settings.has_restart_changes();
     let active = &state.transcription_settings.active;
     let pending = &state.transcription_settings.pending;
@@ -6950,6 +6981,7 @@ fn apply_transcription_settings(state: &mut AppState) {
     let will_share_microphone =
         pending.include_microphone && pending.sources.contains(&SourceKind::Microphone);
     let microphone_sharing_disabled = was_sharing_microphone && !will_share_microphone;
+    let transparency_changed = pending.transparency_label != active.transparency_label;
     let refresh_agent_after_restart = answer_mode_changed
         || was_sharing_microphone != will_share_microphone
         || pending.agent_enabled != active.agent_enabled
@@ -6964,6 +6996,23 @@ fn apply_transcription_settings(state: &mut AppState) {
         Ok(()) => {
             state.transcription_settings.active = state.transcription_settings.pending.clone();
             state.transcription_settings.load_error = None;
+            if transparency_changed {
+                state.transcription_settings.transparency_generation = state
+                    .transcription_settings
+                    .transparency_generation
+                    .wrapping_add(1);
+                let preset_index = typing_transparency_preset_index(
+                    &state.transcription_settings.active.transparency_label,
+                )
+                .unwrap_or(0);
+                request_typing_transparency(
+                    transparency_tx,
+                    AppMode::Transcription,
+                    state.transcription_settings.transparency_generation,
+                    TYPING_TRANSPARENCY_PRESETS[preset_index],
+                    &mut state.transcription_settings.note,
+                );
+            }
             let next_token_budget = state.transcription_settings.active.agent_token_budget;
             if next_token_budget != previous_token_budget {
                 state.agent_token_limit = (next_token_budget > 0).then_some(next_token_budget);
@@ -7009,7 +7058,7 @@ fn apply_transcription_settings(state: &mut AppState) {
 }
 
 fn transcription_settings_option_count() -> usize {
-    14
+    15
 }
 
 fn transcription_settings_viewport(state: &AppState) -> (usize, usize, usize) {
@@ -7152,6 +7201,14 @@ fn change_transcription_setting(
                 &AGENT_TOKEN_BUDGET_CHOICES,
                 direction,
             )
+        }
+        14 => {
+            let current_index =
+                typing_transparency_preset_index(&settings.pending.transparency_label).unwrap_or(0);
+            let next_index =
+                cycle_index(current_index, TYPING_TRANSPARENCY_PRESETS.len(), direction);
+            settings.pending.transparency_label =
+                TYPING_TRANSPARENCY_PRESETS[next_index].label.to_string();
         }
         _ => return TypingKeyOutcome::Consumed,
     }
@@ -7467,6 +7524,7 @@ fn change_typing_setting(
                 state.typing.transparency_generation.wrapping_add(1);
             request_typing_transparency(
                 transparency_tx,
+                AppMode::EnhancedTyping,
                 state.typing.transparency_generation,
                 preset,
                 &mut state.typing.settings_note,
@@ -7535,6 +7593,7 @@ fn change_typing_setting(
 
 fn request_typing_transparency(
     transparency_tx: Option<&Sender<TypingTransparencyRequest>>,
+    mode: AppMode,
     generation: u64,
     preset: TypingTransparencyPreset,
     settings_note: &mut Option<String>,
@@ -7545,7 +7604,11 @@ fn request_typing_transparency(
     };
 
     if transparency_tx
-        .send(TypingTransparencyRequest { generation, preset })
+        .send(TypingTransparencyRequest {
+            mode,
+            generation,
+            preset,
+        })
         .is_err()
     {
         *settings_note = Some("Transparency worker unavailable".to_string());
@@ -7884,6 +7947,7 @@ fn transcription_settings_columns(
             "Agent token budget",
             token_budget_text(pending.agent_token_budget),
         ),
+        ("Transparency", pending.transparency_label.clone()),
     ];
 
     let mut option_lines = Vec::new();
@@ -8081,6 +8145,10 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
         11 => vec!["Off", "15m", "30m", "60m", "120m", "240m"],
         12 => vec!["Off", "60m", "120m", "240m", "480m", "720m"],
         13 => vec!["Off", "25k", "50k", "100k", "250k", "500k"],
+        14 => TYPING_TRANSPARENCY_PRESETS
+            .iter()
+            .map(|preset| preset.label)
+            .collect(),
         _ => Vec::new(),
     };
     let mut choices = values.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -8178,6 +8246,7 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         11 => "Closes the application after no transcript changes for this long. Off allows an idle visible session to remain open indefinitely.",
         12 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
         13 => "Pauses new insight requests at this reported API-token threshold and asks before granting another block of the same size. Local transcription and context collection keep running; Off removes the prompt and cap.",
+        14 => "Applies the existing terminal transparency tool to this window. Opaque disables the effect; clear presets keep a sharp background, while blurry presets use acrylic blur. The choice is saved and does not restart capture.",
         _ => "",
     }
 }
@@ -9445,6 +9514,7 @@ mod tests {
             chunk_seconds: TYPING_CHUNK_SECONDS,
             language: Some(DEFAULT_LANGUAGE.to_string()),
             fade_duration: Duration::from_secs(70),
+            transparency_tool: PathBuf::new(),
             agent: AgentConfig::disabled(DEFAULT_AGENT_MODEL),
             typing: Some(TypingConfig {
                 model: DEFAULT_AGENT_MODEL.to_string(),
@@ -9454,7 +9524,6 @@ mod tests {
                 max_output_tokens: 256,
                 input_source: SourceKind::Microphone,
                 terminal_hwnd: None,
-                transparency_tool: PathBuf::new(),
                 settings_path: PathBuf::new(),
                 settings_load_error: None,
                 transparency_index: 0,

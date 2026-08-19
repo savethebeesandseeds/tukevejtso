@@ -344,6 +344,7 @@ function Get-DefaultTranscriptionSettings {
         agent_enabled = $true
         agent_model = "gpt-5.4-nano"
         include_microphone = $false
+        transparency_label = $null
     }
 }
 
@@ -369,6 +370,9 @@ function Read-TranscriptionSettings {
         }
         if ($saved.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$saved.agent_model)) {
             $settings.agent_model = [string]$saved.agent_model
+        }
+        if ($saved.transparency_label -and -not [string]::IsNullOrWhiteSpace([string]$saved.transparency_label)) {
+            $settings.transparency_label = [string]$saved.transparency_label
         }
     }
     catch {
@@ -549,19 +553,36 @@ function ConvertFrom-SecureStringToPlainText {
 }
 
 function Invoke-OptionalTransparencySetup {
-    if (-not $Transparency) {
-        return
-    }
+    param($Settings)
 
     if (-not (Test-Path -LiteralPath $TransparencyTool)) {
-        Write-Warning "Terminal transparency tool was not found: $TransparencyTool"
+        if ($Transparency -or $Settings.transparency_label) {
+            Write-Warning "Terminal transparency tool was not found: $TransparencyTool"
+        }
         return
     }
 
     $transparencyArgs = @{
-        Opacity = $TransparencyOpacity
         ConfigureOnly = $true
         NoMenu = $true
+    }
+
+    if ($Transparency) {
+        $transparencyArgs.Opacity = $TransparencyOpacity
+        $transparencyArgs[$TransparencyBackground] = $true
+    }
+    else {
+        switch (([string]$Settings.transparency_label).Trim().ToLowerInvariant()) {
+            "opaque" { $transparencyArgs.Disable = $true }
+            "clear 85%" { $transparencyArgs.Opacity = 85; $transparencyArgs.Clear = $true }
+            "clear 70%" { $transparencyArgs.Opacity = 70; $transparencyArgs.Clear = $true }
+            "clear 55%" { $transparencyArgs.Opacity = 55; $transparencyArgs.Clear = $true }
+            "blurry 85%" { $transparencyArgs.Opacity = 85; $transparencyArgs.Acrylic = $true }
+            "blurry 70%" { $transparencyArgs.Opacity = 70; $transparencyArgs.Acrylic = $true }
+            "blurry 55%" { $transparencyArgs.Opacity = 55; $transparencyArgs.Acrylic = $true }
+            "glass 45%" { $transparencyArgs.Opacity = 45; $transparencyArgs.Acrylic = $true }
+            default { return }
+        }
     }
 
     & $TransparencyTool @transparencyArgs
@@ -640,9 +661,6 @@ if (Test-Path -LiteralPath $llvmBin) {
     $env:Path = "$llvmBin;$env:Path"
 }
 
-if ($Mode -ne "EnhancedTyping" -or $Transparency) {
-    Invoke-OptionalTransparencySetup
-}
 Invoke-OptionalFullScreen
 $terminalRestoreSnapshot = Get-TerminalRestoreSnapshot
 $transcriptDumpEnvironmentExisted = Test-Path Env:TUKEVEJTSO_TRANSCRIPT_DUMP
@@ -669,6 +687,7 @@ $manifest = Join-Path $AgentRoot "Cargo.toml"
 while ($true) {
     $agentExitCode = 0
     $settings = Read-TranscriptionSettings
+    Invoke-OptionalTransparencySetup -Settings $settings
     $resolvedLanguage = Resolve-LanguageOption -Settings $settings
     $resolvedModel = Resolve-ModelOption -Settings $settings -LanguageName $resolvedLanguage
     $resolvedFadeSeconds = Resolve-FadeSecondsOption -Settings $settings
@@ -735,6 +754,7 @@ while ($true) {
         $noAgentProvided = $false
         $NoAgent = $false
         $SetupOpenAiKey = $false
+        $Transparency = $false
         Import-OpenAiApiKey
         $agentExitCode = 0
         continue
