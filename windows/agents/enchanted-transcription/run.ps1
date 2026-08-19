@@ -97,9 +97,6 @@ namespace Tukevejtso {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        public static extern int GetWindowText(IntPtr hWnd, StringBuilder windowText, int maxCount);
-
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
@@ -146,19 +143,6 @@ function Get-WindowClassName {
     return $builder.ToString()
 }
 
-function Get-WindowTitle {
-    param([IntPtr]$WindowHandle)
-
-    Add-TerminalKeyNativeType
-    if ($WindowHandle -eq [IntPtr]::Zero) {
-        return ""
-    }
-
-    $builder = [Text.StringBuilder]::new(512)
-    [void] [Tukevejtso.TerminalKeys]::GetWindowText($WindowHandle, $builder, $builder.Capacity)
-    return $builder.ToString()
-}
-
 function Test-TerminalWindowHandle {
     param([IntPtr]$WindowHandle)
 
@@ -182,40 +166,12 @@ function Get-ForegroundTerminalWindowHandle {
     return [IntPtr]::Zero
 }
 
-function Get-CurrentWindowsTerminalWindowHandle {
-    if ([string]::IsNullOrWhiteSpace($env:WT_SESSION)) {
-        return [IntPtr]::Zero
-    }
+function Get-ForegroundHostWindowHandle {
+    Add-TerminalKeyNativeType
 
-    $originalTitle = $null
-    try {
-        $originalTitle = [Console]::Title
-        $probeTitle = "tukevejtso-monitor-$([Guid]::NewGuid().ToString('N'))"
-        [Console]::Title = $probeTitle
-        $deadline = [DateTime]::UtcNow.AddMilliseconds(300)
-
-        do {
-            $candidate = Get-ForegroundTerminalWindowHandle
-            if ($candidate -ne [IntPtr]::Zero -and
-                (Get-WindowClassName -WindowHandle $candidate) -eq "CASCADIA_HOSTING_WINDOW_CLASS" -and
-                (Get-WindowTitle -WindowHandle $candidate).Contains($probeTitle)) {
-                return $candidate
-            }
-            Start-Sleep -Milliseconds 20
-        } while ([DateTime]::UtcNow -lt $deadline)
-    }
-    catch {
-        return [IntPtr]::Zero
-    }
-    finally {
-        if ($null -ne $originalTitle) {
-            try {
-                [Console]::Title = $originalTitle
-            }
-            catch {
-                # A host that cannot restore its title is also not safe to monitor.
-            }
-        }
+    $foregroundWindow = Get-RootWindowHandle -WindowHandle ([Tukevejtso.TerminalKeys]::GetForegroundWindow())
+    if ($foregroundWindow -ne [IntPtr]::Zero -and [Tukevejtso.TerminalKeys]::IsWindowVisible($foregroundWindow)) {
+        return $foregroundWindow
     }
 
     return [IntPtr]::Zero
@@ -229,16 +185,11 @@ function Get-CurrentTerminalWindowHandle {
         return $consoleWindow
     }
 
-    $terminalWindow = Get-CurrentWindowsTerminalWindowHandle
-    if ($terminalWindow -ne [IntPtr]::Zero) {
-        return $terminalWindow
-    }
-
-    return [IntPtr]::Zero
+    return Get-ForegroundHostWindowHandle
 }
 
-# Capture the host before setup work gives the user time to focus an unrelated
-# Windows Terminal window. Unsupported/integrated hosts deliberately stay zero.
+# Capture the visible foreground host immediately. Exact tab/pane identity is not
+# required for the API grace-period safeguard and made startup unnecessarily brittle.
 $terminalWindowHandle = Get-CurrentTerminalWindowHandle
 
 function Invoke-OptionalFullScreen {

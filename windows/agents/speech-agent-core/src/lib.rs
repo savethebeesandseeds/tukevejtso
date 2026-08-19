@@ -3546,8 +3546,8 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
     }
     let terminal_hwnd = args
         .terminal_window_handle
-        .and_then(valid_terminal_window_handle)
-        .or_else(current_terminal_window_handle);
+        .and_then(valid_monitor_window_handle)
+        .or_else(current_monitor_window_handle);
 
     Ok(AppConfig {
         mode: AppMode::Transcription,
@@ -5529,17 +5529,17 @@ impl Drop for ClipboardGuard {
 }
 
 fn current_terminal_window_handle() -> Option<isize> {
-    // Windows Terminal requires the launcher's title-probe handshake. A bare
-    // foreground HWND is not enough because another window/tab may own it.
     attached_console_terminal_window_handle()
 }
 
-fn reacquire_terminal_window_handle(terminal_view_focused: Option<bool>) -> Option<isize> {
+fn current_monitor_window_handle() -> Option<isize> {
+    attached_console_terminal_window_handle().or_else(foreground_monitor_window_handle)
+}
+
+fn reacquire_monitor_window_handle(terminal_view_focused: Option<bool>) -> Option<isize> {
     attached_console_terminal_window_handle().or_else(|| {
-        // A foreground Windows Terminal window is only a safe reacquisition
-        // candidate after this console has reported that its own view gained focus.
-        (terminal_view_focused == Some(true))
-            .then(foreground_windows_terminal_window_handle)
+        (terminal_view_focused != Some(false))
+            .then(foreground_monitor_window_handle)
             .flatten()
     })
 }
@@ -5549,14 +5549,14 @@ fn attached_console_terminal_window_handle() -> Option<isize> {
     is_terminal_window_handle(console_hwnd).then_some(console_hwnd as isize)
 }
 
-fn foreground_windows_terminal_window_handle() -> Option<isize> {
-    if env::var_os("WT_SESSION").is_none() {
-        return None;
-    }
-
+fn foreground_monitor_window_handle() -> Option<isize> {
     let foreground_hwnd = root_window_handle(unsafe { GetForegroundWindow() });
-    (window_class_name(foreground_hwnd) == "CASCADIA_HOSTING_WINDOW_CLASS")
-        .then_some(foreground_hwnd as isize)
+    if is_monitor_window_handle(foreground_hwnd) && unsafe { IsWindowVisible(foreground_hwnd) } != 0
+    {
+        Some(foreground_hwnd as isize)
+    } else {
+        None
+    }
 }
 
 fn valid_terminal_window_handle(handle: isize) -> Option<isize> {
@@ -5566,6 +5566,11 @@ fn valid_terminal_window_handle(handle: isize) -> Option<isize> {
     } else {
         None
     }
+}
+
+fn valid_monitor_window_handle(handle: isize) -> Option<isize> {
+    let hwnd = root_window_handle(handle as HWND);
+    is_monitor_window_handle(hwnd).then_some(hwnd as isize)
 }
 
 fn terminal_window_is_visible(handle: isize) -> bool {
@@ -5590,11 +5595,9 @@ fn terminal_window_visibility(handle: isize) -> Option<bool> {
             size_of::<u32>() as u32,
         )
     };
-    if result < 0 {
-        None
-    } else {
-        Some(cloaked == 0)
-    }
+    // DWM metadata is optional. Basic visibility/minimized checks are enough
+    // when a host does not expose cloaking information.
+    Some(result < 0 || cloaked == 0)
 }
 
 fn terminal_window_accepts_requests(handle: isize) -> Option<bool> {
@@ -5629,6 +5632,10 @@ fn is_terminal_window_handle(hwnd: HWND) -> bool {
         window_class_name(hwnd).as_str(),
         "ConsoleWindowClass" | "CASCADIA_HOSTING_WINDOW_CLASS"
     )
+}
+
+fn is_monitor_window_handle(hwnd: HWND) -> bool {
+    !hwnd.is_null() && unsafe { IsWindow(hwnd) } != 0
 }
 
 fn window_class_name(hwnd: HWND) -> String {
@@ -6690,13 +6697,13 @@ fn update_transcription_lifecycle(
 
     let now = Instant::now();
     let previous_terminal_hwnd = state.terminal_hwnd;
-    let mut terminal_hwnd = previous_terminal_hwnd.and_then(valid_terminal_window_handle);
+    let mut terminal_hwnd = previous_terminal_hwnd.and_then(valid_monitor_window_handle);
     if previous_terminal_hwnd.is_some() && terminal_hwnd.is_none() {
         // Do not reuse focus evidence from a window that no longer exists.
         state.terminal_view_focused = None;
     }
     if terminal_hwnd.is_none() {
-        terminal_hwnd = reacquire_terminal_window_handle(state.terminal_view_focused);
+        terminal_hwnd = reacquire_monitor_window_handle(state.terminal_view_focused);
     }
     state.terminal_hwnd = terminal_hwnd;
     let monitor_changed = previous_terminal_hwnd != terminal_hwnd;
