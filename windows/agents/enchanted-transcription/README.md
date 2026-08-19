@@ -28,6 +28,8 @@ The insight agent has layered API safeguards. By default, new API requests pause
 
 Terminal transparency is opt-in through the launcher flags and no longer prompts during normal startup.
 
+Plaintext transcript files are disabled by default. To opt in for local debugging, launch with `-TranscriptDump` or set `TUKEVEJTSO_TRANSCRIPT_DUMP=1`; enabled dumps retain the existing seven-day cleanup policy. F9 restarts use a launcher-scoped, Windows DPAPI-protected temporary state so the visible transcript and Agent context survive without being written as plaintext.
+
 The optional right-side agent pane uses the OpenAI Responses API on system-output transcript text. Microphone transcript text is not sent unless enabled in F9 settings. Store the API key once with:
 
 ```cmd

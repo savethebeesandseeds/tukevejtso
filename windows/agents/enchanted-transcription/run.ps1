@@ -15,6 +15,7 @@ param(
     [string]$AgentModel = "gpt-5.4-nano",
     [switch]$NoAgent,
     [switch]$SetupOpenAiKey,
+    [switch]$TranscriptDump,
     [switch]$FullScreen,
     [switch]$Cpu
 )
@@ -96,6 +97,9 @@ namespace Tukevejtso {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowText(IntPtr hWnd, StringBuilder windowText, int maxCount);
+
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
@@ -142,6 +146,19 @@ function Get-WindowClassName {
     return $builder.ToString()
 }
 
+function Get-WindowTitle {
+    param([IntPtr]$WindowHandle)
+
+    Add-TerminalKeyNativeType
+    if ($WindowHandle -eq [IntPtr]::Zero) {
+        return ""
+    }
+
+    $builder = [Text.StringBuilder]::new(512)
+    [void] [Tukevejtso.TerminalKeys]::GetWindowText($WindowHandle, $builder, $builder.Capacity)
+    return $builder.ToString()
+}
+
 function Test-TerminalWindowHandle {
     param([IntPtr]$WindowHandle)
 
@@ -165,12 +182,40 @@ function Get-ForegroundTerminalWindowHandle {
     return [IntPtr]::Zero
 }
 
-function Get-ForegroundHostWindowHandle {
-    Add-TerminalKeyNativeType
+function Get-CurrentWindowsTerminalWindowHandle {
+    if ([string]::IsNullOrWhiteSpace($env:WT_SESSION)) {
+        return [IntPtr]::Zero
+    }
 
-    $foregroundWindow = Get-RootWindowHandle -WindowHandle ([Tukevejtso.TerminalKeys]::GetForegroundWindow())
-    if ($foregroundWindow -ne [IntPtr]::Zero -and [Tukevejtso.TerminalKeys]::IsWindowVisible($foregroundWindow)) {
-        return $foregroundWindow
+    $originalTitle = $null
+    try {
+        $originalTitle = [Console]::Title
+        $probeTitle = "tukevejtso-monitor-$([Guid]::NewGuid().ToString('N'))"
+        [Console]::Title = $probeTitle
+        $deadline = [DateTime]::UtcNow.AddMilliseconds(300)
+
+        do {
+            $candidate = Get-ForegroundTerminalWindowHandle
+            if ($candidate -ne [IntPtr]::Zero -and
+                (Get-WindowClassName -WindowHandle $candidate) -eq "CASCADIA_HOSTING_WINDOW_CLASS" -and
+                (Get-WindowTitle -WindowHandle $candidate).Contains($probeTitle)) {
+                return $candidate
+            }
+            Start-Sleep -Milliseconds 20
+        } while ([DateTime]::UtcNow -lt $deadline)
+    }
+    catch {
+        return [IntPtr]::Zero
+    }
+    finally {
+        if ($null -ne $originalTitle) {
+            try {
+                [Console]::Title = $originalTitle
+            }
+            catch {
+                # A host that cannot restore its title is also not safe to monitor.
+            }
+        }
     }
 
     return [IntPtr]::Zero
@@ -184,15 +229,17 @@ function Get-CurrentTerminalWindowHandle {
         return $consoleWindow
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:WT_SESSION)) {
-        $terminalWindow = Get-ForegroundTerminalWindowHandle
-        if ($terminalWindow -ne [IntPtr]::Zero) {
-            return $terminalWindow
-        }
+    $terminalWindow = Get-CurrentWindowsTerminalWindowHandle
+    if ($terminalWindow -ne [IntPtr]::Zero) {
+        return $terminalWindow
     }
 
-    return Get-ForegroundHostWindowHandle
+    return [IntPtr]::Zero
 }
+
+# Capture the host before setup work gives the user time to focus an unrelated
+# Windows Terminal window. Unsupported/integrated hosts deliberately stay zero.
+$terminalWindowHandle = Get-CurrentTerminalWindowHandle
 
 function Invoke-OptionalFullScreen {
     if ($Mode -ne "EnhancedTyping" -or -not $FullScreen -or [Console]::IsInputRedirected) {
@@ -646,17 +693,27 @@ if ($Mode -ne "EnhancedTyping" -or $Transparency) {
     Invoke-OptionalTransparencySetup
 }
 Invoke-OptionalFullScreen
-$terminalWindowHandle = Get-CurrentTerminalWindowHandle
 $terminalRestoreSnapshot = Get-TerminalRestoreSnapshot
+$transcriptDumpEnvironmentExisted = Test-Path Env:TUKEVEJTSO_TRANSCRIPT_DUMP
+$previousTranscriptDumpEnvironment = $env:TUKEVEJTSO_TRANSCRIPT_DUMP
+$openAiApiKeyEnvironmentExisted = Test-Path Env:OPENAI_API_KEY
+$previousOpenAiApiKeyEnvironment = $env:OPENAI_API_KEY
+$restartStatePath = $null
+$agentExitCode = 0
+
+try {
+if ($TranscriptDump) {
+    $env:TUKEVEJTSO_TRANSCRIPT_DUMP = "1"
+}
 Import-OpenAiApiKey
 
 New-Item -ItemType Directory -Force -Path $ModelsDir | Out-Null
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 Move-LegacyWhisperModels
+$restartStatePath = Join-Path $TempDir ("restart-state-{0}.json" -f [Guid]::NewGuid().ToString("N"))
 
 $cargo = Get-CargoPath
 $manifest = Join-Path $AgentRoot "Cargo.toml"
-$agentExitCode = 0
 
 while ($true) {
     $agentExitCode = 0
@@ -684,7 +741,7 @@ while ($true) {
         $cargoArgs += @("--features", "cuda")
     }
 
-    $cargoArgs += @("--", "--model", $modelInfo.Path, "--mode", $Mode.Replace("EnhancedTyping", "enhanced-typing").Replace("Transcription", "transcription"), "--temp-dir", $TempDir, "--fade-seconds", $resolvedFadeSeconds, "--language", $resolvedLanguage, "--agent-root", $AgentRoot)
+    $cargoArgs += @("--", "--model", $modelInfo.Path, "--mode", $Mode.Replace("EnhancedTyping", "enhanced-typing").Replace("Transcription", "transcription"), "--temp-dir", $TempDir, "--restart-state", $restartStatePath, "--fade-seconds", $resolvedFadeSeconds, "--language", $resolvedLanguage, "--agent-root", $AgentRoot)
     if ($terminalWindowHandle -ne [IntPtr]::Zero) {
         $cargoArgs += @("--terminal-window-handle", $terminalWindowHandle.ToInt64().ToString())
     }
@@ -717,11 +774,43 @@ while ($true) {
 
     if ($agentExitCode -eq $RestartExitCode) {
         Write-Host "Restarting Enchanted transcription with saved settings..." -ForegroundColor Cyan
+        # Command-line overrides are intentionally one-shot. After F9 saves settings,
+        # the restarted worker must consume those saved values instead of reapplying
+        # the launcher's original arguments.
+        $modelProvided = $false
+        $languageProvided = $false
+        $fadeSecondsProvided = $false
+        $agentModelProvided = $false
+        $noAgentProvided = $false
+        $NoAgent = $false
+        $SetupOpenAiKey = $false
+        Import-OpenAiApiKey
         $agentExitCode = 0
         continue
     }
 
     break
+}
+}
+finally {
+    if (-not [string]::IsNullOrWhiteSpace($restartStatePath) -and
+        (Test-Path -LiteralPath $restartStatePath -PathType Leaf)) {
+        Remove-Item -LiteralPath $restartStatePath -Force -ErrorAction SilentlyContinue
+    }
+    if ($TranscriptDump) {
+        if ($transcriptDumpEnvironmentExisted) {
+            $env:TUKEVEJTSO_TRANSCRIPT_DUMP = $previousTranscriptDumpEnvironment
+        }
+        else {
+            Remove-Item Env:TUKEVEJTSO_TRANSCRIPT_DUMP -ErrorAction SilentlyContinue
+        }
+    }
+    if ($openAiApiKeyEnvironmentExisted) {
+        $env:OPENAI_API_KEY = $previousOpenAiApiKeyEnvironment
+    }
+    else {
+        Remove-Item Env:OPENAI_API_KEY -ErrorAction SilentlyContinue
+    }
 }
 
 if ($agentExitCode -ne 0) {

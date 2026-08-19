@@ -12,8 +12,10 @@ use std::{
     cell::Cell,
     collections::{HashMap, VecDeque},
     env, fs,
+    fs::OpenOptions,
     io::{self, Write},
     mem::size_of,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     ptr,
@@ -30,8 +32,11 @@ use whisper_rs::{
     install_logging_hooks, FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
 };
 use windows_sys::Win32::{
-    Foundation::{HWND, POINT, RECT},
+    Foundation::{LocalFree, HWND, POINT, RECT},
     Graphics::Dwm::DwmGetWindowAttribute,
+    Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    },
     System::{
         Console::GetConsoleWindow,
         DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
@@ -83,12 +88,16 @@ const FADE_RENDER_INTERVAL: Duration = Duration::from_secs(2);
 const ERROR_BUFFER_CAPACITY: usize = 6;
 const DEFAULT_AGENT_MODEL: &str = "gpt-5.4-nano";
 const TRANSCRIPTION_RESTART_EXIT_CODE: i32 = 75;
+const TRANSCRIPTION_RESTART_STATE_VERSION: u32 = 2;
 const AGENT_INSTRUCTIONS_FILE: &str = "agent-instructions.md";
 const TYPING_INSTRUCTIONS_FILE: &str = "enhanced-typing-agent-instructions.md";
 const TRANSCRIPTION_SETTINGS_FILE: &str = "enchanted-transcription-settings.json";
 const TYPING_SETTINGS_FILE: &str = "enhanced-typing-settings.json";
 const AGENT_REFRESH_INTERVAL: Duration = Duration::from_secs(6);
 const AGENT_HTTP_TIMEOUT: Duration = Duration::from_secs(14);
+const AGENT_RETRY_LIMIT: u32 = 3;
+const AGENT_RETRY_BASE_SECONDS: u64 = 2;
+const AGENT_RETRY_MAX_SECONDS: u64 = 8;
 const AGENT_CONTEXT_CHARS: usize = 3500;
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const TYPING_MIN_WIDTH: u16 = 16;
@@ -117,6 +126,15 @@ const VK_KEYSCAN_NO_TRANSLATION: i16 = -1;
 const VK_KEYSCAN_SHIFT: u8 = 0x01;
 const VK_KEYSCAN_CONTROL: u8 = 0x02;
 const VK_KEYSCAN_ALT: u8 = 0x04;
+const MOVE_FILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+const MOVE_FILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+#[link(name = "kernel32")]
+extern "system" {
+    #[link_name = "MoveFileExW"]
+    fn move_file_ex_w(existing_file_name: *const u16, new_file_name: *const u16, flags: u32)
+        -> i32;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TypingTransparencyPreset {
@@ -365,6 +383,9 @@ struct AppConfig {
     temp_dir: PathBuf,
     terminal_hwnd: Option<isize>,
     transcription_settings_path: PathBuf,
+    transcription_settings_load_error: Option<String>,
+    restart_state_path: Option<PathBuf>,
+    restart_state: Option<TranscriptionRestartState>,
     transcription_settings: EnchantedTranscriptionSettings,
     sources: Vec<SourceKind>,
     chunk_seconds: usize,
@@ -380,6 +401,7 @@ struct CliArgs {
     temp_dir: PathBuf,
     agent_root: Option<PathBuf>,
     terminal_window_handle: Option<isize>,
+    restart_state_path: Option<PathBuf>,
     fade_seconds: u64,
     fade_seconds_provided: bool,
     language: Option<String>,
@@ -401,6 +423,8 @@ struct AgentConfig {
     max_output_tokens: u64,
     fields: Vec<AgentFieldConfig>,
     microphone_delta_gate_field: Option<String>,
+    initial_result: Value,
+    initial_input: Option<AgentInput>,
 }
 
 impl AgentConfig {
@@ -416,6 +440,8 @@ impl AgentConfig {
             max_output_tokens: 220,
             fields: Vec::new(),
             microphone_delta_gate_field: None,
+            initial_result: json!({}),
+            initial_input: None,
         }
     }
 }
@@ -431,6 +457,7 @@ struct TypingConfig {
     terminal_hwnd: Option<isize>,
     transparency_tool: PathBuf,
     settings_path: PathBuf,
+    settings_load_error: Option<String>,
     transparency_index: usize,
     typing_speed_index: usize,
     apply_saved_transparency: bool,
@@ -439,6 +466,7 @@ struct TypingConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct EnhancedTypingSettings {
     #[serde(default = "default_enabled_setting")]
     intelligence_enabled: bool,
@@ -457,6 +485,7 @@ struct EnhancedTypingSettings {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct EnchantedTranscriptionSettings {
     #[serde(default = "default_transcription_sources")]
     sources: Vec<SourceKind>,
@@ -736,6 +765,7 @@ enum AgentFieldRender {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAgentInstructionsConfig {
     max_output_tokens: Option<u64>,
     microphone_delta_gate_field: Option<String>,
@@ -743,6 +773,7 @@ struct RawAgentInstructionsConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAgentFieldConfig {
     key: String,
     title: String,
@@ -764,20 +795,24 @@ struct AudioFrame {
 
 enum UiEvent {
     Status(String),
+    Fatal(String),
     Transcript {
         source: SourceKind,
         text: String,
         elapsed_ms: u128,
         rms: f32,
+        generation: u64,
     },
     PartialTranscript {
         source: SourceKind,
         text: String,
         elapsed_ms: u128,
         rms: f32,
+        generation: u64,
     },
     TranscriptBreak {
         source: SourceKind,
+        generation: u64,
     },
     SourceError {
         source: SourceKind,
@@ -790,23 +825,30 @@ enum UiEvent {
     AgentStatus(String),
     AgentRequestStarted {
         query_bytes: usize,
+        generation: u64,
     },
     AgentRequestFailed {
         message: String,
+        usage: Option<AgentUsage>,
+        generation: u64,
     },
     AgentOutput {
         result: Value,
+        successful_input: AgentInput,
         usage: Option<AgentUsage>,
         force_hints: bool,
         elapsed_ms: u128,
+        generation: u64,
     },
     TypingRequestStarted {
         raw_text: String,
         query_bytes: usize,
         intelligence_enabled: bool,
+        generation: u64,
     },
     TypingRequestFailed {
         message: String,
+        generation: u64,
     },
     TypingOutput {
         raw_text: String,
@@ -815,6 +857,7 @@ enum UiEvent {
         usage: Option<AgentUsage>,
         elapsed_ms: u128,
         paste_status: String,
+        generation: u64,
     },
     TypingTransparencyFailed {
         generation: u64,
@@ -822,16 +865,19 @@ enum UiEvent {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AgentInput {
     system_transcript: String,
     microphone_transcript: Option<String>,
     force: bool,
+    generation: u64,
 }
 
 #[derive(Clone)]
 struct TypingInput {
     raw_text: String,
+    generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -928,8 +974,9 @@ impl StreamingSourceState {
 struct AppState {
     mode: AppMode,
     model_path: PathBuf,
-    dump_path: PathBuf,
+    dump_path: Option<PathBuf>,
     terminal_hwnd: Option<isize>,
+    terminal_view_focused: Option<bool>,
     transcription_settings_path: PathBuf,
     cuda_enabled: bool,
     sources: Vec<SourceKind>,
@@ -939,13 +986,17 @@ struct AppState {
     typing: TypingPaneState,
     transcripts: HashMap<SourceKind, TranscriptState>,
     errors: VecDeque<AppErrorEntry>,
+    discarded_error_count: u64,
     error_revision: u64,
     status: String,
+    fatal_error: Option<String>,
     restart_requested: bool,
+    restart_force_agent_update: bool,
     started_at: Instant,
     last_context_activity_at: Instant,
     hidden_since: Option<Instant>,
     agent_inactive_since: Option<Instant>,
+    agent_generation: u64,
     agent_token_limit: Option<u64>,
     token_budget_prompt_open: bool,
     token_budget_prompt_dismissed: bool,
@@ -958,9 +1009,75 @@ struct AppErrorEntry {
     repeat_count: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptionRestartState {
+    version: u32,
+    saved_at_unix_ms: u64,
+    session_elapsed_ms: u64,
+    idle_elapsed_ms: u64,
+    hidden_elapsed_ms: Option<u64>,
+    agent_inactive_elapsed_ms: Option<u64>,
+    agent_request_count: u64,
+    agent_input_tokens: u64,
+    agent_output_tokens: u64,
+    agent_total_tokens: u64,
+    agent_last_total_tokens: Option<u64>,
+    agent_last_query_bytes: Option<u64>,
+    agent_token_limit: Option<u64>,
+    token_budget_prompt_open: bool,
+    token_budget_prompt_dismissed: bool,
+    force_agent_update: bool,
+    discarded_error_count: u64,
+    protected_context: String,
+    #[serde(skip)]
+    context: Option<TranscriptionRestartContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptionRestartContext {
+    transcripts: Vec<RestartTranscriptEntry>,
+    agent_result: Value,
+    #[serde(default)]
+    agent_last_successful_input: Option<AgentInput>,
+    errors: Vec<RestartErrorEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestartTranscriptEntry {
+    source: SourceKind,
+    blocks: Vec<RestartTranscriptBlock>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestartTranscriptBlock {
+    text: String,
+    words: Vec<RestartTranscriptWord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestartTranscriptWord {
+    text: String,
+    age_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestartErrorEntry {
+    elapsed_ms: u64,
+    message: String,
+    repeat_count: u32,
+}
+
 struct AgentPaneState {
     enabled: bool,
     fields: Vec<AgentFieldState>,
+    canonical_result: Value,
+    last_successful_input: Option<AgentInput>,
     status: String,
     microphone_active: bool,
     system_output_active: bool,
@@ -978,7 +1095,9 @@ struct AgentPaneState {
 struct TranscriptionSettingsState {
     open: bool,
     selection: usize,
+    scroll_offset: usize,
     note: Option<String>,
+    load_error: Option<String>,
     confirm_close: bool,
     active: TranscriptionRestartSettings,
     pending: TranscriptionRestartSettings,
@@ -1012,6 +1131,7 @@ struct TypingPaneState {
     typing_speed_index: usize,
     transparency_generation: u64,
     settings_note: Option<String>,
+    settings_load_error: Option<String>,
     intelligence_available: bool,
     intelligence_enabled: bool,
     flush_mode: TypingFlushMode,
@@ -1107,13 +1227,17 @@ struct TranscriptWord {
 }
 
 impl AppState {
-    fn new(config: &AppConfig) -> Self {
+    fn new(config: &AppConfig) -> Result<Self> {
         let typing = config.typing.as_ref();
+        let terminal_view_focused = config
+            .terminal_hwnd
+            .and_then(terminal_window_accepts_requests);
         let mut state = Self {
             mode: config.mode,
             model_path: config.model_path.clone(),
-            dump_path: session_dump_path(&config.temp_dir),
+            dump_path: transcript_dump_enabled().then(|| session_dump_path(&config.temp_dir)),
             terminal_hwnd: config.terminal_hwnd,
+            terminal_view_focused,
             transcription_settings_path: config.transcription_settings_path.clone(),
             cuda_enabled: cfg!(feature = "cuda"),
             sources: config.sources.clone(),
@@ -1121,6 +1245,8 @@ impl AppState {
             agent: AgentPaneState {
                 enabled: config.agent.enabled,
                 fields: default_agent_fields(&config.agent.fields),
+                canonical_result: config.agent.initial_result.clone(),
+                last_successful_input: config.agent.initial_input.clone(),
                 status: if config.agent.enabled {
                     "waiting for system output".to_string()
                 } else {
@@ -1150,6 +1276,7 @@ impl AppState {
                 typing_speed_index: typing.map(|config| config.typing_speed_index).unwrap_or(1),
                 transparency_generation: 0,
                 settings_note: None,
+                settings_load_error: typing.and_then(|config| config.settings_load_error.clone()),
                 intelligence_available: typing.is_some_and(|config| config.api_key.is_some()),
                 intelligence_enabled: typing.is_some_and(|config| config.intelligence_enabled),
                 flush_mode: typing
@@ -1184,18 +1311,26 @@ impl AppState {
             },
             transcripts: HashMap::new(),
             errors: VecDeque::with_capacity(ERROR_BUFFER_CAPACITY),
+            discarded_error_count: 0,
             error_revision: 0,
             status: "Starting".to_string(),
+            fatal_error: None,
             restart_requested: false,
+            restart_force_agent_update: false,
             started_at: Instant::now(),
             last_context_activity_at: Instant::now(),
             hidden_since: None,
             agent_inactive_since: None,
+            agent_generation: 0,
             agent_token_limit: (config.transcription_settings.agent_token_budget > 0)
                 .then_some(config.transcription_settings.agent_token_budget),
             token_budget_prompt_open: false,
             token_budget_prompt_dismissed: false,
         };
+
+        if let Some(restart_state) = config.restart_state.as_ref() {
+            state.restore_restart_state(restart_state)?;
+        }
 
         if config.mode == AppMode::Transcription
             && config.transcription_settings.agent_enabled
@@ -1209,7 +1344,210 @@ impl AppState {
             state.agent.status = message.to_string();
             state.record_error(message);
         }
-        state
+        if let Some(message) = state.typing.settings_load_error.clone() {
+            state.typing.paste_status = "settings error; intelligence disabled".to_string();
+            state.record_error(message);
+        }
+        Ok(state)
+    }
+
+    fn restore_restart_state(&mut self, saved: &TranscriptionRestartState) -> Result<()> {
+        if saved.version != TRANSCRIPTION_RESTART_STATE_VERSION {
+            return Err(anyhow!(
+                "unsupported transcription restart-state version {}",
+                saved.version
+            ));
+        }
+
+        let now_unix_ms = unix_time_millis();
+        if saved.saved_at_unix_ms > now_unix_ms.saturating_add(60_000) {
+            return Err(anyhow!(
+                "transcription restart state has a future timestamp"
+            ));
+        }
+        let downtime_ms = now_unix_ms.saturating_sub(saved.saved_at_unix_ms);
+        let now = Instant::now();
+        let restored_instant = |elapsed_ms: u64, label: &str| -> Result<Instant> {
+            let elapsed = Duration::from_millis(elapsed_ms.saturating_add(downtime_ms));
+            now.checked_sub(elapsed)
+                .ok_or_else(|| anyhow!("transcription restart state has invalid {label}"))
+        };
+
+        self.started_at = restored_instant(saved.session_elapsed_ms, "session elapsed time")?;
+        self.last_context_activity_at =
+            restored_instant(saved.idle_elapsed_ms, "idle elapsed time")?;
+        self.hidden_since = saved
+            .hidden_elapsed_ms
+            .map(|elapsed| restored_instant(elapsed, "hidden elapsed time"))
+            .transpose()?;
+        self.agent_inactive_since = saved
+            .agent_inactive_elapsed_ms
+            .map(|elapsed| restored_instant(elapsed, "Agent inactive elapsed time"))
+            .transpose()?;
+
+        self.agent.request_count = saved.agent_request_count;
+        self.agent.input_tokens = saved.agent_input_tokens;
+        self.agent.output_tokens = saved.agent_output_tokens;
+        self.agent.total_tokens = saved.agent_total_tokens;
+        self.agent.last_total_tokens = saved.agent_last_total_tokens;
+        self.agent.last_query_bytes = saved
+            .agent_last_query_bytes
+            .map(usize::try_from)
+            .transpose()
+            .context("transcription restart state has an invalid query size")?;
+        self.agent_token_limit = saved.agent_token_limit;
+        self.token_budget_prompt_open = saved.token_budget_prompt_open;
+        self.token_budget_prompt_dismissed = saved.token_budget_prompt_dismissed;
+
+        let context = saved
+            .context
+            .as_ref()
+            .ok_or_else(|| anyhow!("transcription restart state has no protected context"))?;
+        let mut transcripts = HashMap::new();
+        for saved_transcript in &context.transcripts {
+            let mut blocks = Vec::with_capacity(saved_transcript.blocks.len());
+            for saved_block in &saved_transcript.blocks {
+                let mut words = Vec::with_capacity(saved_block.words.len());
+                for saved_word in &saved_block.words {
+                    words.push(TranscriptWord {
+                        text: saved_word.text.clone(),
+                        first_seen: restored_instant(saved_word.age_ms, "transcript word age")?,
+                    });
+                }
+                blocks.push(TranscriptBlock {
+                    text: saved_block.text.clone(),
+                    words,
+                });
+            }
+            transcripts.insert(saved_transcript.source, TranscriptState { blocks });
+        }
+        self.transcripts = transcripts;
+
+        let agent_field_configs = self
+            .agent
+            .fields
+            .iter()
+            .map(|field| field.config.clone())
+            .collect::<Vec<_>>();
+        if agent_result_matches_fields(&context.agent_result, &agent_field_configs) {
+            self.agent.canonical_result = context.agent_result.clone();
+            if value_has_content(&context.agent_result) {
+                let _ = self.agent.apply_result(context.agent_result.clone(), true);
+            }
+        }
+        self.agent.last_successful_input =
+            context
+                .agent_last_successful_input
+                .clone()
+                .map(|mut input| {
+                    input.force = false;
+                    input.generation = self.agent_generation;
+                    if !self.transcription_settings.active.include_microphone
+                        || !self
+                            .transcription_settings
+                            .active
+                            .sources
+                            .contains(&SourceKind::Microphone)
+                    {
+                        input.microphone_transcript = None;
+                    }
+                    input
+                });
+
+        let skipped = context.errors.len().saturating_sub(ERROR_BUFFER_CAPACITY);
+        let skipped_repeats = context
+            .errors
+            .iter()
+            .take(skipped)
+            .fold(0u64, |total, entry| {
+                total.saturating_add(u64::from(entry.repeat_count.max(1)))
+            });
+        self.discarded_error_count = saved.discarded_error_count.saturating_add(skipped_repeats);
+        self.errors = context
+            .errors
+            .iter()
+            .skip(skipped)
+            .filter(|entry| !entry.message.trim().is_empty())
+            .map(|entry| AppErrorEntry {
+                elapsed: Duration::from_millis(entry.elapsed_ms),
+                message: compact_error(entry.message.trim(), 2_000),
+                repeat_count: entry.repeat_count.max(1),
+            })
+            .collect();
+        if !self.errors.is_empty() || self.discarded_error_count > 0 {
+            self.error_revision = 1;
+        }
+        Ok(())
+    }
+
+    fn restart_state(&self) -> Result<TranscriptionRestartState> {
+        let context = TranscriptionRestartContext {
+            transcripts: [SourceKind::Microphone, SourceKind::SystemOutput]
+                .into_iter()
+                .filter_map(|source| {
+                    self.transcripts
+                        .get(&source)
+                        .map(|transcript| RestartTranscriptEntry {
+                            source,
+                            blocks: transcript
+                                .blocks
+                                .iter()
+                                .map(|block| RestartTranscriptBlock {
+                                    text: block.text.clone(),
+                                    words: block
+                                        .words
+                                        .iter()
+                                        .map(|word| RestartTranscriptWord {
+                                            text: word.text.clone(),
+                                            age_ms: duration_millis(word.first_seen.elapsed()),
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        })
+                })
+                .collect(),
+            agent_result: self.agent.canonical_result.clone(),
+            agent_last_successful_input: self.agent.last_successful_input.clone(),
+            errors: self
+                .errors
+                .iter()
+                .map(|entry| RestartErrorEntry {
+                    elapsed_ms: duration_millis(entry.elapsed),
+                    message: entry.message.clone(),
+                    repeat_count: entry.repeat_count,
+                })
+                .collect(),
+        };
+        let protected_context = protect_restart_context(&context)?;
+        Ok(TranscriptionRestartState {
+            version: TRANSCRIPTION_RESTART_STATE_VERSION,
+            saved_at_unix_ms: unix_time_millis(),
+            session_elapsed_ms: duration_millis(self.started_at.elapsed()),
+            idle_elapsed_ms: duration_millis(self.last_context_activity_at.elapsed()),
+            hidden_elapsed_ms: self
+                .hidden_since
+                .map(|started| duration_millis(started.elapsed())),
+            agent_inactive_elapsed_ms: self
+                .agent_inactive_since
+                .map(|started| duration_millis(started.elapsed())),
+            agent_request_count: self.agent.request_count,
+            agent_input_tokens: self.agent.input_tokens,
+            agent_output_tokens: self.agent.output_tokens,
+            agent_total_tokens: self.agent.total_tokens,
+            agent_last_total_tokens: self.agent.last_total_tokens,
+            agent_last_query_bytes: self
+                .agent
+                .last_query_bytes
+                .map(|value| u64::try_from(value).unwrap_or(u64::MAX)),
+            agent_token_limit: self.agent_token_limit,
+            token_budget_prompt_open: self.token_budget_prompt_open,
+            token_budget_prompt_dismissed: self.token_budget_prompt_dismissed,
+            force_agent_update: self.restart_force_agent_update,
+            discarded_error_count: self.discarded_error_count,
+            protected_context,
+            context: Some(context),
+        })
     }
 
     fn update_transcript(&mut self, source: SourceKind, text: &str) -> bool {
@@ -1251,7 +1589,8 @@ impl AppState {
         true
     }
 
-    fn refresh_session(&mut self) {
+    fn refresh_session(&mut self, generation: u64) {
+        self.agent_generation = generation;
         self.transcripts.clear();
         let field_configs = self
             .agent
@@ -1260,6 +1599,8 @@ impl AppState {
             .map(|field| field.config.clone())
             .collect::<Vec<_>>();
         self.agent.fields = default_agent_fields(&field_configs);
+        self.agent.canonical_result = default_agent_result(&field_configs);
+        self.agent.last_successful_input = None;
         self.agent.status = if self.agent.enabled {
             "refreshed".to_string()
         } else {
@@ -1280,7 +1621,7 @@ impl AppState {
     }
 
     fn record_error(&mut self, message: impl Into<String>) {
-        let message = compact_error(message.into().trim(), 240);
+        let message = compact_error(message.into().trim(), 2_000);
         if message.is_empty() {
             return;
         }
@@ -1296,7 +1637,11 @@ impl AppState {
         }
 
         if self.errors.len() == ERROR_BUFFER_CAPACITY {
-            self.errors.pop_front();
+            if let Some(discarded) = self.errors.pop_front() {
+                self.discarded_error_count = self
+                    .discarded_error_count
+                    .saturating_add(u64::from(discarded.repeat_count.max(1)));
+            }
         }
         self.errors.push_back(AppErrorEntry {
             elapsed,
@@ -1307,6 +1652,9 @@ impl AppState {
     }
 
     fn dump_transcripts(&self) -> Result<()> {
+        let Some(dump_path) = self.dump_path.as_ref() else {
+            return Ok(());
+        };
         let mut content = String::new();
         for source in &self.sources {
             content.push_str(source.label());
@@ -1325,8 +1673,8 @@ impl AppState {
             content.push('\n');
         }
 
-        fs::write(&self.dump_path, content)
-            .with_context(|| format!("failed to write {}", self.dump_path.display()))
+        fs::write(dump_path, content)
+            .with_context(|| format!("failed to write {}", dump_path.display()))
     }
 
     fn apply(&mut self, event: UiEvent) -> bool {
@@ -1344,12 +1692,22 @@ impl AppState {
                 self.status = message;
                 true
             }
+            UiEvent::Fatal(message) => {
+                self.status = message.clone();
+                self.record_error(message.clone());
+                self.fatal_error = Some(message);
+                true
+            }
             UiEvent::Transcript {
                 source,
                 text,
                 elapsed_ms,
                 rms,
+                generation,
             } => {
+                if generation != self.agent_generation {
+                    return false;
+                }
                 let _ = rms;
                 let changed = self.update_transcript(source, &text);
                 if changed {
@@ -1363,7 +1721,11 @@ impl AppState {
                 text,
                 elapsed_ms,
                 rms,
+                generation,
             } => {
+                if generation != self.agent_generation {
+                    return false;
+                }
                 let _ = rms;
                 let changed = self.update_transcript(source, &text);
                 if changed {
@@ -1372,7 +1734,9 @@ impl AppState {
                 }
                 changed
             }
-            UiEvent::TranscriptBreak { source } => self.add_transcript_break(source),
+            UiEvent::TranscriptBreak { source, generation } => {
+                generation == self.agent_generation && self.add_transcript_break(source)
+            }
             UiEvent::SourceError { source, message } => {
                 let message = format!(
                     "{} failed: {}",
@@ -1397,11 +1761,30 @@ impl AppState {
                 self.agent.status = message;
                 true
             }
-            UiEvent::AgentRequestStarted { query_bytes } => {
+            UiEvent::AgentRequestStarted {
+                query_bytes,
+                generation,
+            } => {
+                if generation != self.agent_generation {
+                    // The request crossed the F5/settings generation boundary, but
+                    // it still reached the API and must remain visible in the
+                    // lifetime counters. Do not mark the new generation in flight.
+                    self.agent.request_count = self.agent.request_count.saturating_add(1);
+                    self.agent.last_query_bytes = Some(query_bytes);
+                    return true;
+                }
                 self.agent.start_request(query_bytes);
                 true
             }
-            UiEvent::AgentRequestFailed { message } => {
+            UiEvent::AgentRequestFailed {
+                message,
+                usage,
+                generation,
+            } => {
+                self.agent.record_usage(usage);
+                if generation != self.agent_generation {
+                    return usage.is_some();
+                }
                 self.agent.finish_request();
                 self.agent.record_error(message.clone());
                 self.agent.status = message.clone();
@@ -1410,14 +1793,21 @@ impl AppState {
             }
             UiEvent::AgentOutput {
                 result,
+                successful_input,
                 usage,
                 force_hints,
                 elapsed_ms,
+                generation,
             } => {
+                self.agent.record_usage(usage);
+                if generation != self.agent_generation {
+                    return usage.is_some();
+                }
+                self.agent.canonical_result = result.clone();
+                self.agent.last_successful_input = Some(successful_input);
                 self.agent.apply_result(result, force_hints);
                 self.agent.finish_request();
                 self.agent.clear_error();
-                self.agent.record_usage(usage);
                 self.agent.status = format!("updated in {} ms", elapsed_ms);
                 true
             }
@@ -1425,12 +1815,22 @@ impl AppState {
                 raw_text,
                 query_bytes,
                 intelligence_enabled,
+                generation,
             } => {
+                if generation != self.agent_generation {
+                    return false;
+                }
                 self.typing
                     .start_request(raw_text, query_bytes, intelligence_enabled);
                 true
             }
-            UiEvent::TypingRequestFailed { message } => {
+            UiEvent::TypingRequestFailed {
+                message,
+                generation,
+            } => {
+                if generation != self.agent_generation {
+                    return false;
+                }
                 if self.typing.discard_pending_typing_output {
                     self.typing.finish_discarded_request();
                     return true;
@@ -1448,14 +1848,22 @@ impl AppState {
                 usage,
                 elapsed_ms,
                 paste_status,
+                generation,
             } => {
+                self.typing.record_usage(usage);
+                if generation != self.agent_generation {
+                    if usage.is_some() {
+                        self.typing.request_count = self.typing.request_count.saturating_add(1);
+                    }
+                    return usage.is_some();
+                }
                 if self.typing.discard_pending_typing_output {
                     self.typing.finish_discarded_request();
                     self.status = format!("enhanced typing cleared in {} ms", elapsed_ms);
                     return true;
                 }
                 self.typing
-                    .apply_output(raw_text, typed_text, display_note, usage, paste_status);
+                    .apply_output(raw_text, typed_text, display_note, paste_status);
                 self.status = format!("enhanced typing updated in {} ms", elapsed_ms);
                 true
             }
@@ -1483,7 +1891,9 @@ impl TranscriptionSettingsState {
         Self {
             open: false,
             selection: 0,
+            scroll_offset: 0,
             note: None,
+            load_error: config.transcription_settings_load_error.clone(),
             confirm_close: false,
             active: values.clone(),
             pending: values.clone(),
@@ -1494,6 +1904,7 @@ impl TranscriptionSettingsState {
 
     fn open(&mut self, fade_duration: Duration) {
         self.open = true;
+        self.scroll_offset = 0;
         self.note = None;
         self.confirm_close = false;
         self.snapshot = self.pending.clone();
@@ -1502,12 +1913,16 @@ impl TranscriptionSettingsState {
 
     fn close(&mut self) {
         self.open = false;
+        self.scroll_offset = 0;
         self.note = None;
         self.confirm_close = false;
     }
 
     fn request_close(&mut self, fade_duration: Duration) {
-        if self.pending != self.snapshot || fade_duration != self.fade_snapshot {
+        if self.load_error.is_some()
+            || self.pending != self.snapshot
+            || fade_duration != self.fade_snapshot
+        {
             self.confirm_close = true;
             self.note = None;
         } else {
@@ -1753,12 +2168,22 @@ impl TypingPaneState {
         self.last_error = Some(message);
     }
 
+    fn record_usage(&mut self, usage: Option<AgentUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.last_total_tokens = Some(usage.total_tokens);
+    }
+
     fn apply_output(
         &mut self,
         raw_text: String,
         typed_text: String,
         display_note: String,
-        usage: Option<AgentUsage>,
         paste_status: String,
     ) {
         self.finish_request();
@@ -1769,12 +2194,6 @@ impl TypingPaneState {
         self.paste_status = paste_status;
         self.updated_at = Some(Instant::now());
         self.scroll_offset = 0;
-        if let Some(usage) = usage {
-            self.input_tokens += usage.input_tokens;
-            self.output_tokens += usage.output_tokens;
-            self.total_tokens += usage.total_tokens;
-            self.last_total_tokens = Some(usage.total_tokens);
-        }
     }
 
     fn has_content(&self) -> bool {
@@ -2128,10 +2547,41 @@ fn default_agent_result(fields: &[AgentFieldConfig]) -> Value {
     Value::Object(out)
 }
 
-fn agent_result_has_renderable_fields(result: &Value, fields: &[AgentFieldConfig]) -> bool {
-    fields
-        .iter()
-        .any(|field| result.get(&field.key).is_some_and(value_has_content))
+fn agent_result_matches_fields(result: &Value, fields: &[AgentFieldConfig]) -> bool {
+    let Some(object) = result.as_object() else {
+        return false;
+    };
+    if object.len() != fields.len() {
+        return false;
+    }
+
+    fields.iter().all(|field| match field.render {
+        AgentFieldRender::Text => object.get(&field.key).is_some_and(Value::is_string),
+        AgentFieldRender::List => object
+            .get(&field.key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().all(Value::is_string)),
+    })
+}
+
+fn canonical_agent_result(fields: &[AgentFieldConfig], current: &Value, mut next: Value) -> Value {
+    let Some(next_object) = next.as_object_mut() else {
+        return next;
+    };
+
+    for field in fields.iter().filter(|field| field.preserve_on_empty) {
+        let next_has_content = next_object.get(&field.key).is_some_and(value_has_content);
+        if next_has_content {
+            continue;
+        }
+        if let Some(previous) = current
+            .get(&field.key)
+            .filter(|value| value_has_content(value))
+        {
+            next_object.insert(field.key.clone(), previous.clone());
+        }
+    }
+    next
 }
 
 fn value_has_content(value: &Value) -> bool {
@@ -2142,6 +2592,158 @@ fn value_has_content(value: &Value) -> bool {
         Value::Null => false,
         Value::Bool(value) => *value,
         Value::Number(_) => true,
+    }
+}
+
+fn agent_retry_delay(retry_number: u32) -> Duration {
+    let exponent = retry_number.saturating_sub(1).min(8);
+    let multiplier = 1u64 << exponent;
+    Duration::from_secs(
+        AGENT_RETRY_BASE_SECONDS
+            .saturating_mul(multiplier)
+            .min(AGENT_RETRY_MAX_SECONDS),
+    )
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(duration_millis)
+        .unwrap_or_default()
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn protect_restart_context(context: &TranscriptionRestartContext) -> Result<String> {
+    let mut plaintext = serde_json::to_vec(context)
+        .context("failed to serialize protected transcription restart context")?;
+    let plaintext_len = u32::try_from(plaintext.len())
+        .context("protected transcription restart context is too large")?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: plaintext_len,
+        pbData: plaintext.as_mut_ptr(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: ptr::null_mut(),
+    };
+    let protected = unsafe {
+        CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    plaintext.fill(0);
+    if protected == 0 {
+        return Err(io::Error::last_os_error())
+            .context("Windows DPAPI could not protect transcription restart context");
+    }
+    if output.cbData > 0 && output.pbData.is_null() {
+        return Err(anyhow!(
+            "Windows DPAPI returned an invalid protected transcription restart context"
+        ));
+    }
+
+    let protected_bytes =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    if !output.pbData.is_null() {
+        unsafe {
+            let _ = LocalFree(output.pbData.cast());
+        }
+    }
+    Ok(hex_encode(&protected_bytes))
+}
+
+fn unprotect_restart_context(encoded: &str) -> Result<TranscriptionRestartContext> {
+    let mut protected_bytes = hex_decode(encoded)?;
+    let protected_len = u32::try_from(protected_bytes.len())
+        .context("protected transcription restart payload is too large")?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: protected_len,
+        pbData: protected_bytes.as_mut_ptr(),
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: ptr::null_mut(),
+    };
+    let unprotected = unsafe {
+        CryptUnprotectData(
+            &input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if unprotected == 0 {
+        return Err(io::Error::last_os_error())
+            .context("Windows DPAPI could not unprotect transcription restart context");
+    }
+    if output.cbData > 0 && output.pbData.is_null() {
+        return Err(anyhow!(
+            "Windows DPAPI returned an invalid unprotected transcription restart context"
+        ));
+    }
+
+    let mut plaintext =
+        unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec() };
+    if !output.pbData.is_null() {
+        unsafe {
+            ptr::write_bytes(output.pbData, 0, output.cbData as usize);
+            let _ = LocalFree(output.pbData.cast());
+        }
+    }
+    let context = serde_json::from_slice::<TranscriptionRestartContext>(&plaintext)
+        .context("invalid protected transcription restart context");
+    plaintext.fill(0);
+    context
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>> {
+    let bytes = text.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err(anyhow!(
+            "protected transcription restart payload has odd length"
+        ));
+    }
+
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(value: u8) -> Result<u8> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(anyhow!(
+            "protected transcription restart payload is not hexadecimal"
+        )),
     }
 }
 
@@ -2172,6 +2774,7 @@ impl TerminalGuard {
             io::stdout(),
             terminal::EnterAlternateScreen,
             terminal::Clear(terminal::ClearType::All),
+            event::EnableFocusChange,
             cursor::Hide
         )?;
         Ok(Self { restore_on_drop })
@@ -2180,7 +2783,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            event::DisableFocusChange,
+            cursor::Show,
+            terminal::LeaveAlternateScreen
+        );
         let _ = terminal::disable_raw_mode();
         if let Some(restore_state) = self.restore_on_drop {
             restore_typing_terminal(restore_state);
@@ -2207,9 +2815,11 @@ fn run(product: ProductMode) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let refresh_generation = Arc::new(AtomicU64::new(0));
     let agent_force_generation = Arc::new(AtomicU64::new(0));
-    let agent_requests_allowed = Arc::new(AtomicBool::new(
-        !config.transcription_settings.pause_agent_when_hidden || config.terminal_hwnd.is_some(),
-    ));
+    // Start fail-closed. The render lifecycle enables requests only after it has
+    // evaluated terminal focus, restored token limits, and automatic-off rules.
+    let agent_requests_allowed = Arc::new(AtomicBool::new(false));
+    let agent_request_in_flight = Arc::new(AtomicBool::new(false));
+    let typing_request_in_flight = Arc::new(AtomicBool::new(false));
     let typing_intelligence_enabled = Arc::new(AtomicBool::new(
         config
             .typing
@@ -2254,6 +2864,7 @@ fn run(product: ProductMode) -> Result<()> {
             stop.clone(),
             refresh_generation.clone(),
             agent_requests_allowed.clone(),
+            agent_request_in_flight.clone(),
         );
         Some(agent_tx)
     } else {
@@ -2266,8 +2877,10 @@ fn run(product: ProductMode) -> Result<()> {
             typing_rx,
             ui_tx.clone(),
             stop.clone(),
+            refresh_generation.clone(),
             typing_intelligence_enabled.clone(),
             typing_refiner_model.clone(),
+            typing_request_in_flight,
         );
         Some(typing_tx)
     } else {
@@ -2292,12 +2905,12 @@ fn run(product: ProductMode) -> Result<()> {
         typing_input_source.clone(),
     );
 
-    let restart_requested = {
+    let restart_state = {
         let terminal_hwnd = config.terminal_hwnd;
         let restore_on_drop = (config.mode == AppMode::EnhancedTyping)
             .then(|| capture_terminal_restore_state(terminal_hwnd));
         let _terminal = TerminalGuard::enter(restore_on_drop)?;
-        let mut state = AppState::new(&config);
+        let mut state = AppState::new(&config)?;
         if config
             .typing
             .as_ref()
@@ -2322,11 +2935,21 @@ fn run(product: ProductMode) -> Result<()> {
             typing_paused,
             typing_transparency_tx,
             agent_requests_allowed,
+            agent_request_in_flight,
         )?;
-        state.restart_requested
+        if state.restart_requested {
+            Some(state.restart_state()?)
+        } else {
+            None
+        }
     };
 
-    if restart_requested {
+    if let Some(restart_state) = restart_state {
+        let restart_state_path = config
+            .restart_state_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("settings restart requires --restart-state <file>"))?;
+        save_transcription_restart_state(restart_state_path, &restart_state)?;
         std::process::exit(TRANSCRIPTION_RESTART_EXIT_CODE);
     }
     Ok(())
@@ -2339,6 +2962,7 @@ fn parse_args(default_mode: AppMode) -> Result<CliArgs> {
     let mut temp_dir = None;
     let mut agent_root = None;
     let mut terminal_window_handle = None;
+    let mut restart_state_path = None;
     let mut fade_seconds = DEFAULT_TEXT_FADE_SECONDS;
     let mut fade_seconds_provided = false;
     let mut language = None;
@@ -2372,6 +2996,12 @@ fn parse_args(default_mode: AppMode) -> Result<CliArgs> {
                     .next()
                     .ok_or_else(|| anyhow!("--terminal-window-handle requires a window handle"))?;
                 terminal_window_handle = parse_terminal_window_handle(&value)?;
+            }
+            "--restart-state" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--restart-state requires a file path"))?;
+                restart_state_path = Some(PathBuf::from(path));
             }
             "--mode" => {
                 let value = args
@@ -2411,7 +3041,7 @@ fn parse_args(default_mode: AppMode) -> Result<CliArgs> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: speech-agent --model <ggml-model.bin> [--mode transcription|enhanced-typing] [--temp-dir <dir>] [--agent-root <dir>] [--terminal-window-handle <hwnd>] [--fade-seconds <5-180>] [--language <code|auto>] [--agent-model <model>] [--agent-disabled]"
+                    "Usage: speech-agent --model <ggml-model.bin> [--mode transcription|enhanced-typing] [--temp-dir <dir>] [--agent-root <dir>] [--terminal-window-handle <hwnd>] [--restart-state <file>] [--fade-seconds <5-180>] [--language <code|auto>] [--agent-model <model>] [--agent-disabled]"
                 );
                 std::process::exit(0);
             }
@@ -2427,6 +3057,7 @@ fn parse_args(default_mode: AppMode) -> Result<CliArgs> {
         temp_dir,
         agent_root,
         terminal_window_handle,
+        restart_state_path,
         fade_seconds,
         fade_seconds_provided,
         language,
@@ -2520,7 +3151,7 @@ fn cleanup_old_temp_files(temp_dir: &PathBuf) -> Result<()> {
     {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() || !is_transcript_dump(&path) {
+        if !path.is_file() || !is_expiring_session_file(&path) {
             continue;
         }
 
@@ -2539,10 +3170,14 @@ fn cleanup_old_temp_files(temp_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn is_transcript_dump(path: &Path) -> bool {
+fn is_expiring_session_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.starts_with("transcription-") && name.ends_with(".txt"))
+        .map(|name| {
+            (name.starts_with("transcription-") && name.ends_with(".txt"))
+                || (name.starts_with("restart-state-") && name.ends_with(".json"))
+                || (name.starts_with(".restart-state-") && name.ends_with(".tmp"))
+        })
         .unwrap_or(false)
 }
 
@@ -2552,6 +3187,17 @@ fn session_dump_path(temp_dir: &Path) -> PathBuf {
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     temp_dir.join(format!("transcription-{seconds}.txt"))
+}
+
+fn transcript_dump_enabled() -> bool {
+    env::var("TUKEVEJTSO_TRANSCRIPT_DUMP")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 fn enhanced_typing_settings_path() -> PathBuf {
@@ -2570,12 +3216,45 @@ fn transcription_settings_path() -> PathBuf {
         .join(TRANSCRIPTION_SETTINGS_FILE)
 }
 
-fn load_enchanted_transcription_settings(path: &PathBuf) -> EnchantedTranscriptionSettings {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<EnchantedTranscriptionSettings>(&text).ok())
-        .unwrap_or_default()
-        .normalized()
+fn load_enchanted_transcription_settings(
+    path: &PathBuf,
+) -> (EnchantedTranscriptionSettings, Option<String>) {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return (EnchantedTranscriptionSettings::default(), None);
+        }
+        Err(err) => {
+            return (
+                EnchantedTranscriptionSettings::default(),
+                Some(format!(
+                    "Could not read saved transcription settings: {err}. Defaults are active for this session; the original file will be preserved unless you explicitly apply settings."
+                )),
+            );
+        }
+    };
+
+    match serde_json::from_str::<EnchantedTranscriptionSettings>(&text) {
+        Ok(settings) => {
+            let mut comparable = settings.clone();
+            comparable.sources = normalize_transcription_sources(&comparable.sources);
+            let normalized = settings.clone().normalized();
+            let load_error = (comparable != normalized).then(|| {
+                "Some saved transcription settings were adjusted to supported values. Review them before applying; the original file has not been changed."
+                    .to_string()
+            });
+            (normalized, load_error)
+        }
+        Err(err) => (
+            EnchantedTranscriptionSettings::default(),
+            Some(format!(
+                "Could not parse saved transcription settings at line {}, column {}: {}. Defaults are active for this session; the invalid file will be preserved unless you explicitly apply settings.",
+                err.line(),
+                err.column(),
+                err
+            )),
+        ),
+    }
 }
 
 fn save_enchanted_transcription_settings(
@@ -2588,15 +3267,179 @@ fn save_enchanted_transcription_settings(
     }
     let text = serde_json::to_string_pretty(settings)
         .context("failed to serialize transcription settings")?;
-    fs::write(path, format!("{text}\n"))
+    atomic_write_file(path, format!("{text}\n").as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn load_enhanced_typing_settings(path: &PathBuf) -> EnhancedTypingSettings {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<EnhancedTypingSettings>(&text).ok())
-        .unwrap_or_default()
+fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("settings path has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "settings".into());
+    cleanup_old_atomic_write_files(parent, &file_name);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let mut temporary = None;
+
+    for sequence in 0..32u32 {
+        let candidate = parent.join(format!(
+            ".{file_name}.{}.{nonce}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err).context("failed to create temporary settings file"),
+        }
+    }
+
+    let (temporary_path, mut temporary_file) =
+        temporary.ok_or_else(|| anyhow!("could not allocate a temporary settings file"))?;
+    let write_result = (|| -> Result<()> {
+        temporary_file
+            .write_all(contents)
+            .context("failed to write temporary settings file")?;
+        temporary_file
+            .sync_all()
+            .context("failed to flush temporary settings file")?;
+        drop(temporary_file);
+
+        let source = temporary_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let destination = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let replaced = unsafe {
+            move_file_ex_w(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVE_FILE_REPLACE_EXISTING | MOVE_FILE_WRITE_THROUGH,
+            )
+        };
+        if replaced == 0 {
+            return Err(io::Error::last_os_error()).context("failed to replace settings file");
+        }
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    write_result
+}
+
+fn cleanup_old_atomic_write_files(parent: &Path, target_file_name: &str) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let prefix = format!(".{target_file_name}.");
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let matches_target = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".tmp"));
+        if !matches_target || !path.is_file() {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > TEMP_RETENTION);
+        if old_enough {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn load_transcription_restart_state(path: &Path) -> Result<Option<TranscriptionRestartState>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read restart state {}", path.display()))
+        }
+    };
+    let mut state = serde_json::from_str::<TranscriptionRestartState>(&text)
+        .with_context(|| format!("invalid restart state {}", path.display()))?;
+    if state.version != TRANSCRIPTION_RESTART_STATE_VERSION {
+        return Err(anyhow!(
+            "unsupported restart-state version {} in {}",
+            state.version,
+            path.display()
+        ));
+    }
+    state.context = Some(
+        unprotect_restart_context(&state.protected_context)
+            .with_context(|| format!("failed to restore restart state {}", path.display()))?,
+    );
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove consumed restart state {}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn save_transcription_restart_state(path: &Path, state: &TranscriptionRestartState) -> Result<()> {
+    let text = serde_json::to_string_pretty(state).context("failed to serialize restart state")?;
+    atomic_write_file(path, format!("{text}\n").as_bytes())
+        .with_context(|| format!("failed to save restart state {}", path.display()))
+}
+
+fn load_enhanced_typing_settings(path: &Path) -> (EnhancedTypingSettings, Option<String>) {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return (EnhancedTypingSettings::default(), None);
+        }
+        Err(err) => {
+            let mut settings = EnhancedTypingSettings::default();
+            settings.intelligence_enabled = false;
+            return (
+                settings,
+                Some(format!(
+                    "Could not read saved enhanced-typing settings: {err}. Intelligence is disabled; the original file is preserved until you apply or change a setting."
+                )),
+            );
+        }
+    };
+
+    match serde_json::from_str::<EnhancedTypingSettings>(&text) {
+        Ok(settings) => (settings, None),
+        Err(err) => {
+            let mut settings = EnhancedTypingSettings::default();
+            settings.intelligence_enabled = false;
+            (
+                settings,
+                Some(format!(
+                    "Could not parse saved enhanced-typing settings at line {}, column {}: {}. Intelligence is disabled; the invalid file is preserved until you apply or change a setting.",
+                    err.line(),
+                    err.column(),
+                    err
+                )),
+            )
+        }
+    }
 }
 
 fn save_enhanced_typing_settings(path: &PathBuf, settings: &EnhancedTypingSettings) -> Result<()> {
@@ -2606,7 +3449,7 @@ fn save_enhanced_typing_settings(path: &PathBuf, settings: &EnhancedTypingSettin
     }
     let text =
         serde_json::to_string_pretty(settings).context("failed to serialize typing settings")?;
-    fs::write(path, format!("{text}\n"))
+    atomic_write_file(path, format!("{text}\n").as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
@@ -2648,7 +3491,22 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
         );
     }
 
-    let mut settings = load_enchanted_transcription_settings(&transcription_settings_path);
+    let restart_state_path = args.restart_state_path.clone();
+    let restart_state = restart_state_path
+        .as_deref()
+        .map(load_transcription_restart_state)
+        .transpose()?
+        .flatten();
+
+    let (mut settings, mut transcription_settings_load_error) =
+        load_enchanted_transcription_settings(&transcription_settings_path);
+    if let Some(message) = transcription_settings_load_error.as_mut() {
+        // An unreadable settings document must never silently re-enable remote requests.
+        settings.agent_enabled = false;
+        message.push_str(
+            " Agent API requests are disabled until you explicitly review and apply settings.",
+        );
+    }
     settings.model = transcription_model_choice_from_path(&model_path);
     if args.language_provided {
         settings.language = transcription_language_setting(args.language.as_deref());
@@ -2665,7 +3523,27 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
     settings = settings.normalized();
 
     let sources = settings.sources.clone();
-    let agent = build_transcription_agent_config(&settings, &sources, &agent_root)?;
+    let mut agent = build_transcription_agent_config(&settings, &sources, &agent_root)?;
+    if let Some(restored_context) = restart_state
+        .as_ref()
+        .and_then(|state| state.context.as_ref())
+    {
+        if agent_result_matches_fields(&restored_context.agent_result, &agent.fields) {
+            agent.initial_result = restored_context.agent_result.clone();
+        }
+        agent.initial_input =
+            restored_context
+                .agent_last_successful_input
+                .clone()
+                .map(|mut input| {
+                    input.force = false;
+                    input.generation = 0;
+                    if !agent.include_microphone {
+                        input.microphone_transcript = None;
+                    }
+                    input
+                });
+    }
     let terminal_hwnd = args
         .terminal_window_handle
         .and_then(valid_terminal_window_handle)
@@ -2677,6 +3555,9 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
         temp_dir: args.temp_dir,
         terminal_hwnd,
         transcription_settings_path,
+        transcription_settings_load_error,
+        restart_state_path,
+        restart_state,
         transcription_settings: settings.clone(),
         sources,
         chunk_seconds: settings.chunk_seconds,
@@ -2703,8 +3584,8 @@ fn build_enhanced_typing_config(
         .or_else(current_terminal_window_handle);
     let instructions = load_typing_instructions(agent_root)?;
     let settings_path = enhanced_typing_settings_path();
-    let settings_were_saved = settings_path.is_file();
-    let settings = load_enhanced_typing_settings(&settings_path);
+    let (settings, settings_load_error) = load_enhanced_typing_settings(&settings_path);
+    let settings_were_saved = settings_path.is_file() && settings_load_error.is_none();
     let refiner_model = saved_typing_refiner_model(&settings, &args.agent_model);
     let transparency_index =
         typing_transparency_preset_index(&settings.transparency_label).unwrap_or(0);
@@ -2722,6 +3603,9 @@ fn build_enhanced_typing_config(
         temp_dir: args.temp_dir,
         terminal_hwnd,
         transcription_settings_path,
+        transcription_settings_load_error: None,
+        restart_state_path: None,
+        restart_state: None,
         transcription_settings: EnchantedTranscriptionSettings::default(),
         sources: vec![SourceKind::Microphone, SourceKind::SystemOutput],
         chunk_seconds: TYPING_CHUNK_SECONDS,
@@ -2742,6 +3626,7 @@ fn build_enhanced_typing_config(
             terminal_hwnd,
             transparency_tool,
             settings_path,
+            settings_load_error,
             transparency_index,
             typing_speed_index,
             apply_saved_transparency: settings_were_saved,
@@ -2789,6 +3674,7 @@ fn build_transcription_agent_config(
     agent_context
         .instructions
         .push_str(settings.answer_mode.developer_instruction());
+    let initial_result = default_agent_result(&agent_context.fields);
     Ok(AgentConfig {
         enabled: true,
         model: settings.agent_model.clone(),
@@ -2800,6 +3686,8 @@ fn build_transcription_agent_config(
         max_output_tokens: agent_context.max_output_tokens,
         fields: agent_context.fields,
         microphone_delta_gate_field: agent_context.microphone_delta_gate_field,
+        initial_result,
+        initial_input: None,
     })
 }
 
@@ -3139,7 +4027,7 @@ fn capture_loop(
         device_name
     )));
 
-    while !stop.load(Ordering::SeqCst) {
+    'capture: while !stop.load(Ordering::SeqCst) {
         capture_client.read_from_device_to_deque(&mut sample_queue)?;
 
         while sample_queue.len() >= block_align * CAPTURE_FRAMES_PER_PACKET {
@@ -3151,8 +4039,7 @@ fn capture_loop(
             }
             let samples = f32_samples_from_bytes(&bytes);
             if !samples.is_empty() && tx.send(AudioFrame { source, samples }).is_err() {
-                stop.store(true, Ordering::SeqCst);
-                break;
+                break 'capture;
             }
         }
 
@@ -3208,8 +4095,7 @@ fn spawn_whisper_thread(
                 typing_paused,
                 typing_input_source,
             ) {
-                let _ = ui_tx.send(UiEvent::Status(format!("Whisper failed: {err}")));
-                stop.store(true, Ordering::SeqCst);
+                let _ = ui_tx.send(UiEvent::Fatal(format!("Whisper failed: {err:#}")));
             }
         })
         .expect("failed to spawn Whisper thread");
@@ -3266,8 +4152,41 @@ fn whisper_loop(
     for source in &config.sources {
         streams.insert(*source, StreamingSourceState::new(window_samples));
     }
+    if let Some(context) = config
+        .restart_state
+        .as_ref()
+        .and_then(|state| state.context.as_ref())
+    {
+        for saved in &context.transcripts {
+            let Some(stream) = streams.get_mut(&saved.source) else {
+                continue;
+            };
+            stream.history = saved
+                .blocks
+                .iter()
+                .map(|block| block.text.trim())
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            let history_text = stream.history.join("\n\n");
+            set_prompt(&mut stream.prompt, &history_text);
+        }
+    }
     let mut seen_refresh_generation = refresh_generation.load(Ordering::SeqCst);
     let mut seen_agent_force_generation = agent_force_generation.load(Ordering::SeqCst);
+    if config
+        .restart_state
+        .as_ref()
+        .is_some_and(|state| state.force_agent_update)
+    {
+        send_agent_update(
+            &agent_tx,
+            &streams,
+            config.agent.include_microphone,
+            true,
+            seen_refresh_generation,
+        );
+    }
 
     while !stop.load(Ordering::SeqCst) {
         let current_refresh_generation = refresh_generation.load(Ordering::SeqCst);
@@ -3286,7 +4205,13 @@ fn whisper_loop(
         let current_agent_force_generation = agent_force_generation.load(Ordering::SeqCst);
         if current_agent_force_generation != seen_agent_force_generation {
             seen_agent_force_generation = current_agent_force_generation;
-            send_agent_update(&agent_tx, &streams, config.agent.include_microphone, true);
+            send_agent_update(
+                &agent_tx,
+                &streams,
+                config.agent.include_microphone,
+                true,
+                seen_refresh_generation,
+            );
         }
 
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -3357,7 +4282,8 @@ fn whisper_loop(
 
                         if silence_break {
                             let should_send_agent_update =
-                                source == SourceKind::SystemOutput && stream.agent_update_pending;
+                                source_updates_agent(source, config.agent.include_microphone)
+                                    && stream.agent_update_pending;
                             if is_typing_source && stream.best_text.trim().is_empty() {
                                 let final_window = stream.samples.clone();
                                 if final_window.len() >= SAMPLE_RATE / 4 {
@@ -3382,7 +4308,10 @@ fn whisper_loop(
                                 None
                             };
                             if stream.finish_current_block() {
-                                let _ = ui_tx.send(UiEvent::TranscriptBreak { source });
+                                let _ = ui_tx.send(UiEvent::TranscriptBreak {
+                                    source,
+                                    generation: seen_refresh_generation,
+                                });
                                 if let Some(text) = completed_typing_text {
                                     typing_update = Some(text);
                                 }
@@ -3453,7 +4382,7 @@ fn whisper_loop(
                         if text_changed {
                             stream.best_text = merged_text.clone();
                             stream.pending_commit = merged_text.clone();
-                            if source == SourceKind::SystemOutput {
+                            if source_updates_agent(source, config.agent.include_microphone) {
                                 stream.agent_update_pending = true;
                             }
                         }
@@ -3463,6 +4392,7 @@ fn whisper_loop(
                             text: merged_text,
                             elapsed_ms,
                             rms: energy,
+                            generation: seen_refresh_generation,
                         });
 
                         if stream.last_commit.elapsed() >= STREAM_COMMIT_INTERVAL
@@ -3479,8 +4409,9 @@ fn whisper_loop(
                                 text: committed,
                                 elapsed_ms,
                                 rms: energy,
+                                generation: seen_refresh_generation,
                             });
-                            if source == SourceKind::SystemOutput {
+                            if source_updates_agent(source, config.agent.include_microphone) {
                                 stream.agent_update_pending = false;
                                 agent_update_needed = true;
                             }
@@ -3489,10 +4420,16 @@ fn whisper_loop(
                 }
 
                 if agent_update_needed {
-                    send_agent_update(&agent_tx, &streams, config.agent.include_microphone, false);
+                    send_agent_update(
+                        &agent_tx,
+                        &streams,
+                        config.agent.include_microphone,
+                        false,
+                        seen_refresh_generation,
+                    );
                 }
                 if let Some(raw_text) = typing_update {
-                    send_typing_update(&typing_tx, raw_text);
+                    send_typing_update(&typing_tx, raw_text, seen_refresh_generation);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -3503,11 +4440,16 @@ fn whisper_loop(
     Ok(())
 }
 
+fn source_updates_agent(source: SourceKind, include_microphone: bool) -> bool {
+    source == SourceKind::SystemOutput || (include_microphone && source == SourceKind::Microphone)
+}
+
 fn send_agent_update(
     agent_tx: &Option<Sender<AgentInput>>,
     streams: &HashMap<SourceKind, StreamingSourceState>,
     include_microphone: bool,
     force: bool,
+    generation: u64,
 ) {
     let system_transcript = streams
         .get(&SourceKind::SystemOutput)
@@ -3531,6 +4473,7 @@ fn send_agent_update(
             system_transcript,
             microphone_transcript,
             force,
+            generation,
         });
     }
 }
@@ -3562,14 +4505,17 @@ fn typing_submission_text(stream: &StreamingSourceState) -> Option<String> {
     }
 }
 
-fn send_typing_update(typing_tx: &Option<Sender<TypingInput>>, raw_text: String) {
+fn send_typing_update(typing_tx: &Option<Sender<TypingInput>>, raw_text: String, generation: u64) {
     let raw_text = raw_text.trim().to_string();
     if raw_text.is_empty() {
         return;
     }
 
     if let Some(typing_tx) = typing_tx {
-        let _ = typing_tx.send(TypingInput { raw_text });
+        let _ = typing_tx.send(TypingInput {
+            raw_text,
+            generation,
+        });
     }
 }
 
@@ -3580,6 +4526,7 @@ fn spawn_agent_thread(
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
     requests_allowed: Arc<AtomicBool>,
+    request_in_flight: Arc<AtomicBool>,
 ) {
     thread::Builder::new()
         .name("agent-insights".to_string())
@@ -3589,11 +4536,15 @@ fn spawn_agent_thread(
                 rx,
                 ui_tx.clone(),
                 stop.clone(),
-                refresh_generation,
+                refresh_generation.clone(),
                 requests_allowed,
+                request_in_flight.clone(),
             ) {
+                request_in_flight.store(false, Ordering::SeqCst);
                 let _ = ui_tx.send(UiEvent::AgentRequestFailed {
                     message: format!("agent failed: {err}"),
+                    usage: None,
+                    generation: refresh_generation.load(Ordering::SeqCst),
                 });
             }
         })
@@ -3607,6 +4558,7 @@ fn agent_loop(
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
     requests_allowed: Arc<AtomicBool>,
+    request_in_flight: Arc<AtomicBool>,
 ) -> Result<()> {
     let api_key = config
         .api_key
@@ -3621,15 +4573,29 @@ fn agent_loop(
 
     let mut latest_input: Option<AgentInput> = None;
     let mut last_submitted = String::new();
-    let mut last_result = default_agent_result(&config.fields);
-    let mut last_successful_input: Option<AgentInput> = None;
+    let mut last_result = config.initial_result.clone();
+    let mut last_successful_input = config.initial_input.clone();
     let mut last_request = Instant::now() - AGENT_REFRESH_INTERVAL;
+    let mut retry_signature: Option<String> = None;
+    let mut retry_count = 0u32;
+    let mut retry_not_before: Option<Instant> = None;
     let mut seen_refresh_generation = refresh_generation.load(Ordering::SeqCst);
     let mut was_allowed = true;
 
     let _ = ui_tx.send(UiEvent::AgentStatus(format!("ready with {}", config.model)));
 
     while !stop.load(Ordering::SeqCst) {
+        let mut received_input = None;
+        match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(input) => received_input = Some(input),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        while let Ok(input) = rx.try_recv() {
+            received_input = Some(input);
+        }
+
         let current_refresh_generation = refresh_generation.load(Ordering::SeqCst);
         if current_refresh_generation != seen_refresh_generation {
             latest_input = None;
@@ -3637,20 +4603,17 @@ fn agent_loop(
             last_result = default_agent_result(&config.fields);
             last_successful_input = None;
             last_request = Instant::now() - AGENT_REFRESH_INTERVAL;
+            retry_signature = None;
+            retry_count = 0;
+            retry_not_before = None;
             seen_refresh_generation = current_refresh_generation;
             let _ = ui_tx.send(UiEvent::AgentStatus("refreshed".to_string()));
-            continue;
         }
 
-        match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(input) => {
-                latest_input = Some(input);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-
-        while let Ok(input) = rx.try_recv() {
+        if let Some(input) = received_input.filter(|input| {
+            input.generation == seen_refresh_generation
+                && input.generation == refresh_generation.load(Ordering::SeqCst)
+        }) {
             latest_input = Some(input);
         }
 
@@ -3680,7 +4643,17 @@ fn agent_loop(
             continue;
         };
 
-        if !force_requested {
+        let retrying = retry_signature.as_deref() == Some(input_signature.as_str());
+        if retry_signature.is_some() && !retrying {
+            retry_signature = None;
+            retry_count = 0;
+            retry_not_before = None;
+        }
+        if retrying && retry_not_before.is_some_and(|not_before| Instant::now() < not_before) {
+            continue;
+        }
+
+        if !force_requested && !retrying {
             if input_signature == last_submitted || last_request.elapsed() < AGENT_REFRESH_INTERVAL
             {
                 continue;
@@ -3700,35 +4673,82 @@ fn agent_loop(
         let request_body =
             build_agent_request_body(&config, input, last_successful_input.as_ref(), &last_result);
         let query_bytes = serialized_json_bytes(&request_body);
+        let request_generation = seen_refresh_generation;
+
+        // Publish ownership before the final permission check. This closes the
+        // settings-restart race: either the renderer sees an active request and
+        // waits for its usage, or this worker sees the pause and never calls the API.
+        request_in_flight.store(true, Ordering::SeqCst);
+        if stop.load(Ordering::SeqCst)
+            || !requests_allowed.load(Ordering::SeqCst)
+            || refresh_generation.load(Ordering::SeqCst) != request_generation
+        {
+            request_in_flight.store(false, Ordering::SeqCst);
+            continue;
+        }
 
         let started = Instant::now();
-        let _ = ui_tx.send(UiEvent::AgentRequestStarted { query_bytes });
+        let _ = ui_tx.send(UiEvent::AgentRequestStarted {
+            query_bytes,
+            generation: request_generation,
+        });
 
         match request_agent_result(&client, &api_key, request_body, &config.fields) {
             Ok(call_result) => {
                 last_submitted = input_signature;
                 last_successful_input = Some(input.clone());
-                last_result = call_result.result.clone();
+                let result =
+                    canonical_agent_result(&config.fields, &last_result, call_result.result);
+                last_result = result.clone();
+                retry_signature = None;
+                retry_count = 0;
+                retry_not_before = None;
                 let _ = ui_tx.send(UiEvent::AgentOutput {
-                    result: call_result.result,
+                    result,
+                    successful_input: input.clone(),
                     usage: call_result.usage,
                     force_hints,
                     elapsed_ms: started.elapsed().as_millis(),
+                    generation: request_generation,
                 });
             }
-            Err(err) => {
-                last_submitted = input_signature;
+            Err(failure) => {
+                let AgentCallFailure {
+                    message,
+                    usage,
+                    retryable,
+                } = failure;
+                let retry_scheduled = retryable && retry_count < AGENT_RETRY_LIMIT;
+                let message = if retry_scheduled {
+                    retry_count += 1;
+                    let delay = agent_retry_delay(retry_count);
+                    retry_signature = Some(input_signature.clone());
+                    retry_not_before = Some(Instant::now() + delay);
+                    format!(
+                        "OpenAI request failed: {}; retry {}/{} in {}s",
+                        compact_error(&message, 90),
+                        retry_count,
+                        AGENT_RETRY_LIMIT,
+                        delay.as_secs()
+                    )
+                } else {
+                    last_submitted = input_signature;
+                    retry_signature = None;
+                    retry_count = 0;
+                    retry_not_before = None;
+                    format!("OpenAI request failed: {}", compact_error(&message, 90))
+                };
                 let _ = ui_tx.send(UiEvent::AgentRequestFailed {
-                    message: format!(
-                        "OpenAI request failed: {}",
-                        compact_error(&err.to_string(), 90)
-                    ),
+                    message,
+                    usage,
+                    generation: request_generation,
                 });
             }
         }
+        request_in_flight.store(false, Ordering::SeqCst);
 
         last_request = Instant::now();
-        if force_requested {
+        if force_requested && retry_signature.is_none() {
             latest_input = None;
         }
     }
@@ -3741,8 +4761,10 @@ fn spawn_typing_thread(
     rx: Receiver<TypingInput>,
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
+    refresh_generation: Arc<AtomicU64>,
     intelligence_enabled: Arc<AtomicBool>,
     refiner_model: Arc<Mutex<String>>,
+    request_in_flight: Arc<AtomicBool>,
 ) {
     thread::Builder::new()
         .name("enhanced-typing".to_string())
@@ -3752,11 +4774,15 @@ fn spawn_typing_thread(
                 rx,
                 ui_tx.clone(),
                 stop.clone(),
+                refresh_generation.clone(),
                 intelligence_enabled,
                 refiner_model,
+                request_in_flight.clone(),
             ) {
+                request_in_flight.store(false, Ordering::SeqCst);
                 let _ = ui_tx.send(UiEvent::TypingRequestFailed {
                     message: format!("typing failed: {err}"),
+                    generation: refresh_generation.load(Ordering::SeqCst),
                 });
             }
         })
@@ -3768,14 +4794,17 @@ fn typing_loop(
     rx: Receiver<TypingInput>,
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
+    refresh_generation: Arc<AtomicU64>,
     intelligence_enabled: Arc<AtomicBool>,
     refiner_model: Arc<Mutex<String>>,
+    request_in_flight: Arc<AtomicBool>,
 ) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(AGENT_HTTP_TIMEOUT)
         .build()
         .context("failed to create OpenAI HTTP client")?;
     let mut last_submitted = String::new();
+    let mut seen_refresh_generation = refresh_generation.load(Ordering::SeqCst);
 
     let _ = ui_tx.send(UiEvent::Status(format!(
         "Enhanced typing ready with {}",
@@ -3788,6 +4817,14 @@ fn typing_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let request_generation = input.generation;
+        if request_generation != refresh_generation.load(Ordering::SeqCst) {
+            continue;
+        }
+        if request_generation != seen_refresh_generation {
+            last_submitted.clear();
+            seen_refresh_generation = request_generation;
+        }
         let raw_text = input.raw_text.trim().to_string();
         if raw_text.is_empty() || raw_text == last_submitted {
             continue;
@@ -3802,10 +4839,14 @@ fn typing_loop(
             .map(serialized_json_bytes)
             .unwrap_or(0);
         let started = Instant::now();
+        if request_generation != refresh_generation.load(Ordering::SeqCst) {
+            continue;
+        }
         let _ = ui_tx.send(UiEvent::TypingRequestStarted {
             raw_text: raw_text.clone(),
             query_bytes,
             intelligence_enabled: use_intelligence,
+            generation: request_generation,
         });
 
         if !use_intelligence {
@@ -3817,6 +4858,7 @@ fn typing_loop(
                 usage: None,
                 elapsed_ms: started.elapsed().as_millis(),
                 paste_status: "draft updated".to_string(),
+                generation: request_generation,
             });
             continue;
         }
@@ -3826,7 +4868,18 @@ fn typing_loop(
             .api_key
             .as_deref()
             .expect("typing request requires an API key");
-        match request_typing_result(&client, api_key, request_body) {
+        // Publish ownership before the final cancellation check. This gives F5
+        // an unambiguous boundary without making the renderer wait on HTTP.
+        request_in_flight.store(true, Ordering::SeqCst);
+        if stop.load(Ordering::SeqCst)
+            || request_generation != refresh_generation.load(Ordering::SeqCst)
+        {
+            request_in_flight.store(false, Ordering::SeqCst);
+            continue;
+        }
+        let call_result = request_typing_result(&client, api_key, request_body);
+        request_in_flight.store(false, Ordering::SeqCst);
+        match call_result {
             Ok(result) => {
                 last_submitted = raw_text.clone();
                 let _ = ui_tx.send(UiEvent::TypingOutput {
@@ -3836,18 +4889,21 @@ fn typing_loop(
                     usage: result.usage,
                     elapsed_ms: started.elapsed().as_millis(),
                     paste_status: "draft updated".to_string(),
+                    generation: request_generation,
                 });
             }
-            Err(err) => {
+            Err(failure) => {
                 last_submitted = raw_text.clone();
-                let error = compact_error(&err.to_string(), 90);
+                let AgentCallFailure { message, usage, .. } = failure;
+                let error = compact_error(&message, 90);
                 let _ = ui_tx.send(UiEvent::TypingOutput {
                     raw_text: raw_text.clone(),
                     typed_text: raw_text,
                     display_note: format!("raw transcription; refiner failed: {error}"),
-                    usage: None,
+                    usage,
                     elapsed_ms: started.elapsed().as_millis(),
                     paste_status: "draft updated; refiner failed".to_string(),
+                    generation: request_generation,
                 });
             }
         }
@@ -3980,6 +5036,22 @@ struct AgentCallResult {
     usage: Option<AgentUsage>,
 }
 
+struct AgentCallFailure {
+    message: String,
+    usage: Option<AgentUsage>,
+    retryable: bool,
+}
+
+impl AgentCallFailure {
+    fn new(message: impl Into<String>, usage: Option<AgentUsage>, retryable: bool) -> Self {
+        Self {
+            message: message.into(),
+            usage,
+            retryable,
+        }
+    }
+}
+
 struct TypingCallResult {
     typed_text: String,
     display_note: String,
@@ -3997,34 +5069,67 @@ fn request_agent_result(
     api_key: &str,
     body: Value,
     fields: &[AgentFieldConfig],
-) -> Result<AgentCallResult> {
+) -> std::result::Result<AgentCallResult, AgentCallFailure> {
     let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
         .json(&body)
         .send()
-        .context("failed to call OpenAI Responses API")?;
+        .map_err(|err| {
+            AgentCallFailure::new(
+                format!("failed to call OpenAI Responses API: {err}"),
+                None,
+                true,
+            )
+        })?;
     let status = response.status();
-    let response_text = response
-        .text()
-        .context("failed to read OpenAI response body")?;
+    let response_text = response.text().map_err(|err| {
+        AgentCallFailure::new(
+            format!("failed to read OpenAI response body: {err}"),
+            None,
+            true,
+        )
+    })?;
 
     if !status.is_success() {
-        return Err(anyhow!(
-            "OpenAI API returned {status}: {}",
-            compact_error(&response_text, 140)
+        let retryable = status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::CONFLICT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+        return Err(AgentCallFailure::new(
+            format!(
+                "OpenAI API returned {status}: {}",
+                compact_error(&response_text, 140)
+            ),
+            None,
+            retryable,
         ));
     }
 
-    let value: Value =
-        serde_json::from_str(&response_text).context("OpenAI response was not valid JSON")?;
+    let value: Value = serde_json::from_str(&response_text).map_err(|err| {
+        AgentCallFailure::new(
+            format!("OpenAI response was not valid JSON: {err}"),
+            None,
+            false,
+        )
+    })?;
     let usage = extract_agent_usage(&value);
-    let output_text = extract_response_text(&value)
-        .ok_or_else(|| anyhow!("OpenAI response did not contain output text"))?;
-    let parsed = serde_json::from_str::<Value>(&output_text)
-        .context("OpenAI structured output did not match the agent instruction schema")?;
-    if !agent_result_has_renderable_fields(&parsed, fields) {
-        return Err(anyhow!("OpenAI response had no renderable fields"));
+    let output_text = extract_response_text(&value).ok_or_else(|| {
+        AgentCallFailure::new("OpenAI response did not contain output text", usage, false)
+    })?;
+    let parsed = serde_json::from_str::<Value>(&output_text).map_err(|err| {
+        AgentCallFailure::new(
+            format!("OpenAI structured output did not match the agent instruction schema: {err}"),
+            usage,
+            false,
+        )
+    })?;
+    if !agent_result_matches_fields(&parsed, fields) {
+        return Err(AgentCallFailure::new(
+            "OpenAI structured output had unexpected field types",
+            usage,
+            false,
+        ));
     }
 
     Ok(AgentCallResult {
@@ -4037,35 +5142,64 @@ fn request_typing_result(
     client: &reqwest::blocking::Client,
     api_key: &str,
     body: Value,
-) -> Result<TypingCallResult> {
+) -> std::result::Result<TypingCallResult, AgentCallFailure> {
     let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
         .json(&body)
         .send()
-        .context("failed to call OpenAI Responses API")?;
+        .map_err(|err| {
+            AgentCallFailure::new(
+                format!("failed to call OpenAI Responses API: {err}"),
+                None,
+                false,
+            )
+        })?;
     let status = response.status();
-    let response_text = response
-        .text()
-        .context("failed to read OpenAI response body")?;
+    let response_text = response.text().map_err(|err| {
+        AgentCallFailure::new(
+            format!("failed to read OpenAI response body: {err}"),
+            None,
+            false,
+        )
+    })?;
 
     if !status.is_success() {
-        return Err(anyhow!(
-            "OpenAI API returned {status}: {}",
-            compact_error(&response_text, 140)
+        return Err(AgentCallFailure::new(
+            format!(
+                "OpenAI API returned {status}: {}",
+                compact_error(&response_text, 140)
+            ),
+            None,
+            false,
         ));
     }
 
-    let value: Value =
-        serde_json::from_str(&response_text).context("OpenAI response was not valid JSON")?;
+    let value: Value = serde_json::from_str(&response_text).map_err(|err| {
+        AgentCallFailure::new(
+            format!("OpenAI response was not valid JSON: {err}"),
+            None,
+            false,
+        )
+    })?;
     let usage = extract_agent_usage(&value);
-    let output_text = extract_response_text(&value)
-        .ok_or_else(|| anyhow!("OpenAI response did not contain output text"))?;
-    let parsed = serde_json::from_str::<RawTypingResult>(&output_text)
-        .context("OpenAI structured output did not match the enhanced typing schema")?;
+    let output_text = extract_response_text(&value).ok_or_else(|| {
+        AgentCallFailure::new("OpenAI response did not contain output text", usage, false)
+    })?;
+    let parsed = serde_json::from_str::<RawTypingResult>(&output_text).map_err(|err| {
+        AgentCallFailure::new(
+            format!("OpenAI structured output did not match the enhanced typing schema: {err}"),
+            usage,
+            false,
+        )
+    })?;
     let typed_text = parsed.typed_text;
     if typed_text.trim().is_empty() {
-        return Err(anyhow!("OpenAI response returned empty typed_text"));
+        return Err(AgentCallFailure::new(
+            "OpenAI response returned empty typed_text",
+            usage,
+            false,
+        ));
     }
 
     Ok(TypingCallResult {
@@ -4112,6 +5246,7 @@ fn build_agent_request_body(
 
     json!({
         "model": config.model.as_str(),
+        "store": false,
         "input": [
             {
                 "role": "developer",
@@ -4152,6 +5287,7 @@ fn build_typing_request_body(config: &TypingConfig, model: &str, raw_text: &str)
 
     json!({
         "model": model,
+        "store": false,
         "input": [
             {
                 "role": "developer",
@@ -4393,24 +5529,39 @@ impl Drop for ClipboardGuard {
 }
 
 fn current_terminal_window_handle() -> Option<isize> {
+    // Windows Terminal requires the launcher's title-probe handshake. A bare
+    // foreground HWND is not enough because another window/tab may own it.
+    attached_console_terminal_window_handle()
+}
+
+fn reacquire_terminal_window_handle(terminal_view_focused: Option<bool>) -> Option<isize> {
+    attached_console_terminal_window_handle().or_else(|| {
+        // A foreground Windows Terminal window is only a safe reacquisition
+        // candidate after this console has reported that its own view gained focus.
+        (terminal_view_focused == Some(true))
+            .then(foreground_windows_terminal_window_handle)
+            .flatten()
+    })
+}
+
+fn attached_console_terminal_window_handle() -> Option<isize> {
     let console_hwnd = root_window_handle(unsafe { GetConsoleWindow() });
-    if is_terminal_window_handle(console_hwnd) {
-        return Some(console_hwnd as isize);
+    is_terminal_window_handle(console_hwnd).then_some(console_hwnd as isize)
+}
+
+fn foreground_windows_terminal_window_handle() -> Option<isize> {
+    if env::var_os("WT_SESSION").is_none() {
+        return None;
     }
 
-    if env::var_os("WT_SESSION").is_some() {
-        let foreground_hwnd = root_window_handle(unsafe { GetForegroundWindow() });
-        if is_terminal_window_handle(foreground_hwnd) {
-            return Some(foreground_hwnd as isize);
-        }
-    }
-
-    None
+    let foreground_hwnd = root_window_handle(unsafe { GetForegroundWindow() });
+    (window_class_name(foreground_hwnd) == "CASCADIA_HOSTING_WINDOW_CLASS")
+        .then_some(foreground_hwnd as isize)
 }
 
 fn valid_terminal_window_handle(handle: isize) -> Option<isize> {
     let hwnd = root_window_handle(handle as HWND);
-    if !hwnd.is_null() && unsafe { IsWindow(hwnd) } != 0 && unsafe { IsWindowVisible(hwnd) } != 0 {
+    if is_terminal_window_handle(hwnd) {
         Some(hwnd as isize)
     } else {
         None
@@ -4439,7 +5590,11 @@ fn terminal_window_visibility(handle: isize) -> Option<bool> {
             size_of::<u32>() as u32,
         )
     };
-    Some(result < 0 || cloaked == 0)
+    if result < 0 {
+        None
+    } else {
+        Some(cloaked == 0)
+    }
 }
 
 fn terminal_window_accepts_requests(handle: isize) -> Option<bool> {
@@ -4466,7 +5621,7 @@ fn root_window_handle(hwnd: HWND) -> HWND {
 }
 
 fn is_terminal_window_handle(hwnd: HWND) -> bool {
-    if hwnd.is_null() || unsafe { IsWindowVisible(hwnd) } == 0 {
+    if hwnd.is_null() || unsafe { IsWindow(hwnd) } == 0 || unsafe { IsWindowVisible(hwnd) } == 0 {
         return false;
     }
 
@@ -5278,6 +6433,7 @@ fn render_loop(
     typing_paused: Arc<AtomicBool>,
     typing_transparency_tx: Option<Sender<TypingTransparencyRequest>>,
     agent_requests_allowed: Arc<AtomicBool>,
+    agent_request_in_flight: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut dirty = true;
     let mut last_render = Instant::now() - RENDER_INTERVAL;
@@ -5296,14 +6452,52 @@ fn render_loop(
 
     loop {
         while let Ok(app_event) = rx.try_recv() {
-            let settings_open = state.transcription_settings.open || state.typing.settings_open;
+            let transcription_settings_open = state.transcription_settings.open;
+            let settings_open = transcription_settings_open || state.typing.settings_open;
             let error_revision = state.error_revision;
+            let agent_status = state.agent.status.clone();
+            let agent_request_count = state.agent.request_count;
             let changed = state.apply(app_event);
             dirty |= if settings_open {
                 state.error_revision != error_revision
+                    || (transcription_settings_open
+                        && (state.agent.status != agent_status
+                            || state.agent.request_count != agent_request_count))
             } else {
                 changed
             };
+        }
+
+        if let Some(message) = state.fatal_error.clone() {
+            let _ = render(state);
+            agent_requests_allowed.store(false, Ordering::SeqCst);
+            stop.store(true, Ordering::SeqCst);
+            return Err(anyhow!(message));
+        }
+
+        if state.restart_requested {
+            agent_requests_allowed.store(false, Ordering::SeqCst);
+            if agent_request_in_flight.load(Ordering::SeqCst) {
+                let waiting = "Settings saved; waiting for current Agent request";
+                if state.status != waiting {
+                    state.status = waiting.to_string();
+                    dirty = true;
+                }
+            } else {
+                // A completion can be queued just before the worker clears its
+                // atomic flag. Drain it now so billed usage reaches the snapshot.
+                while let Ok(app_event) = rx.try_recv() {
+                    let _ = state.apply(app_event);
+                }
+                if let Some(message) = state.fatal_error.clone() {
+                    let _ = render(state);
+                    agent_requests_allowed.store(false, Ordering::SeqCst);
+                    stop.store(true, Ordering::SeqCst);
+                    return Err(anyhow!(message));
+                }
+                stop.store(true, Ordering::SeqCst);
+                break;
+            }
         }
 
         let (lifecycle_changed, automatic_exit) =
@@ -5350,7 +6544,23 @@ fn render_loop(
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+            let terminal_event = event::read()?;
+            match &terminal_event {
+                Event::FocusGained => {
+                    state.terminal_view_focused = Some(true);
+                    continue;
+                }
+                Event::FocusLost => {
+                    state.terminal_view_focused = Some(false);
+                    continue;
+                }
+                Event::Resize(_, _) => {
+                    dirty = true;
+                    continue;
+                }
+                _ => {}
+            }
+            if let Event::Key(key) = terminal_event {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -5399,8 +6609,14 @@ fn render_loop(
                         TypingKeyOutcome::Changed => {
                             render(state)?;
                             if state.restart_requested {
-                                stop.store(true, Ordering::SeqCst);
-                                break;
+                                agent_requests_allowed.store(false, Ordering::SeqCst);
+                                if agent_request_in_flight.load(Ordering::SeqCst) {
+                                    state.status =
+                                        "Settings saved; waiting for current Agent request"
+                                            .to_string();
+                                    dirty = true;
+                                }
+                                continue;
                             }
                             dirty = false;
                             last_render = Instant::now();
@@ -5408,6 +6624,8 @@ fn render_loop(
                         }
                         TypingKeyOutcome::Consumed => continue,
                         TypingKeyOutcome::ExitRequested => {
+                            state.restart_requested = false;
+                            agent_requests_allowed.store(false, Ordering::SeqCst);
                             stop.store(true, Ordering::SeqCst);
                             break;
                         }
@@ -5427,8 +6645,11 @@ fn render_loop(
                 }
 
                 if key.code == KeyCode::F(5) {
-                    state.refresh_session();
-                    refresh_generation.fetch_add(1, Ordering::SeqCst);
+                    agent_requests_allowed.store(false, Ordering::SeqCst);
+                    let generation = refresh_generation
+                        .fetch_add(1, Ordering::SeqCst)
+                        .wrapping_add(1);
+                    state.refresh_session(generation);
                     dirty = true;
                     continue;
                 }
@@ -5437,6 +6658,8 @@ fn render_loop(
                     || (key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL));
                 if quit {
+                    state.restart_requested = false;
+                    agent_requests_allowed.store(false, Ordering::SeqCst);
                     stop.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -5444,6 +6667,7 @@ fn render_loop(
         }
 
         if stop.load(Ordering::SeqCst) {
+            agent_requests_allowed.store(false, Ordering::SeqCst);
             break;
         }
     }
@@ -5459,24 +6683,43 @@ fn update_transcription_lifecycle(
         requests_allowed.store(true, Ordering::SeqCst);
         return (false, false);
     }
+    if state.restart_requested {
+        requests_allowed.store(false, Ordering::SeqCst);
+        return (false, false);
+    }
 
     let now = Instant::now();
+    let previous_terminal_hwnd = state.terminal_hwnd;
+    let mut terminal_hwnd = previous_terminal_hwnd.and_then(valid_terminal_window_handle);
+    if previous_terminal_hwnd.is_some() && terminal_hwnd.is_none() {
+        // Do not reuse focus evidence from a window that no longer exists.
+        state.terminal_view_focused = None;
+    }
+    if terminal_hwnd.is_none() {
+        terminal_hwnd = reacquire_terminal_window_handle(state.terminal_view_focused);
+    }
+    state.terminal_hwnd = terminal_hwnd;
+    let monitor_changed = previous_terminal_hwnd != terminal_hwnd;
+
     let settings = &state.transcription_settings.active;
-    let visibility = state.terminal_hwnd.and_then(terminal_window_visibility);
-    let request_visibility = state
+    let window_request_visibility = state
         .terminal_hwnd
         .and_then(terminal_window_accepts_requests);
-    match visibility {
-        Some(true) | None => state.hidden_since = None,
-        Some(false) if state.hidden_since.is_none() => state.hidden_since = Some(now),
-        Some(false) => {}
+    let request_visibility = match (window_request_visibility, state.terminal_view_focused) {
+        (Some(true), Some(false)) => Some(false),
+        (value, _) => value,
+    };
+    match request_visibility {
+        Some(true) => state.hidden_since = None,
+        Some(false) | None if state.hidden_since.is_none() => state.hidden_since = Some(now),
+        Some(false) | None => {}
     }
     match request_visibility {
-        Some(true) | None => state.agent_inactive_since = None,
-        Some(false) if state.agent_inactive_since.is_none() => {
+        Some(true) => state.agent_inactive_since = None,
+        Some(false) | None if state.agent_inactive_since.is_none() => {
             state.agent_inactive_since = Some(now);
         }
-        Some(false) => {}
+        Some(false) | None => {}
     }
 
     let hidden_elapsed = state
@@ -5493,16 +6736,21 @@ fn update_transcription_lifecycle(
         minutes > 0 && elapsed >= Duration::from_secs(minutes.saturating_mul(60))
     };
 
-    let exit_reason =
-        if visibility == Some(false) && expired(hidden_elapsed, settings.hidden_exit_minutes) {
-            Some("Auto-exit: terminal remained hidden")
-        } else if expired(idle_elapsed, settings.idle_exit_minutes) {
-            Some("Auto-exit: no transcript activity")
-        } else if expired(session_elapsed, settings.max_session_minutes) {
-            Some("Auto-exit: maximum session reached")
+    let exit_reason = if request_visibility != Some(true)
+        && expired(hidden_elapsed, settings.hidden_exit_minutes)
+    {
+        Some(if request_visibility.is_none() {
+            "Auto-exit: terminal monitor remained unavailable"
         } else {
-            None
-        };
+            "Auto-exit: terminal remained out of view"
+        })
+    } else if expired(idle_elapsed, settings.idle_exit_minutes) {
+        Some("Auto-exit: no transcript activity")
+    } else if expired(session_elapsed, settings.max_session_minutes) {
+        Some("Auto-exit: maximum session reached")
+    } else {
+        None
+    };
     if let Some(reason) = exit_reason {
         let changed = state.status != reason;
         state.status = reason.to_string();
@@ -5510,16 +6758,17 @@ fn update_transcription_lifecycle(
         return (changed, true);
     }
 
-    let budget_reached = agent_token_budget_reached(state);
+    let budget_reached = state.agent.enabled && agent_token_budget_reached(state);
     let mut prompt_changed = false;
     if budget_reached && !state.token_budget_prompt_open && !state.token_budget_prompt_dismissed {
         state.token_budget_prompt_open = true;
         prompt_changed = true;
     }
-    let hidden_pause = settings.pause_agent_when_hidden
-        && (request_visibility.is_none()
-            || (request_visibility == Some(false)
-                && agent_inactive_elapsed >= Duration::from_secs(settings.hidden_pause_seconds)));
+    let monitor_unavailable = request_visibility.is_none();
+    let hidden_pause = monitor_unavailable
+        || (settings.pause_agent_when_hidden
+            && request_visibility == Some(false)
+            && agent_inactive_elapsed >= Duration::from_secs(settings.hidden_pause_seconds));
     let allowed = state.agent.enabled && !hidden_pause && !budget_reached;
     requests_allowed.store(allowed, Ordering::SeqCst);
 
@@ -5527,8 +6776,12 @@ fn update_transcription_lifecycle(
         Some("paused; token budget reached (F1 to review)")
     } else if budget_reached {
         Some("paused; session token budget reached")
-    } else if request_visibility.is_none() && settings.pause_agent_when_hidden {
-        Some("paused; terminal visibility unavailable")
+    } else if monitor_unavailable {
+        Some(if settings.hidden_exit_minutes > 0 {
+            "paused; terminal monitor unavailable; hidden auto-exit timer running"
+        } else {
+            "paused; terminal monitor unavailable; hidden auto-exit is off"
+        })
     } else if hidden_pause {
         Some("paused; terminal not foreground, local context continues")
     } else {
@@ -5541,7 +6794,7 @@ fn update_transcription_lifecycle(
         }
     }
 
-    (prompt_changed, false)
+    (prompt_changed || monitor_changed, false)
 }
 
 fn agent_token_budget_reached(state: &AppState) -> bool {
@@ -5610,6 +6863,7 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
                 .request_close(state.fade_duration);
         } else {
             state.transcription_settings.open(state.fade_duration);
+            reveal_transcription_setting_selection(state);
         }
         return TypingKeyOutcome::Changed;
     }
@@ -5619,6 +6873,12 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return TypingKeyOutcome::Ignored;
+    }
+    if matches!(
+        key.code,
+        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End
+    ) {
+        return scroll_transcription_settings(state, key.code);
     }
 
     if state.transcription_settings.confirm_close {
@@ -5653,6 +6913,7 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
             state.transcription_settings.selection =
                 (state.transcription_settings.selection + count - 1) % count;
             state.transcription_settings.note = None;
+            reveal_transcription_setting_selection(state);
             TypingKeyOutcome::Changed
         }
         KeyCode::Down => {
@@ -5660,6 +6921,7 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
             state.transcription_settings.selection =
                 (state.transcription_settings.selection + 1) % count;
             state.transcription_settings.note = None;
+            reveal_transcription_setting_selection(state);
             TypingKeyOutcome::Changed
         }
         KeyCode::Left => change_transcription_setting(state, TypingSettingDirection::Previous),
@@ -5670,6 +6932,20 @@ fn handle_transcription_key(state: &mut AppState, key: &event::KeyEvent) -> Typi
 
 fn apply_transcription_settings(state: &mut AppState) {
     let restart_needed = state.transcription_settings.has_restart_changes();
+    let active = &state.transcription_settings.active;
+    let pending = &state.transcription_settings.pending;
+    let answer_mode_changed = pending.answer_mode != active.answer_mode;
+    let was_sharing_microphone =
+        active.include_microphone && active.sources.contains(&SourceKind::Microphone);
+    let will_share_microphone =
+        pending.include_microphone && pending.sources.contains(&SourceKind::Microphone);
+    let microphone_sharing_disabled = was_sharing_microphone && !will_share_microphone;
+    let refresh_agent_after_restart = answer_mode_changed
+        || was_sharing_microphone != will_share_microphone
+        || pending.agent_enabled != active.agent_enabled
+        || pending.agent_model != active.agent_model
+        || pending.sources.contains(&SourceKind::SystemOutput)
+            != active.sources.contains(&SourceKind::SystemOutput);
     let previous_token_budget = state.transcription_settings.active.agent_token_budget;
     let settings = state
         .transcription_settings
@@ -5677,6 +6953,7 @@ fn apply_transcription_settings(state: &mut AppState) {
     match save_enchanted_transcription_settings(&state.transcription_settings_path, &settings) {
         Ok(()) => {
             state.transcription_settings.active = state.transcription_settings.pending.clone();
+            state.transcription_settings.load_error = None;
             let next_token_budget = state.transcription_settings.active.agent_token_budget;
             if next_token_budget != previous_token_budget {
                 state.agent_token_limit = (next_token_budget > 0).then_some(next_token_budget);
@@ -5685,6 +6962,27 @@ fn apply_transcription_settings(state: &mut AppState) {
             }
             state.transcription_settings.close();
             if restart_needed {
+                // Results already in flight belong to the previous worker contract.
+                // Their usage is still counted, but their content must not enter the
+                // protected restart snapshot.
+                state.agent_generation = state.agent_generation.wrapping_add(1);
+                state.restart_force_agent_update = refresh_agent_after_restart;
+                if microphone_sharing_disabled {
+                    let field_configs = state
+                        .agent
+                        .fields
+                        .iter()
+                        .map(|field| field.config.clone())
+                        .collect::<Vec<_>>();
+                    state.agent.canonical_result = default_agent_result(&field_configs);
+                    if let Some(input) = state.agent.last_successful_input.as_mut() {
+                        input.microphone_transcript = None;
+                    }
+                } else if answer_mode_changed {
+                    if let Some(result) = state.agent.canonical_result.as_object_mut() {
+                        result.insert("answer_guidance".to_string(), Value::String(String::new()));
+                    }
+                }
                 state.status = "Settings saved; restarting".to_string();
                 state.restart_requested = true;
             } else {
@@ -5702,6 +7000,58 @@ fn apply_transcription_settings(state: &mut AppState) {
 
 fn transcription_settings_option_count() -> usize {
     14
+}
+
+fn transcription_settings_viewport(state: &AppState) -> (usize, usize, usize) {
+    let (terminal_width, terminal_height) = terminal::size().unwrap_or((80, 24));
+    let width = terminal_width.saturating_sub(1).max(1) as usize;
+    let viewport_height = terminal_height.saturating_sub(2) as usize;
+    let total_rows = transcription_settings_content_rows(state, width).len();
+    let max_scroll = total_rows.saturating_sub(viewport_height);
+    (viewport_height, total_rows, max_scroll)
+}
+
+fn scroll_transcription_settings(state: &mut AppState, key_code: KeyCode) -> TypingKeyOutcome {
+    let (viewport_height, _total_rows, max_scroll) = transcription_settings_viewport(state);
+    let current = state.transcription_settings.scroll_offset.min(max_scroll);
+    let page = viewport_height.saturating_sub(1).max(1);
+    let next = match key_code {
+        KeyCode::Home => 0,
+        KeyCode::End => usize::MAX,
+        KeyCode::PageUp => current.saturating_sub(page),
+        KeyCode::PageDown => {
+            let next = current.saturating_add(page);
+            if next >= max_scroll {
+                usize::MAX
+            } else {
+                next
+            }
+        }
+        _ => return TypingKeyOutcome::Consumed,
+    };
+    if state.transcription_settings.scroll_offset == next {
+        TypingKeyOutcome::Consumed
+    } else {
+        state.transcription_settings.scroll_offset = next;
+        TypingKeyOutcome::Changed
+    }
+}
+
+fn reveal_transcription_setting_selection(state: &mut AppState) {
+    let (viewport_height, _total_rows, max_scroll) = transcription_settings_viewport(state);
+    if viewport_height == 0 {
+        return;
+    }
+
+    let selection = state.transcription_settings.selection;
+    let current = state.transcription_settings.scroll_offset.min(max_scroll);
+    state.transcription_settings.scroll_offset = if selection < current {
+        selection
+    } else if selection >= current.saturating_add(viewport_height) {
+        selection.saturating_add(1).saturating_sub(viewport_height)
+    } else {
+        current
+    };
 }
 
 fn change_transcription_setting(
@@ -5831,9 +7181,15 @@ fn cycle_transcription_sources(
 fn cycle_str_choice(current: &str, choices: &[&str], direction: TypingSettingDirection) -> String {
     let current_index = choices
         .iter()
-        .position(|choice| choice.eq_ignore_ascii_case(current.trim()))
-        .unwrap_or(0);
-    choices[cycle_index(current_index, choices.len(), direction)].to_string()
+        .position(|choice| choice.eq_ignore_ascii_case(current.trim()));
+    let next_index = current_index.map_or_else(
+        || match direction {
+            TypingSettingDirection::Previous => choices.len().saturating_sub(1),
+            TypingSettingDirection::Next => 0,
+        },
+        |index| cycle_index(index, choices.len(), direction),
+    );
+    choices[next_index].to_string()
 }
 
 fn cycle_usize_choice(
@@ -5941,7 +7297,12 @@ fn handle_typing_key(
                 input_source,
                 transparency_tx,
             ),
-            KeyCode::Enter | KeyCode::Char(' ') => TypingKeyOutcome::Consumed,
+            KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('A')
+                if state.typing.settings_load_error.is_some() =>
+            {
+                repair_enhanced_typing_settings(state)
+            }
+            KeyCode::Char(' ') => TypingKeyOutcome::Consumed,
             _ => TypingKeyOutcome::Consumed,
         };
     }
@@ -6028,6 +7389,25 @@ fn typing_settings_option_count() -> usize {
     6
 }
 
+fn repair_enhanced_typing_settings(state: &mut AppState) -> TypingKeyOutcome {
+    let settings = state.typing.persisted_settings();
+    match save_enhanced_typing_settings(&state.typing.settings_path, &settings) {
+        Ok(()) => {
+            state.typing.settings_load_error = None;
+            state.typing.settings_note = Some("Settings repaired".to_string());
+        }
+        Err(err) => {
+            let message = format!(
+                "Settings save failed: {}",
+                compact_error(&err.to_string(), 56)
+            );
+            state.typing.settings_note = Some(message.clone());
+            state.record_error(format!("Enhanced typing {message}"));
+        }
+    }
+    TypingKeyOutcome::Changed
+}
+
 fn change_typing_setting(
     state: &mut AppState,
     direction: TypingSettingDirection,
@@ -6104,11 +7484,16 @@ fn change_typing_setting(
 
     if before_values != after_values {
         let settings = state.typing.persisted_settings();
-        if let Err(err) = save_enhanced_typing_settings(&state.typing.settings_path, &settings) {
-            state.typing.settings_note = Some(format!(
-                "Settings save failed: {}",
-                compact_error(&err.to_string(), 56)
-            ));
+        match save_enhanced_typing_settings(&state.typing.settings_path, &settings) {
+            Ok(()) => state.typing.settings_load_error = None,
+            Err(err) => {
+                let message = format!(
+                    "Settings save failed: {}",
+                    compact_error(&err.to_string(), 56)
+                );
+                state.typing.settings_note = Some(message.clone());
+                state.record_error(format!("Enhanced typing {message}"));
+            }
         }
     }
 
@@ -6304,57 +7689,44 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
     let (width, height) = terminal::size()?;
     let usable_width = width.saturating_sub(1).max(1) as usize;
     let footer_row = height.saturating_sub(1);
-    let gap_width = if usable_width >= 64 { 4 } else { 2 }.min(usable_width.saturating_sub(2));
-    let columns_width = usable_width.saturating_sub(gap_width);
-    let left_width = if columns_width > 1 {
-        (columns_width * 45 / 100).clamp(1, columns_width - 1)
+    let body_height = height.saturating_sub(2) as usize;
+    let content_rows = transcription_settings_content_rows(state, usable_width);
+    let max_scroll = content_rows.len().saturating_sub(body_height);
+    let scroll_offset = state.transcription_settings.scroll_offset.min(max_scroll);
+    let visible_end = scroll_offset
+        .saturating_add(body_height)
+        .min(content_rows.len());
+    let title = if max_scroll > 0 && body_height > 0 {
+        format!(
+            "Transcription settings  |  rows {}-{} of {}",
+            scroll_offset + 1,
+            visible_end,
+            content_rows.len()
+        )
     } else {
-        columns_width
+        "Transcription settings".to_string()
     };
-    let right_width = columns_width.saturating_sub(left_width);
-    let (option_rows, detail_rows) = transcription_settings_columns(state, left_width, right_width);
-    let column_start = 1usize;
-    let column_height = option_rows.len().max(detail_rows.len());
-    let error_start = column_start + column_height + 2;
-    let error_rows = transcription_error_rows(
-        state,
-        usable_width,
-        (footer_row as usize).saturating_sub(error_start),
-    );
     let mut out = io::stdout();
 
     for row in 0..height {
         queue!(out, cursor::MoveTo(0, row))?;
         let row_index = row as usize;
         if row == footer_row {
-            let footer = if state.transcription_settings.confirm_close {
+            let footer = if max_scroll > 0 && state.transcription_settings.confirm_close {
+                "PgUp/PgDn scroll | End diagnostics | Enter/A apply | D discard | Esc returns"
+            } else if max_scroll > 0 {
+                "PgUp/PgDn scroll | End diagnostics | F9/Esc close | Up/Down select | Left/Right change"
+            } else if state.transcription_settings.confirm_close {
                 "Enter/A apply | D discard | Esc returns"
             } else {
-                "F9/Esc close | Up/Down select | Left/Right change | Ctrl+C exits"
+                "F9/Esc close | Up/Down select | Left/Right change"
             };
             render_segment(&mut out, footer, usable_width, Color::DarkGrey)?;
         } else if row_index == 0 {
-            render_segment(
-                &mut out,
-                "Transcription settings",
-                usable_width,
-                Color::White,
-            )?;
-        } else if (column_start..column_start + column_height).contains(&row_index) {
-            let index = row_index - column_start;
-            if let Some(line) = option_rows.get(index) {
-                render_styled_segment(&mut out, line, left_width)?;
-            } else {
-                render_segment(&mut out, "", left_width, Color::White)?;
-            }
-            render_gap(&mut out, gap_width)?;
-            if let Some(line) = detail_rows.get(index) {
-                render_styled_segment(&mut out, line, right_width)?;
-            } else {
-                render_segment(&mut out, "", right_width, Color::White)?;
-            }
-        } else if row_index >= error_start {
-            if let Some(line) = error_rows.get(row_index - error_start) {
+            render_segment(&mut out, &title, usable_width, Color::White)?;
+        } else if row < footer_row {
+            let content_index = scroll_offset.saturating_add(row_index - 1);
+            if let Some(line) = content_rows.get(content_index) {
                 render_styled_segment(&mut out, line, usable_width)?;
             } else {
                 render_segment(&mut out, "", usable_width, Color::White)?;
@@ -6365,6 +7737,92 @@ fn render_transcription_settings_mode(state: &AppState) -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+fn transcription_settings_content_rows(state: &AppState, width: usize) -> Vec<StyledLine> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+
+    if width >= 64 {
+        let gap_width = 4usize.min(width.saturating_sub(2));
+        let columns_width = width.saturating_sub(gap_width);
+        let left_width = if columns_width > 1 {
+            (columns_width * 45 / 100).clamp(1, columns_width - 1)
+        } else {
+            columns_width
+        };
+        let right_width = columns_width.saturating_sub(left_width);
+        let (option_rows, detail_rows) =
+            transcription_settings_columns(state, left_width, right_width);
+        let column_height = option_rows.len().max(detail_rows.len());
+        for index in 0..column_height {
+            rows.push(combine_styled_columns(
+                option_rows.get(index),
+                left_width,
+                gap_width,
+                detail_rows.get(index),
+                right_width,
+            ));
+        }
+    } else {
+        let (option_rows, detail_rows) = transcription_settings_columns(state, width, width);
+        rows.extend(option_rows);
+        rows.push(StyledLine::plain("", Color::White));
+        rows.extend(detail_rows);
+    }
+
+    rows.push(StyledLine::plain("", Color::White));
+    rows.push(StyledLine::plain("", Color::White));
+    rows.extend(transcription_diagnostic_rows(state, width));
+    rows
+}
+
+fn combine_styled_columns(
+    left: Option<&StyledLine>,
+    left_width: usize,
+    gap_width: usize,
+    right: Option<&StyledLine>,
+    right_width: usize,
+) -> StyledLine {
+    let mut segments = Vec::new();
+    append_fitted_styled_segments(&mut segments, left, left_width);
+    if gap_width > 0 {
+        segments.push(StyledSegment {
+            text: " ".repeat(gap_width),
+            color: Color::White,
+        });
+    }
+    append_fitted_styled_segments(&mut segments, right, right_width);
+    StyledLine { segments }
+}
+
+fn append_fitted_styled_segments(
+    output: &mut Vec<StyledSegment>,
+    line: Option<&StyledLine>,
+    width: usize,
+) {
+    let mut used = 0usize;
+    if let Some(line) = line {
+        for segment in &line.segments {
+            if used >= width {
+                break;
+            }
+            let text = fit_line_fragment(&segment.text, width - used);
+            used += text.chars().count();
+            if !text.is_empty() {
+                output.push(StyledSegment {
+                    text,
+                    color: segment.color,
+                });
+            }
+        }
+    }
+    if used < width {
+        output.push(StyledSegment {
+            text: " ".repeat(width - used),
+            color: Color::White,
+        });
+    }
 }
 
 fn transcription_settings_columns(
@@ -6422,10 +7880,7 @@ fn transcription_settings_columns(
     for (index, (label, value)) in option_rows.iter().enumerate() {
         let selected = index == settings.selection;
         option_lines.push(StyledLine::plain(
-            fit_line(
-                &format!("{} {label}: {value}", if selected { ">" } else { " " }),
-                option_width.max(1),
-            ),
+            transcription_setting_option_line(label, value, selected, option_width.max(1)),
             if selected { Color::Cyan } else { Color::White },
         ));
     }
@@ -6439,119 +7894,143 @@ fn transcription_settings_columns(
     }
     detail_rows.push(StyledLine::plain("", Color::White));
     detail_rows.push(StyledLine::plain("Choices", Color::Cyan));
-    for line in wrap_choice_list(
-        transcription_setting_choices(settings.selection),
-        detail_width.max(1),
-    ) {
+    let choices = transcription_setting_choices(state);
+    for line in wrap_choice_list(&choices, detail_width.max(1)) {
         detail_rows.push(StyledLine::plain(line, Color::DarkGrey));
     }
 
     if settings.has_restart_changes() {
         detail_rows.push(StyledLine::plain("", Color::White));
-        detail_rows.push(StyledLine::plain(
-            fit_line(
-                "Pending worker changes will restart capture after you apply them.",
-                detail_width.max(1),
-            ),
+        append_wrapped_rows(
+            &mut detail_rows,
+            "Pending worker changes will restart capture after you apply them.",
+            detail_width,
             Color::Yellow,
-        ));
+            false,
+        );
     }
     if let Some(note) = &settings.note {
-        detail_rows.push(StyledLine::plain(
-            fit_line(note, detail_width.max(1)),
-            Color::Yellow,
-        ));
+        append_wrapped_rows(&mut detail_rows, note, detail_width, Color::Yellow, false);
     }
     if settings.confirm_close {
-        detail_rows.push(StyledLine::plain(
-            fit_line("Apply these changes or discard them?", detail_width.max(1)),
+        append_wrapped_rows(
+            &mut detail_rows,
+            "Apply these changes or discard them?",
+            detail_width,
             Color::Yellow,
-        ));
+            false,
+        );
     }
 
     (option_lines, detail_rows)
 }
 
-fn transcription_error_rows(
-    state: &AppState,
+fn transcription_setting_option_line(
+    label: &str,
+    value: &str,
+    selected: bool,
     width: usize,
-    available_rows: usize,
-) -> Vec<StyledLine> {
-    if available_rows == 0 {
-        return Vec::new();
+) -> String {
+    let marker = if selected { ">" } else { " " };
+    let full = format!("{marker} {label}: {value}");
+    if full.chars().count() <= width {
+        return fit_line(&full, width);
     }
 
+    let suffix = format!(": {value}");
+    let fixed_width = 2usize.saturating_add(suffix.chars().count());
+    if fixed_width + 2 <= width {
+        let label_width = width - fixed_width;
+        let abbreviated = if label.chars().count() > label_width {
+            format!(
+                "{}…",
+                label
+                    .chars()
+                    .take(label_width.saturating_sub(1))
+                    .collect::<String>()
+            )
+        } else {
+            label.to_string()
+        };
+        fit_line(&format!("{marker} {abbreviated}{suffix}"), width)
+    } else {
+        fit_line(&format!("{marker} {value}"), width)
+    }
+}
+
+fn transcription_diagnostic_rows(state: &AppState, width: usize) -> Vec<StyledLine> {
     let mut rows = Vec::new();
     rows.push(StyledLine::plain("Agent status", Color::Cyan));
-    if rows.len() < available_rows {
-        rows.push(StyledLine::plain(
-            fit_line(
-                &format!(
-                    "  {}; {} requests",
-                    state.agent.status, state.agent.request_count
-                ),
-                width.max(1),
-            ),
-            if state.agent.enabled {
-                Color::DarkGrey
-            } else {
-                Color::Yellow
-            },
-        ));
+    append_wrapped_rows(
+        &mut rows,
+        &format!(
+            "{}; {} requests",
+            state.agent.status, state.agent.request_count
+        ),
+        width,
+        if state.agent.enabled {
+            Color::DarkGrey
+        } else {
+            Color::Yellow
+        },
+        true,
+    );
+
+    if let Some(load_error) = &state.transcription_settings.load_error {
+        rows.push(StyledLine::plain("Settings error", Color::Red));
+        append_wrapped_rows(&mut rows, load_error, width, Color::Red, true);
     }
 
     let monitor_unavailable = state
         .terminal_hwnd
         .and_then(terminal_window_visibility)
         .is_none();
-    if monitor_unavailable && state.transcription_settings.active.pause_agent_when_hidden {
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain("Warnings (1)", Color::Yellow));
-        }
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain(
-                fit_line(
-                    "  Terminal visibility unavailable; API requests are paused.",
-                    width.max(1),
-                ),
-                Color::Yellow,
-            ));
-        }
+    if monitor_unavailable {
+        rows.push(StyledLine::plain("Warnings (1)", Color::Yellow));
+        let warning = if state.transcription_settings.active.hidden_exit_minutes > 0 {
+            "Terminal visibility is unavailable. API requests are paused, and the hidden auto-exit timer is running until monitoring recovers."
+        } else {
+            "Terminal visibility is unavailable. API requests are paused until monitoring recovers."
+        };
+        append_wrapped_rows(&mut rows, warning, width, Color::Yellow, true);
     }
 
-    if rows.len() < available_rows {
-        rows.push(StyledLine::plain(
-            format!("Recent errors ({})", state.errors.len()),
-            if state.errors.is_empty() {
-                Color::DarkGrey
-            } else {
-                Color::Red
-            },
-        ));
-    }
-    if state.errors.is_empty() {
-        if rows.len() < available_rows {
-            rows.push(StyledLine::plain("  None.", Color::DarkGrey));
-        }
+    let error_heading = if state.discarded_error_count == 0 {
+        format!("Recent errors ({})", state.errors.len())
     } else {
-        for error in state.errors.iter().rev() {
-            if rows.len() >= available_rows {
-                break;
+        format!(
+            "Recent errors ({} stored; {} older discarded)",
+            state.errors.len(),
+            state.discarded_error_count
+        )
+    };
+    rows.push(StyledLine::plain(
+        error_heading,
+        if state.errors.is_empty() {
+            Color::DarkGrey
+        } else {
+            Color::Red
+        },
+    ));
+    if state.errors.is_empty() {
+        rows.push(StyledLine::plain("  None.", Color::DarkGrey));
+    } else {
+        for error in &state.errors {
+            for line in wrap_line(&format_error_entry(error), width.max(1)) {
+                rows.push(StyledLine::plain(line, Color::Red));
             }
-            rows.push(StyledLine::plain(
-                fit_line(&format_error_entry(error), width.max(1)),
-                Color::Red,
-            ));
         }
     }
     rows
 }
 
-fn transcription_setting_choices(selection: usize) -> &'static [&'static str] {
-    match selection {
-        0 => &["5s", "10s", "15s", "...", "180s (5-second steps)"],
-        1 => &["Microphone + system output", "Microphone", "System output"],
-        2 => &[
+fn transcription_setting_choices(state: &AppState) -> Vec<String> {
+    let settings = &state.transcription_settings;
+    let pending = &settings.pending;
+    let values: Vec<&str> = match settings.selection {
+        0 => vec!["Range: 5s-180s", "Left/Right adjusts by 5s"],
+        1 => vec!["Microphone + system output", "Microphone", "System output"],
+        2 => vec![
             "Auto",
             "English (en)",
             "Spanish (es)",
@@ -6559,8 +8038,9 @@ fn transcription_setting_choices(selection: usize) -> &'static [&'static str] {
             "French (fr)",
             "German (de)",
             "Italian (it)",
+            "Other language codes from saved settings or CLI",
         ],
-        3 => &[
+        3 => vec![
             "tiny",
             "base",
             "small",
@@ -6570,11 +8050,16 @@ fn transcription_setting_choices(selection: usize) -> &'static [&'static str] {
             "small.en",
             "medium.en",
         ],
-        4 => &["6s", "8s", "10s", "12s", "15s", "20s", "30s"],
-        5 | 8 => &["On", "Off"],
-        6 => &["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"],
-        7 => &["Silhouette", "Natural Answer"],
-        9 => &[
+        4 => vec!["6s", "8s", "10s", "12s", "15s", "20s", "30s"],
+        5 | 8 => vec!["On", "Off"],
+        6 => vec![
+            "gpt-5.4-nano",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "Other non-empty model IDs from saved settings or CLI",
+        ],
+        7 => vec!["Silhouette", "Natural Answer"],
+        9 => vec![
             "Off",
             "After 5s",
             "After 10s",
@@ -6582,15 +8067,33 @@ fn transcription_setting_choices(selection: usize) -> &'static [&'static str] {
             "After 30s",
             "After 60s",
         ],
-        10 => &["Off", "5m", "10m", "15m", "30m", "60m"],
-        11 => &["Off", "15m", "30m", "60m", "120m", "240m"],
-        12 => &["Off", "60m", "120m", "240m", "480m", "720m"],
-        13 => &["Off", "25k", "50k", "100k", "250k", "500k"],
-        _ => &[],
+        10 => vec!["Off", "5m", "10m", "15m", "30m", "60m"],
+        11 => vec!["Off", "15m", "30m", "60m", "120m", "240m"],
+        12 => vec!["Off", "60m", "120m", "240m", "480m", "720m"],
+        13 => vec!["Off", "25k", "50k", "100k", "250k", "500k"],
+        _ => Vec::new(),
+    };
+    let mut choices = values.into_iter().map(str::to_string).collect::<Vec<_>>();
+
+    if settings.selection == 2 {
+        let current = pending.language.as_deref().unwrap_or("auto");
+        if !TRANSCRIPTION_LANGUAGE_CHOICES
+            .iter()
+            .any(|choice| choice.eq_ignore_ascii_case(current))
+        {
+            choices.insert(0, format!("Current custom value: {current}"));
+        }
+    } else if settings.selection == 6
+        && !TYPING_REFINER_MODELS
+            .iter()
+            .any(|choice| choice.eq_ignore_ascii_case(&pending.agent_model))
+    {
+        choices.insert(0, format!("Current custom value: {}", pending.agent_model));
     }
+    choices
 }
 
-fn wrap_choice_list(choices: &[&str], width: usize) -> Vec<String> {
+fn wrap_choice_list(choices: &[String], width: usize) -> Vec<String> {
     let width = width.max(1);
     let prefix = "  ";
     let separator = "  •  ";
@@ -6612,6 +8115,29 @@ fn wrap_choice_list(choices: &[&str], width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+        .into_iter()
+        .flat_map(|line| wrap_line(&line, width))
+        .collect()
+}
+
+fn append_wrapped_rows(
+    rows: &mut Vec<StyledLine>,
+    text: &str,
+    width: usize,
+    color: Color,
+    indent: bool,
+) {
+    let width = width.max(1);
+    for paragraph in text.lines() {
+        let paragraph = if indent {
+            format!("  {}", paragraph.trim())
+        } else {
+            paragraph.trim().to_string()
+        };
+        for line in wrap_line(&paragraph, width) {
+            rows.push(StyledLine::plain(line, color));
+        }
+    }
 }
 
 fn format_error_entry(error: &AppErrorEntry) -> String {
@@ -6852,6 +8378,17 @@ fn typing_settings_layout(state: &AppState, max_content_width: usize) -> TypingL
         max_content_width.max(1),
     ) {
         lines.push(StyledLine::plain(line, Color::DarkGrey));
+    }
+    if let Some(error) = &state.typing.settings_load_error {
+        lines.push(StyledLine::plain("", Color::White));
+        lines.push(StyledLine::plain("Settings error", Color::Red));
+        for line in wrap_plain_text(error, max_content_width.max(1)) {
+            lines.push(StyledLine::plain(line, Color::Red));
+        }
+        lines.push(StyledLine::plain(
+            "Press Enter or A to apply the safe values without another change.",
+            Color::Yellow,
+        ));
     }
     if let Some(note) = &state.typing.settings_note {
         lines.push(StyledLine::plain(
@@ -7844,8 +9381,11 @@ fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn fit_line(line: &str, width: usize) -> String {
-    if line.chars().count() >= width {
-        return line.chars().take(width.saturating_sub(1)).collect();
+    if width == 0 {
+        return String::new();
+    }
+    if line.chars().count() > width {
+        return line.chars().take(width).collect();
     }
 
     format!("{line:<width$}")
@@ -7862,18 +9402,19 @@ fn fit_line_fragment(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_input_has_informative_delta, agent_input_signature, align_transcript_words,
-        build_response_schema, extract_agent_config_block, extract_agent_usage,
+        agent_input_has_informative_delta, agent_input_signature, agent_result_matches_fields,
+        agent_retry_delay, align_transcript_words, build_agent_request_body, build_response_schema,
+        canonical_agent_result, extract_agent_config_block, extract_agent_usage,
         extract_response_text, fade_intensity, format_byte_size, is_informative_text,
         merge_transcript_estimate, min_typing_status_width, new_text_since, parse_agent_config,
-        serialized_json_bytes, styled_line_width, typable_key_for_char, typing_desired_width,
-        typing_display_text, typing_layout, typing_safe_row_width, typing_submission_text,
-        typing_window_width, wrap_plain_text, AgentConfig, AgentInput, AgentUsage, AppConfig,
-        AppMode, EnhancedTypingSettings, SourceKind, StreamingSourceState, TranscriptState,
-        TranscriptWord, TypingConfig, TypingFlushMode, TypingTransparencyBackground,
-        DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE, TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS,
-        TYPING_MAX_CONTENT_WIDTH, TYPING_REFINER_MODELS, TYPING_RIGHT_GUTTER_COLS,
-        TYPING_SPEED_PRESETS, TYPING_TRANSPARENCY_PRESETS,
+        serialized_json_bytes, source_updates_agent, styled_line_width, typable_key_for_char,
+        typing_desired_width, typing_display_text, typing_layout, typing_safe_row_width,
+        typing_submission_text, typing_window_width, wrap_plain_text, AgentConfig, AgentInput,
+        AgentUsage, AppConfig, AppMode, EnhancedTypingSettings, SourceKind, StreamingSourceState,
+        TranscriptState, TranscriptWord, TypingConfig, TypingFlushMode,
+        TypingTransparencyBackground, DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE, TEXT_MIN_INTENSITY,
+        TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH, TYPING_REFINER_MODELS,
+        TYPING_RIGHT_GUTTER_COLS, TYPING_SPEED_PRESETS, TYPING_TRANSPARENCY_PRESETS,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -7886,6 +9427,9 @@ mod tests {
             temp_dir: PathBuf::from("."),
             terminal_hwnd: None,
             transcription_settings_path: PathBuf::new(),
+            transcription_settings_load_error: None,
+            restart_state_path: None,
+            restart_state: None,
             transcription_settings: super::EnchantedTranscriptionSettings::default(),
             sources: vec![SourceKind::Microphone],
             chunk_seconds: TYPING_CHUNK_SECONDS,
@@ -7902,6 +9446,7 @@ mod tests {
                 terminal_hwnd: None,
                 transparency_tool: PathBuf::new(),
                 settings_path: PathBuf::new(),
+                settings_load_error: None,
                 transparency_index: 0,
                 typing_speed_index: 1,
                 apply_saved_transparency: false,
@@ -7909,7 +9454,7 @@ mod tests {
                 flush_mode: TypingFlushMode::Clipboard,
             }),
         };
-        let mut state = super::AppState::new(&config);
+        let mut state = super::AppState::new(&config).expect("test AppState should initialize");
         state.typing.last_typed_text = text.to_string();
         state
     }
@@ -8430,6 +9975,7 @@ After.
             system_transcript: "What is the deadline?".to_string(),
             microphone_transcript: Some("I can answer that.".to_string()),
             force: false,
+            generation: 0,
         });
 
         assert!(signature.contains("system:What is the deadline?"));
@@ -8486,11 +10032,13 @@ After.
             system_transcript: "We should decide soon.".to_string(),
             microphone_transcript: None,
             force: false,
+            generation: 0,
         };
         let current = AgentInput {
             system_transcript: "We should decide soon...".to_string(),
             microphone_transcript: None,
             force: false,
+            generation: 0,
         };
 
         assert!(!agent_input_has_informative_delta(
@@ -8507,11 +10055,13 @@ After.
             system_transcript: "Can we discuss the launch?".to_string(),
             microphone_transcript: Some("Yes.".to_string()),
             force: false,
+            generation: 0,
         };
         let current = AgentInput {
             system_transcript: "Can we discuss the launch?".to_string(),
             microphone_transcript: Some("Yes. The launch is on track.".to_string()),
             force: false,
+            generation: 0,
         };
 
         assert!(!agent_input_has_informative_delta(
@@ -8528,11 +10078,13 @@ After.
             system_transcript: "When is the launch?".to_string(),
             microphone_transcript: Some("Let me check.".to_string()),
             force: false,
+            generation: 0,
         };
         let current = AgentInput {
             system_transcript: "When is the launch?".to_string(),
             microphone_transcript: Some("Let me check. It is planned for Friday.".to_string()),
             force: false,
+            generation: 0,
         };
         let state = json!({
             "critical_hints": "Answer with the date.",
@@ -8546,5 +10098,122 @@ After.
             &state,
             Some("unanswered_questions")
         ));
+    }
+
+    #[test]
+    fn microphone_snapshots_publish_only_when_context_sharing_is_enabled() {
+        assert!(source_updates_agent(SourceKind::SystemOutput, false));
+        assert!(!source_updates_agent(SourceKind::Microphone, false));
+        assert!(source_updates_agent(SourceKind::Microphone, true));
+    }
+
+    #[test]
+    fn agent_retry_backoff_is_bounded() {
+        assert_eq!(agent_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(agent_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(agent_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(agent_retry_delay(20), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn empty_agent_state_is_valid_and_preserved_fields_use_canonical_state() {
+        let parsed = parse_agent_config(
+            r##"
+{
+  "fields": [
+    {
+      "key": "answer_guidance",
+      "title": "Answer",
+      "render": "text",
+      "empty": "none",
+      "title_color": "#FFFFFF",
+      "value_color": "#FFFFFF",
+      "preserve_on_empty": true,
+      "schema": { "type": "string" }
+    }
+  ]
+}
+"##,
+        )
+        .expect("agent config should parse");
+        let empty = json!({ "answer_guidance": "" });
+        assert!(agent_result_matches_fields(&empty, &parsed.fields));
+
+        let current = json!({ "answer_guidance": "A useful answer." });
+        let canonical = canonical_agent_result(&parsed.fields, &current, empty);
+        assert_eq!(canonical["answer_guidance"], "A useful answer.");
+    }
+
+    #[test]
+    fn transcription_requests_disable_response_storage() {
+        let config = AgentConfig::disabled(DEFAULT_AGENT_MODEL);
+        let input = AgentInput {
+            system_transcript: "What is the deadline?".to_string(),
+            microphone_transcript: None,
+            force: false,
+            generation: 0,
+        };
+        let body = build_agent_request_body(&config, &input, None, &json!({}));
+
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn stale_agent_output_counts_usage_without_repopulating_fields() {
+        let parsed = parse_agent_config(
+            r##"
+{
+  "fields": [
+    {
+      "key": "answer_guidance",
+      "title": "Answer",
+      "render": "text",
+      "title_color": "#FFFFFF",
+      "value_color": "#FFFFFF",
+      "schema": { "type": "string" }
+    }
+  ]
+}
+"##,
+        )
+        .expect("agent config should parse");
+        let mut state = test_typing_state("");
+        state.agent.fields = super::default_agent_fields(&parsed.fields);
+        state.agent_generation = 1;
+
+        assert!(state.apply(super::UiEvent::AgentOutput {
+            result: json!({ "answer_guidance": "stale" }),
+            successful_input: AgentInput {
+                system_transcript: "stale context".to_string(),
+                microphone_transcript: None,
+                force: false,
+                generation: 0,
+            },
+            usage: Some(AgentUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+            }),
+            force_hints: true,
+            elapsed_ms: 100,
+            generation: 0,
+        }));
+        assert!(state.agent.fields[0].lines.is_empty());
+        assert_eq!(state.agent.total_tokens, 15);
+    }
+
+    #[test]
+    fn stale_whisper_transcript_does_not_repopulate_after_refresh() {
+        let mut state = test_typing_state("");
+        state.agent_generation = 1;
+
+        assert!(!state.apply(super::UiEvent::Transcript {
+            source: SourceKind::SystemOutput,
+            text: "stale context".to_string(),
+            elapsed_ms: 100,
+            rms: 0.1,
+            generation: 0,
+        }));
+        assert!(state.transcripts.is_empty());
     }
 }
