@@ -6247,7 +6247,7 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         4 => "Controls the rolling audio context sent to local Whisper. Longer windows preserve context but increase inference work and latency; changing it restarts.",
         5 => "Enables the remote insight pane. Local capture and Whisper continue when this is off; applying the change restarts agent wiring.",
         6 => "Selects the OpenAI model used for insight updates. Model choice affects latency, quality, and API cost; changing it restarts agent wiring.",
-        7 => "Silhouette returns a content-free answer frame with blanks for your own knowledge. Natural Answer returns a concise, directly usable answer. Changing modes restarts agent wiring.",
+        7 => "Silhouette returns a content-free answer frame with blanks for your own knowledge. Natural Answer returns a concise, directly usable answer. Changing modes uses the normal automatic application restart.",
         8 => "Allows microphone transcript text to be included in API context. Off keeps local speech out of remote requests; changing it restarts agent wiring.",
         9 => "Stops only new API requests while this terminal is hidden, minimized, cloaked, or invalid. Audio capture, Whisper, and context buffering continue locally.",
         10 => "Closes the application after it remains hidden for this long. Off disables this shutdown rule; API pausing can still happen immediately.",
