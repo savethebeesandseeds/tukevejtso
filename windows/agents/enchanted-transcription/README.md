@@ -40,6 +40,8 @@ The terminal maintains rolling Whisper hypotheses instead of treating each audio
 
 Automatic Agent Insights updates wait for about 1.2 seconds of silence after new text in an Agent-shared audio source instead of issuing requests continuously while speech is active. Updates are consolidated, rate-limited, and based on the newest context; F1 can request an update manually. Agent Insights requires system-output capture, an enabled agent, and a stored API key.
 
+Both Silhouette and Natural Answer modes also show a bounded list of the main risks supported by the current conversation or selected reference context.
+
 The Responses API requests use `store: false`. System-output transcript text is included when Agent Insights runs. Microphone transcript text remains local unless **Mic context** is enabled in F9.
 
 ### Spanish transcription
