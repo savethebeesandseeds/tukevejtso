@@ -89,6 +89,7 @@ const TEXT_MIN_INTENSITY: f32 = 0.60;
 const FADE_RENDER_INTERVAL: Duration = Duration::from_secs(2);
 const ERROR_BUFFER_CAPACITY: usize = 6;
 const DEFAULT_AGENT_MODEL: &str = "gpt-5.6-terra";
+const GPT54_MINI_MIGRATION_NOTICE: &str = "Model migration and cost notice: saved gpt-5.4-mini was migrated to gpt-5.6-terra. Terra currently has a higher per-token price than the saved Mini tier. Review and apply the model choice in F9.";
 const TRANSCRIPTION_RESTART_EXIT_CODE: i32 = 75;
 const TRANSCRIPTION_RESTART_STATE_VERSION: u32 = 2;
 const AGENT_INSTRUCTIONS_FILE: &str = "agent-instructions.md";
@@ -432,6 +433,7 @@ struct AppConfig {
     terminal_hwnd: Option<isize>,
     transcription_settings_path: PathBuf,
     transcription_settings_load_error: Option<String>,
+    transcription_settings_migration_notice: Option<String>,
     restart_state_path: Option<PathBuf>,
     restart_state: Option<TranscriptionRestartState>,
     transcription_settings: EnchantedTranscriptionSettings,
@@ -474,7 +476,8 @@ struct AgentConfig {
     response_schema: Value,
     max_output_tokens: u64,
     fields: Vec<AgentFieldConfig>,
-    microphone_delta_gate_field: Option<String>,
+    microphone_delta_gate_fields: Vec<String>,
+    microphone_delta_bootstrap_fields: Vec<String>,
     initial_result: Value,
     initial_input: Option<AgentInput>,
 }
@@ -494,7 +497,8 @@ impl AgentConfig {
             response_schema: json!({}),
             max_output_tokens: 220,
             fields: Vec::new(),
-            microphone_delta_gate_field: None,
+            microphone_delta_gate_fields: Vec::new(),
+            microphone_delta_bootstrap_fields: Vec::new(),
             initial_result: json!({}),
             initial_input: None,
         }
@@ -524,6 +528,7 @@ struct TypingConfig {
     terminal_hwnd: Option<isize>,
     settings_path: PathBuf,
     settings_load_error: Option<String>,
+    settings_migration_notice: Option<String>,
     transparency_index: usize,
     typing_speed_index: usize,
     apply_saved_transparency: bool,
@@ -979,6 +984,11 @@ enum AgentFieldRender {
 #[serde(deny_unknown_fields)]
 struct RawAgentInstructionsConfig {
     max_output_tokens: Option<u64>,
+    #[serde(default)]
+    microphone_delta_gate_fields: Vec<String>,
+    #[serde(default)]
+    microphone_delta_bootstrap_fields: Vec<String>,
+    // Retain the original singular key for existing instruction files.
     microphone_delta_gate_field: Option<String>,
     fields: Vec<RawAgentFieldConfig>,
 }
@@ -1331,7 +1341,14 @@ fn flush_due_streams(
     }
 
     if agent_update_needed {
-        send_agent_update(agent_tx, streams, include_microphone, false, generation);
+        send_agent_update(
+            agent_tx,
+            streams,
+            include_microphone,
+            false,
+            false,
+            generation,
+        );
     }
     for raw_text in typing_updates {
         send_typing_update(typing_tx, raw_text, generation);
@@ -1478,6 +1495,7 @@ struct TranscriptionSettingsState {
     scroll_offset: usize,
     note: Option<String>,
     load_error: Option<String>,
+    migration_notice: Option<String>,
     confirm_close: bool,
     active: TranscriptionRestartSettings,
     pending: TranscriptionRestartSettings,
@@ -1520,6 +1538,7 @@ struct TypingPaneState {
     transparency_generation: u64,
     settings_note: Option<String>,
     settings_load_error: Option<String>,
+    settings_migration_notice: Option<String>,
     intelligence_available: bool,
     intelligence_enabled: bool,
     flush_mode: TypingFlushMode,
@@ -1665,6 +1684,8 @@ impl AppState {
                 transparency_generation: 0,
                 settings_note: None,
                 settings_load_error: typing.and_then(|config| config.settings_load_error.clone()),
+                settings_migration_notice: typing
+                    .and_then(|config| config.settings_migration_notice.clone()),
                 intelligence_available: typing.is_some_and(|config| config.api_key.is_some()),
                 intelligence_enabled: typing.is_some_and(|config| config.intelligence_enabled),
                 flush_mode: typing
@@ -1817,36 +1838,34 @@ impl AppState {
             .iter()
             .map(|field| field.config.clone())
             .collect::<Vec<_>>();
-        // A forced refresh means the Agent contract changed (for example, its
-        // answer mode or reference context). Keep the transcript, but do not
-        // seed the new worker with an answer or delta baseline produced under
-        // the previous contract.
-        if !saved.force_agent_update {
-            if agent_result_matches_fields(&context.agent_result, &agent_field_configs) {
-                self.agent.canonical_result = context.agent_result.clone();
-                if value_has_content(&context.agent_result) {
-                    let _ = self.agent.apply_result(context.agent_result.clone(), true);
-                }
-            }
-            self.agent.last_successful_input =
-                context
-                    .agent_last_successful_input
-                    .clone()
-                    .map(|mut input| {
-                        input.force = false;
-                        input.generation = self.agent_generation;
-                        if !self.transcription_settings.active.include_microphone
-                            || !self
-                                .transcription_settings
-                                .active
-                                .sources
-                                .contains(&SourceKind::Microphone)
-                        {
-                            input.microphone_transcript = None;
-                        }
-                        input
-                    });
+        // `force_agent_update` only schedules an immediate request. The saved
+        // snapshot has already been scrubbed for privacy-sensitive changes, so
+        // compatible state remains useful while that request is in flight.
+        let (restored_result, schema_changed) =
+            migrate_agent_result(&agent_field_configs, &context.agent_result);
+        self.agent.canonical_result = restored_result.clone();
+        if value_has_content(&restored_result) {
+            let _ = self.agent.apply_result(restored_result, true);
         }
+        let restored_input = if schema_changed {
+            None
+        } else {
+            context.agent_last_successful_input.clone()
+        };
+        self.agent.last_successful_input = restored_input.map(|mut input| {
+            input.force = false;
+            input.generation = self.agent_generation;
+            if !self.transcription_settings.active.include_microphone
+                || !self
+                    .transcription_settings
+                    .active
+                    .sources
+                    .contains(&SourceKind::Microphone)
+            {
+                input.microphone_transcript = None;
+            }
+            input
+        });
 
         let skipped = context.errors.len().saturating_sub(ERROR_BUFFER_CAPACITY);
         let skipped_repeats = context
@@ -2329,6 +2348,7 @@ impl TranscriptionSettingsState {
             scroll_offset: 0,
             note: None,
             load_error: config.transcription_settings_load_error.clone(),
+            migration_notice: config.transcription_settings_migration_notice.clone(),
             confirm_close: false,
             active: values.clone(),
             pending: values.clone(),
@@ -2382,6 +2402,7 @@ impl TranscriptionSettingsState {
 
     fn request_close(&mut self, fade_duration: Duration) {
         if self.load_error.is_some()
+            || self.migration_notice.is_some()
             || self.pending != self.snapshot
             || fade_duration != self.fade_snapshot
         {
@@ -3017,6 +3038,61 @@ fn default_agent_result(fields: &[AgentFieldConfig]) -> Value {
     Value::Object(out)
 }
 
+fn migrate_agent_result(fields: &[AgentFieldConfig], saved: &Value) -> (Value, bool) {
+    if agent_result_matches_fields(saved, fields) {
+        return (saved.clone(), false);
+    }
+
+    let mut migrated = default_agent_result(fields);
+    let Some(saved_object) = saved.as_object() else {
+        return (migrated, true);
+    };
+    let Some(migrated_object) = migrated.as_object_mut() else {
+        return (migrated, true);
+    };
+
+    for field in fields {
+        let Some(value) = saved_object
+            .get(&field.key)
+            .filter(|value| agent_value_matches_field(value, field))
+        else {
+            continue;
+        };
+        migrated_object.insert(field.key.clone(), value.clone());
+    }
+    (migrated, true)
+}
+
+fn prepare_agent_restart_state(
+    result: &mut Value,
+    last_successful_input: &mut Option<AgentInput>,
+    fields: &[AgentFieldConfig],
+    answer_mode_changed: bool,
+    reference_context_changed: bool,
+    microphone_sharing_disabled: bool,
+) {
+    if reference_context_changed || microphone_sharing_disabled {
+        *result = default_agent_result(fields);
+        *last_successful_input = None;
+    }
+
+    if answer_mode_changed {
+        if let Some(result) = result.as_object_mut() {
+            result.insert("answer_guidance".to_string(), Value::String(String::new()));
+        }
+        *last_successful_input = None;
+    }
+}
+
+fn agent_value_matches_field(value: &Value, field: &AgentFieldConfig) -> bool {
+    match field.render {
+        AgentFieldRender::Text => value.is_string(),
+        AgentFieldRender::List => value
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string)),
+    }
+}
+
 fn agent_result_matches_fields(result: &Value, fields: &[AgentFieldConfig]) -> bool {
     let Some(object) = result.as_object() else {
         return false;
@@ -3025,12 +3101,10 @@ fn agent_result_matches_fields(result: &Value, fields: &[AgentFieldConfig]) -> b
         return false;
     }
 
-    fields.iter().all(|field| match field.render {
-        AgentFieldRender::Text => object.get(&field.key).is_some_and(Value::is_string),
-        AgentFieldRender::List => object
+    fields.iter().all(|field| {
+        object
             .get(&field.key)
-            .and_then(Value::as_array)
-            .is_some_and(|items| items.iter().all(Value::is_string)),
+            .is_some_and(|value| agent_value_matches_field(value, field))
     })
 }
 
@@ -3673,13 +3747,35 @@ fn transcription_settings_path() -> PathBuf {
         .join(TRANSCRIPTION_SETTINGS_FILE)
 }
 
+fn saved_model_migration_notice(model: &str) -> Option<String> {
+    model
+        .trim()
+        .eq_ignore_ascii_case("gpt-5.4-mini")
+        .then(|| GPT54_MINI_MIGRATION_NOTICE.to_string())
+}
+
+fn migration_notice_for_active_saved_model(
+    notice: Option<String>,
+    explicit_model_provided: bool,
+) -> Option<String> {
+    if explicit_model_provided {
+        None
+    } else {
+        notice
+    }
+}
+
 fn load_enchanted_transcription_settings(
     path: &PathBuf,
-) -> (EnchantedTranscriptionSettings, Option<String>) {
+) -> (
+    EnchantedTranscriptionSettings,
+    Option<String>,
+    Option<String>,
+) {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return (EnchantedTranscriptionSettings::default(), None);
+            return (EnchantedTranscriptionSettings::default(), None, None);
         }
         Err(err) => {
             return (
@@ -3687,12 +3783,14 @@ fn load_enchanted_transcription_settings(
                 Some(format!(
                     "Could not read saved transcription settings: {err}. Defaults are active for this session; the original file will be preserved unless you explicitly apply settings."
                 )),
+                None,
             );
         }
     };
 
     match serde_json::from_str::<EnchantedTranscriptionSettings>(&text) {
         Ok(settings) => {
+            let migration_notice = saved_model_migration_notice(&settings.agent_model);
             let mut comparable = settings.clone();
             comparable.sources = normalize_transcription_sources(&comparable.sources);
             if let Some(model) = normalize_whisper_model_name(&comparable.model) {
@@ -3707,7 +3805,7 @@ fn load_enchanted_transcription_settings(
                 "Some saved transcription settings were adjusted to supported values. Review them before applying; the original file has not been changed."
                     .to_string()
             });
-            (normalized, load_error)
+            (normalized, load_error, migration_notice)
         }
         Err(err) => (
             EnchantedTranscriptionSettings::default(),
@@ -3717,6 +3815,7 @@ fn load_enchanted_transcription_settings(
                 err.column(),
                 err
             )),
+            None,
         ),
     }
 }
@@ -3870,11 +3969,13 @@ fn save_transcription_restart_state(path: &Path, state: &TranscriptionRestartSta
         .with_context(|| format!("failed to save restart state {}", path.display()))
 }
 
-fn load_enhanced_typing_settings(path: &Path) -> (EnhancedTypingSettings, Option<String>) {
+fn load_enhanced_typing_settings(
+    path: &Path,
+) -> (EnhancedTypingSettings, Option<String>, Option<String>) {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return (EnhancedTypingSettings::default(), None);
+            return (EnhancedTypingSettings::default(), None, None);
         }
         Err(err) => {
             let mut settings = EnhancedTypingSettings::default();
@@ -3884,14 +3985,16 @@ fn load_enhanced_typing_settings(path: &Path) -> (EnhancedTypingSettings, Option
                 Some(format!(
                     "Could not read saved enhanced-typing settings: {err}. Intelligence is disabled; the original file is preserved until you apply or change a setting."
                 )),
+                None,
             );
         }
     };
 
     match serde_json::from_str::<EnhancedTypingSettings>(&text) {
         Ok(mut settings) => {
+            let migration_notice = saved_model_migration_notice(&settings.refiner_model);
             settings.refiner_model = normalize_openai_model_id(&settings.refiner_model);
-            (settings, None)
+            (settings, None, migration_notice)
         }
         Err(err) => {
             let mut settings = EnhancedTypingSettings::default();
@@ -3904,6 +4007,7 @@ fn load_enhanced_typing_settings(path: &Path) -> (EnhancedTypingSettings, Option
                     err.column(),
                     err
                 )),
+                None,
             )
         }
     }
@@ -3937,6 +4041,15 @@ fn saved_typing_refiner_model(settings: &EnhancedTypingSettings, fallback: &str)
     normalize_openai_model_id(if model.is_empty() { fallback } else { model })
 }
 
+fn explicit_openai_model_id(model: &str) -> Result<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        Err(anyhow!("--agent-model requires a non-empty model name"))
+    } else {
+        Ok(model.to_string())
+    }
+}
+
 fn terminal_transparency_tool_path(agent_root: &Path) -> PathBuf {
     agent_root
         .parent()
@@ -3963,14 +4076,21 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
     }
 
     let restart_state_path = args.restart_state_path.clone();
-    let restart_state = restart_state_path
+    let mut restart_state = restart_state_path
         .as_deref()
         .map(load_transcription_restart_state)
         .transpose()?
         .flatten();
 
-    let (mut settings, mut transcription_settings_load_error) =
-        load_enchanted_transcription_settings(&transcription_settings_path);
+    let (
+        mut settings,
+        mut transcription_settings_load_error,
+        saved_transcription_settings_migration_notice,
+    ) = load_enchanted_transcription_settings(&transcription_settings_path);
+    let transcription_settings_migration_notice = migration_notice_for_active_saved_model(
+        saved_transcription_settings_migration_notice,
+        args.agent_model_provided,
+    );
     if let Some(message) = transcription_settings_load_error.as_mut() {
         // An unreadable settings document must never silently re-enable remote requests.
         settings.agent_enabled = false;
@@ -3991,13 +4111,13 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
     if args.fade_seconds_provided {
         settings.fade_seconds = args.fade_seconds;
     }
-    if args.agent_model_provided {
-        settings.agent_model = args.agent_model.clone();
-    }
     if args.agent_disabled {
         settings.agent_enabled = false;
     }
     settings = settings.normalized();
+    if args.agent_model_provided {
+        settings.agent_model = explicit_openai_model_id(&args.agent_model)?;
+    }
     if settings.model != loaded_model {
         return Err(anyhow!(
             "Whisper model {loaded_model} is English-only and cannot be used with language {}; use {} instead",
@@ -4008,26 +4128,28 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
 
     let sources = settings.sources.clone();
     let mut agent = build_transcription_agent_config(&settings, &sources, &agent_root)?;
-    if let Some(restored_context) = restart_state
-        .as_ref()
-        .filter(|state| !state.force_agent_update)
-        .and_then(|state| state.context.as_ref())
-    {
-        if agent_result_matches_fields(&restored_context.agent_result, &agent.fields) {
-            agent.initial_result = restored_context.agent_result.clone();
+    if let Some(restored_state) = restart_state.as_mut() {
+        if let Some(restored_context) = restored_state.context.as_ref() {
+            let (restored_result, schema_changed) =
+                migrate_agent_result(&agent.fields, &restored_context.agent_result);
+            agent.initial_result = restored_result;
+            restored_state.force_agent_update |= schema_changed;
+            agent.initial_input = if schema_changed {
+                None
+            } else {
+                restored_context
+                    .agent_last_successful_input
+                    .clone()
+                    .map(|mut input| {
+                        input.force = false;
+                        input.generation = 0;
+                        if !agent.include_microphone {
+                            input.microphone_transcript = None;
+                        }
+                        input
+                    })
+            };
         }
-        agent.initial_input =
-            restored_context
-                .agent_last_successful_input
-                .clone()
-                .map(|mut input| {
-                    input.force = false;
-                    input.generation = 0;
-                    if !agent.include_microphone {
-                        input.microphone_transcript = None;
-                    }
-                    input
-                });
     }
     let terminal_hwnd = args
         .terminal_window_handle
@@ -4041,6 +4163,7 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
         terminal_hwnd,
         transcription_settings_path,
         transcription_settings_load_error,
+        transcription_settings_migration_notice,
         restart_state_path,
         restart_state,
         transcription_settings: settings.clone(),
@@ -4070,9 +4193,18 @@ fn build_enhanced_typing_config(
         .or_else(current_terminal_window_handle);
     let instructions = load_typing_instructions(agent_root)?;
     let settings_path = enhanced_typing_settings_path();
-    let (settings, settings_load_error) = load_enhanced_typing_settings(&settings_path);
+    let (settings, settings_load_error, saved_settings_migration_notice) =
+        load_enhanced_typing_settings(&settings_path);
+    let settings_migration_notice = migration_notice_for_active_saved_model(
+        saved_settings_migration_notice,
+        args.agent_model_provided,
+    );
     let settings_were_saved = settings_path.is_file() && settings_load_error.is_none();
-    let refiner_model = saved_typing_refiner_model(&settings, &args.agent_model);
+    let refiner_model = if args.agent_model_provided {
+        explicit_openai_model_id(&args.agent_model)?
+    } else {
+        saved_typing_refiner_model(&settings, DEFAULT_AGENT_MODEL)
+    };
     let transparency_index =
         typing_transparency_preset_index(&settings.transparency_label).unwrap_or(0);
     let typing_speed_index = typing_speed_preset_index(&settings.typing_speed_label).unwrap_or(1);
@@ -4086,6 +4218,7 @@ fn build_enhanced_typing_config(
         terminal_hwnd,
         transcription_settings_path,
         transcription_settings_load_error: None,
+        transcription_settings_migration_notice: None,
         restart_state_path: None,
         restart_state: None,
         transcription_settings: EnchantedTranscriptionSettings::default(),
@@ -4109,6 +4242,7 @@ fn build_enhanced_typing_config(
             terminal_hwnd,
             settings_path,
             settings_load_error,
+            settings_migration_notice,
             transparency_index,
             typing_speed_index,
             apply_saved_transparency: settings_were_saved,
@@ -4185,7 +4319,8 @@ fn build_transcription_agent_config(
         response_schema: agent_context.response_schema,
         max_output_tokens: agent_context.max_output_tokens,
         fields: agent_context.fields,
-        microphone_delta_gate_field: agent_context.microphone_delta_gate_field,
+        microphone_delta_gate_fields: agent_context.microphone_delta_gate_fields,
+        microphone_delta_bootstrap_fields: agent_context.microphone_delta_bootstrap_fields,
         initial_result,
         initial_input: None,
     })
@@ -4219,7 +4354,8 @@ struct AgentContext {
     response_schema: Value,
     max_output_tokens: u64,
     fields: Vec<AgentFieldConfig>,
-    microphone_delta_gate_field: Option<String>,
+    microphone_delta_gate_fields: Vec<String>,
+    microphone_delta_bootstrap_fields: Vec<String>,
 }
 
 fn load_agent_context(agent_root: &Path) -> Result<AgentContext> {
@@ -4236,13 +4372,15 @@ fn load_agent_context(agent_root: &Path) -> Result<AgentContext> {
         response_schema,
         max_output_tokens: agent_config.max_output_tokens,
         fields: agent_config.fields,
-        microphone_delta_gate_field: agent_config.microphone_delta_gate_field,
+        microphone_delta_gate_fields: agent_config.microphone_delta_gate_fields,
+        microphone_delta_bootstrap_fields: agent_config.microphone_delta_bootstrap_fields,
     })
 }
 
 struct ParsedAgentConfig {
     max_output_tokens: u64,
-    microphone_delta_gate_field: Option<String>,
+    microphone_delta_gate_fields: Vec<String>,
+    microphone_delta_bootstrap_fields: Vec<String>,
     fields: Vec<AgentFieldConfig>,
 }
 
@@ -4355,26 +4493,59 @@ fn parse_agent_config(config_text: &str) -> Result<ParsedAgentConfig> {
         });
     }
 
-    let microphone_delta_gate_field = raw
+    let mut microphone_delta_gate_fields = Vec::new();
+    for gate_field in raw.microphone_delta_gate_fields {
+        let gate_field = gate_field.trim().to_string();
+        if !gate_field.is_empty() && !microphone_delta_gate_fields.contains(&gate_field) {
+            microphone_delta_gate_fields.push(gate_field);
+        }
+    }
+    if let Some(legacy_gate_field) = raw
         .microphone_delta_gate_field
         .map(|field| field.trim().to_string())
-        .filter(|field| !field.is_empty());
-    if let Some(gate_field) = microphone_delta_gate_field.as_ref() {
-        if !is_agent_config_key(gate_field) {
-            return Err(anyhow!(
-                "agent-config.microphone_delta_gate_field must use lowercase letters, digits, and underscores only: {gate_field}"
-            ));
+        .filter(|field| !field.is_empty())
+    {
+        if !microphone_delta_gate_fields.contains(&legacy_gate_field) {
+            microphone_delta_gate_fields.push(legacy_gate_field);
         }
-        if !seen_keys.iter().any(|key| key == gate_field) {
-            return Err(anyhow!(
-                "agent-config.microphone_delta_gate_field references missing field: {gate_field}"
-            ));
+    }
+    let mut microphone_delta_bootstrap_fields = Vec::new();
+    for bootstrap_field in raw.microphone_delta_bootstrap_fields {
+        let bootstrap_field = bootstrap_field.trim().to_string();
+        if !bootstrap_field.is_empty()
+            && !microphone_delta_bootstrap_fields.contains(&bootstrap_field)
+        {
+            microphone_delta_bootstrap_fields.push(bootstrap_field);
+        }
+    }
+    for (setting_name, configured_fields) in [
+        (
+            "microphone_delta_gate_fields",
+            &microphone_delta_gate_fields,
+        ),
+        (
+            "microphone_delta_bootstrap_fields",
+            &microphone_delta_bootstrap_fields,
+        ),
+    ] {
+        for configured_field in configured_fields {
+            if !is_agent_config_key(configured_field) {
+                return Err(anyhow!(
+                    "agent-config.{setting_name} must use lowercase letters, digits, and underscores only: {configured_field}"
+                ));
+            }
+            if !seen_keys.iter().any(|key| key == configured_field) {
+                return Err(anyhow!(
+                    "agent-config.{setting_name} references missing field: {configured_field}"
+                ));
+            }
         }
     }
 
     Ok(ParsedAgentConfig {
         max_output_tokens,
-        microphone_delta_gate_field,
+        microphone_delta_gate_fields,
+        microphone_delta_bootstrap_fields,
         fields,
     })
 }
@@ -4692,6 +4863,7 @@ fn whisper_loop(
             &streams,
             config.agent.include_microphone,
             true,
+            config.agent.context_file.is_some(),
             seen_refresh_generation,
         );
     }
@@ -4718,6 +4890,7 @@ fn whisper_loop(
                 &streams,
                 config.agent.include_microphone,
                 true,
+                config.agent.context_file.is_some(),
                 seen_refresh_generation,
             );
         }
@@ -4926,6 +5099,7 @@ fn send_agent_update(
     streams: &HashMap<SourceKind, StreamingSourceState>,
     include_microphone: bool,
     force: bool,
+    reference_context_selected: bool,
     generation: u64,
 ) {
     let system_transcript = streams
@@ -4941,7 +5115,10 @@ fn send_agent_update(
         None
     };
 
-    if system_transcript.is_empty() && microphone_transcript.is_none() {
+    if system_transcript.is_empty()
+        && microphone_transcript.is_none()
+        && !(force && reference_context_selected)
+    {
         return;
     }
 
@@ -5140,7 +5317,8 @@ fn agent_loop(
                 input,
                 last_successful_input.as_ref(),
                 &last_result,
-                config.microphone_delta_gate_field.as_deref(),
+                &config.microphone_delta_gate_fields,
+                &config.microphone_delta_bootstrap_fields,
             ) {
                 last_submitted = input_signature;
                 continue;
@@ -5749,6 +5927,22 @@ struct LoadedReferenceContext {
     content: String,
 }
 
+fn openai_reasoning_effort(model: &str) -> Option<&'static str> {
+    if model.eq_ignore_ascii_case("gpt-5.6-terra") || model.eq_ignore_ascii_case("gpt-5.6-luna") {
+        Some("none")
+    } else if model.eq_ignore_ascii_case("gpt-5.6-sol") || model.eq_ignore_ascii_case("gpt-5.6") {
+        Some("medium")
+    } else {
+        None
+    }
+}
+
+fn add_openai_reasoning_effort(body: &mut Value, model: &str) {
+    if let Some(effort) = openai_reasoning_effort(model.trim()) {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+}
+
 fn load_reference_context(config: &AgentConfig) -> Result<Option<LoadedReferenceContext>> {
     let Some(configured_name) = config.context_file.as_deref() else {
         return Ok(None);
@@ -5833,7 +6027,7 @@ fn build_agent_request_body(
         developer_instructions.push_str(config.context_strictness.developer_instruction());
     }
 
-    Ok(json!({
+    let mut body = json!({
         "model": config.model.as_str(),
         "store": false,
         "input": [
@@ -5866,7 +6060,9 @@ fn build_agent_request_body(
                 "schema": config.response_schema.clone()
             }
         }
-    }))
+    });
+    add_openai_reasoning_effort(&mut body, &config.model);
+    Ok(body)
 }
 
 fn build_typing_request_body(config: &TypingConfig, model: &str, raw_text: &str) -> Value {
@@ -5874,7 +6070,7 @@ fn build_typing_request_body(config: &TypingConfig, model: &str, raw_text: &str)
         "raw_mic_transcript": raw_text,
     });
 
-    json!({
+    let mut body = json!({
         "model": model,
         "store": false,
         "input": [
@@ -5907,7 +6103,9 @@ fn build_typing_request_body(config: &TypingConfig, model: &str, raw_text: &str)
                 "schema": config.response_schema.clone()
             }
         }
-    })
+    });
+    add_openai_reasoning_effort(&mut body, model);
+    body
 }
 
 fn serialized_json_bytes(value: &Value) -> usize {
@@ -5924,11 +6122,12 @@ fn agent_input_signature(input: &AgentInput) -> String {
     )
 }
 
-fn agent_input_has_informative_delta(
+fn agent_input_has_informative_delta<G: AsRef<str>, B: AsRef<str>>(
     input: &AgentInput,
     previous: Option<&AgentInput>,
     current_state: &Value,
-    microphone_delta_gate_field: Option<&str>,
+    microphone_delta_gate_fields: &[G],
+    microphone_delta_bootstrap_fields: &[B],
 ) -> bool {
     let system_new = new_text_since(
         previous.map(|input| input.system_transcript.as_str()),
@@ -5939,10 +6138,14 @@ fn agent_input_has_informative_delta(
         return true;
     }
 
-    if !microphone_delta_gate_field
-        .and_then(|key| current_state.get(key))
-        .is_some_and(value_has_content)
-    {
+    let has_open_gate = microphone_delta_gate_fields
+        .iter()
+        .filter_map(|key| current_state.get(key.as_ref()))
+        .any(value_has_content);
+    let bootstrap_enabled = microphone_delta_bootstrap_fields
+        .iter()
+        .any(|key| current_state.get(key.as_ref()).is_some());
+    if !has_open_gate && !bootstrap_enabled {
         return false;
     }
 
@@ -7588,6 +7791,7 @@ fn apply_transcription_settings(
         Ok(()) => {
             state.transcription_settings.active = state.transcription_settings.pending.clone();
             state.transcription_settings.load_error = None;
+            state.transcription_settings.migration_notice = None;
             if transparency_changed {
                 state.transcription_settings.transparency_generation = state
                     .transcription_settings
@@ -7618,26 +7822,20 @@ fn apply_transcription_settings(
                 // protected restart snapshot.
                 state.agent_generation = state.agent_generation.wrapping_add(1);
                 state.restart_force_agent_update = refresh_agent_after_restart;
-                if microphone_sharing_disabled || reference_context_changed {
-                    let field_configs = state
-                        .agent
-                        .fields
-                        .iter()
-                        .map(|field| field.config.clone())
-                        .collect::<Vec<_>>();
-                    state.agent.canonical_result = default_agent_result(&field_configs);
-                    if microphone_sharing_disabled {
-                        if let Some(input) = state.agent.last_successful_input.as_mut() {
-                            input.microphone_transcript = None;
-                        }
-                    }
-                }
-                if answer_mode_changed {
-                    if let Some(result) = state.agent.canonical_result.as_object_mut() {
-                        result.insert("answer_guidance".to_string(), Value::String(String::new()));
-                    }
-                    state.agent.last_successful_input = None;
-                }
+                let field_configs = state
+                    .agent
+                    .fields
+                    .iter()
+                    .map(|field| field.config.clone())
+                    .collect::<Vec<_>>();
+                prepare_agent_restart_state(
+                    &mut state.agent.canonical_result,
+                    &mut state.agent.last_successful_input,
+                    &field_configs,
+                    answer_mode_changed,
+                    reference_context_changed,
+                    microphone_sharing_disabled,
+                );
                 state.status = "Settings saved; restarting".to_string();
                 state.restart_requested = true;
             } else {
@@ -7993,7 +8191,8 @@ fn handle_typing_key(
                 transparency_tx,
             ),
             KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('A')
-                if state.typing.settings_load_error.is_some() =>
+                if state.typing.settings_load_error.is_some()
+                    || state.typing.settings_migration_notice.is_some() =>
             {
                 repair_enhanced_typing_settings(state)
             }
@@ -8086,10 +8285,19 @@ fn typing_settings_option_count() -> usize {
 
 fn repair_enhanced_typing_settings(state: &mut AppState) -> TypingKeyOutcome {
     let settings = state.typing.persisted_settings();
+    let repaired_error = state.typing.settings_load_error.is_some();
     match save_enhanced_typing_settings(&state.typing.settings_path, &settings) {
         Ok(()) => {
             state.typing.settings_load_error = None;
-            state.typing.settings_note = Some("Settings repaired".to_string());
+            state.typing.settings_migration_notice = None;
+            state.typing.settings_note = Some(
+                if repaired_error {
+                    "Settings repaired"
+                } else {
+                    "Model choice applied"
+                }
+                .to_string(),
+            );
         }
         Err(err) => {
             let message = format!(
@@ -8181,7 +8389,10 @@ fn change_typing_setting(
     if before_values != after_values {
         let settings = state.typing.persisted_settings();
         match save_enhanced_typing_settings(&state.typing.settings_path, &settings) {
-            Ok(()) => state.typing.settings_load_error = None,
+            Ok(()) => {
+                state.typing.settings_load_error = None;
+                state.typing.settings_migration_notice = None;
+            }
             Err(err) => {
                 let message = format!(
                     "Settings save failed: {}",
@@ -8601,6 +8812,21 @@ fn transcription_settings_columns(
     }
 
     let mut detail_rows = vec![StyledLine::plain("Settings details", Color::Yellow)];
+    if let Some(notice) = &settings.migration_notice {
+        detail_rows.push(StyledLine::plain(
+            "Model migration / cost notice",
+            Color::Yellow,
+        ));
+        append_wrapped_rows(&mut detail_rows, notice, detail_width, Color::Yellow, false);
+        append_wrapped_rows(
+            &mut detail_rows,
+            "Close settings and choose Apply to save the reviewed model choice.",
+            detail_width,
+            Color::DarkGrey,
+            false,
+        );
+        detail_rows.push(StyledLine::plain("", Color::White));
+    }
     for line in wrap_plain_text(
         transcription_setting_help(settings.selection),
         detail_width.max(1),
@@ -9139,6 +9365,20 @@ fn typing_settings_layout(state: &AppState, max_content_width: usize) -> TypingL
         lines.push(StyledLine::plain(
             "Press Enter or A to apply the safe values without another change.",
             Color::Yellow,
+        ));
+    }
+    if let Some(notice) = &state.typing.settings_migration_notice {
+        lines.push(StyledLine::plain("", Color::White));
+        lines.push(StyledLine::plain(
+            "Model migration / cost notice",
+            Color::Yellow,
+        ));
+        for line in wrap_plain_text(notice, max_content_width.max(1)) {
+            lines.push(StyledLine::plain(line, Color::Yellow));
+        }
+        lines.push(StyledLine::plain(
+            "Review Refiner model, then press Enter or A to save the choice.",
+            Color::DarkGrey,
         ));
     }
     if let Some(note) = &state.typing.settings_note {
@@ -9774,6 +10014,20 @@ fn visible_agent_field_rows(state: &AppState, width: usize, max_lines: usize) ->
         .for_each(|height| *height = 1);
     let mut remaining = available.saturating_sub(titled_fields);
 
+    // Keep at least one concrete risk visible when the section is present.
+    // Otherwise a long natural answer can consume every remaining row and
+    // leave Main risks as a title-only section at the minimum terminal size.
+    if let Some(risk_index) = active_fields
+        .iter()
+        .position(|field| field.config.key == "main_risks")
+        .filter(|index| section_heights[*index] > 0)
+    {
+        if remaining > 0 && section_heights[risk_index] < desired_heights[risk_index] {
+            section_heights[risk_index] += 1;
+            remaining -= 1;
+        }
+    }
+
     // The directly usable answer is the primary purpose of this pane. Give it
     // enough rows for its complete wrapped value before distributing spare rows
     // across the supporting fields. The old equal split silently hid most of a
@@ -10205,22 +10459,43 @@ mod tests {
     use super::{
         agent_input_has_informative_delta, agent_input_signature, agent_result_matches_fields,
         agent_retry_delay, align_transcript_words, build_agent_request_body, build_response_schema,
-        canonical_agent_result, extract_agent_config_block, extract_agent_usage,
-        extract_response_text, fade_intensity, format_byte_size, is_informative_text,
-        merge_transcript_estimate, min_typing_status_width, new_text_since, parse_agent_config,
-        serialized_json_bytes, source_updates_agent, stream_silence_elapsed, styled_line_width,
-        typable_key_for_char, typing_desired_width, typing_display_text, typing_layout,
-        typing_safe_row_width, typing_submission_text, typing_window_width, wrap_plain_text,
-        AgentConfig, AgentInput, AgentUsage, AppConfig, AppMode, EnhancedTypingSettings,
-        SourceKind, StreamingSourceState, TranscriptState, TranscriptWord, TypingConfig,
-        TypingFlushMode, TypingTransparencyBackground, DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE,
-        SILENCE_BREAK_AFTER, TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH,
-        TYPING_REFINER_MODELS, TYPING_RIGHT_GUTTER_COLS, TYPING_SPEED_PRESETS,
-        TYPING_TRANSPARENCY_PRESETS,
+        build_typing_request_body, canonical_agent_result, extract_agent_config_block,
+        extract_agent_usage, extract_response_text, fade_intensity, format_byte_size,
+        is_informative_text, merge_transcript_estimate, migrate_agent_result,
+        migration_notice_for_active_saved_model, min_typing_status_width, new_text_since,
+        parse_agent_config, prepare_agent_restart_state, send_agent_update, serialized_json_bytes,
+        source_updates_agent, stream_silence_elapsed, styled_line_width, typable_key_for_char,
+        typing_desired_width, typing_display_text, typing_layout, typing_safe_row_width,
+        typing_submission_text, typing_window_width, wrap_plain_text, AgentConfig, AgentInput,
+        AgentUsage, AppConfig, AppMode, EnhancedTypingSettings, SourceKind, StreamingSourceState,
+        TranscriptState, TranscriptWord, TypingConfig, TypingFlushMode,
+        TypingTransparencyBackground, DEFAULT_AGENT_MODEL, DEFAULT_LANGUAGE, SILENCE_BREAK_AFTER,
+        TEXT_MIN_INTENSITY, TYPING_CHUNK_SECONDS, TYPING_MAX_CONTENT_WIDTH,
+        TYPING_RIGHT_GUTTER_COLS, TYPING_SPEED_PRESETS, TYPING_TRANSPARENCY_PRESETS,
     };
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn test_agent_field(key: &str, render: super::AgentFieldRender) -> super::AgentFieldConfig {
+        let schema = match render {
+            super::AgentFieldRender::Text => json!({ "type": "string" }),
+            super::AgentFieldRender::List => {
+                json!({ "type": "array", "items": { "type": "string" } })
+            }
+        };
+        super::AgentFieldConfig {
+            key: key.to_string(),
+            title: key.to_string(),
+            render,
+            empty: "none".to_string(),
+            title_rgb: (255, 255, 255),
+            value_rgb: (255, 255, 255),
+            min_display: Duration::ZERO,
+            preserve_on_empty: false,
+            schema,
+        }
+    }
 
     fn test_typing_state(text: &str) -> super::AppState {
         let config = AppConfig {
@@ -10230,6 +10505,7 @@ mod tests {
             terminal_hwnd: None,
             transcription_settings_path: PathBuf::new(),
             transcription_settings_load_error: None,
+            transcription_settings_migration_notice: None,
             restart_state_path: None,
             restart_state: None,
             transcription_settings: super::EnchantedTranscriptionSettings::default(),
@@ -10249,6 +10525,7 @@ mod tests {
                 terminal_hwnd: None,
                 settings_path: PathBuf::new(),
                 settings_load_error: None,
+                settings_migration_notice: None,
                 transparency_index: 0,
                 typing_speed_index: 1,
                 apply_saved_transparency: false,
@@ -10770,6 +11047,58 @@ After.
     }
 
     #[test]
+    fn agent_config_accepts_plural_and_legacy_microphone_gate_fields() {
+        let plural_config = r##"
+{
+  "microphone_delta_gate_fields": ["unanswered_questions", "main_risks"],
+  "microphone_delta_bootstrap_fields": ["main_risks"],
+  "fields": [
+    {
+      "key": "unanswered_questions",
+      "title": "Questions",
+      "render": "list",
+      "title_color": "#FFFFFF",
+      "value_color": "#FFFFFF",
+      "schema": { "type": "array", "items": { "type": "string" } }
+    },
+    {
+      "key": "main_risks",
+      "title": "Risks",
+      "render": "list",
+      "title_color": "#FFFFFF",
+      "value_color": "#FFFFFF",
+      "schema": { "type": "array", "items": { "type": "string" } }
+    }
+  ]
+}
+"##;
+        let parsed = parse_agent_config(plural_config).expect("plural gate fields should parse");
+        assert_eq!(
+            parsed.microphone_delta_gate_fields,
+            vec!["unanswered_questions".to_string(), "main_risks".to_string()]
+        );
+        assert_eq!(
+            parsed.microphone_delta_bootstrap_fields,
+            vec!["main_risks".to_string()]
+        );
+
+        let legacy_config = plural_config.replace(
+            "\"microphone_delta_gate_fields\": [\"unanswered_questions\", \"main_risks\"]",
+            "\"microphone_delta_gate_field\": \"unanswered_questions\"",
+        );
+        let parsed =
+            parse_agent_config(&legacy_config).expect("legacy microphone gate field should parse");
+        assert_eq!(
+            parsed.microphone_delta_gate_fields,
+            vec!["unanswered_questions".to_string()]
+        );
+        assert_eq!(
+            parsed.microphone_delta_bootstrap_fields,
+            vec!["main_risks".to_string()]
+        );
+    }
+
+    #[test]
     fn agent_input_signature_labels_sources() {
         let signature = agent_input_signature(&AgentInput {
             system_transcript: "What is the deadline?".to_string(),
@@ -10845,7 +11174,8 @@ After.
             &current,
             Some(&previous),
             &json!({ "unanswered_questions": [] }),
-            Some("unanswered_questions")
+            &["unanswered_questions"],
+            &[] as &[&str]
         ));
     }
 
@@ -10868,7 +11198,8 @@ After.
             &current,
             Some(&previous),
             &json!({ "unanswered_questions": [] }),
-            Some("unanswered_questions")
+            &["unanswered_questions", "main_risks"],
+            &[] as &[&str]
         ));
     }
 
@@ -10896,7 +11227,68 @@ After.
             &current,
             Some(&previous),
             &state,
-            Some("unanswered_questions")
+            &["unanswered_questions", "main_risks"],
+            &[] as &[&str]
+        ));
+    }
+
+    #[test]
+    fn agent_delta_gate_allows_mic_only_changes_when_risks_are_open() {
+        let previous = AgentInput {
+            system_transcript: "The migration is underway.".to_string(),
+            microphone_transcript: Some("We are checking it.".to_string()),
+            force: false,
+            generation: 0,
+        };
+        let current = AgentInput {
+            system_transcript: "The migration is underway.".to_string(),
+            microphone_transcript: Some(
+                "We are checking it. The rollback path is now verified.".to_string(),
+            ),
+            force: false,
+            generation: 0,
+        };
+        let state = json!({
+            "unanswered_questions": [],
+            "main_risks": ["The rollback path is unverified."]
+        });
+
+        assert!(agent_input_has_informative_delta(
+            &current,
+            Some(&previous),
+            &state,
+            &["unanswered_questions", "main_risks"],
+            &[] as &[&str]
+        ));
+    }
+
+    #[test]
+    fn agent_delta_bootstrap_allows_mic_only_first_risk() {
+        let previous = AgentInput {
+            system_transcript: "The migration is underway.".to_string(),
+            microphone_transcript: Some("We started the rollout.".to_string()),
+            force: false,
+            generation: 0,
+        };
+        let current = AgentInput {
+            system_transcript: "The migration is underway.".to_string(),
+            microphone_transcript: Some(
+                "We started the rollout. The rollback path is not yet verified.".to_string(),
+            ),
+            force: false,
+            generation: 0,
+        };
+        let state = json!({
+            "unanswered_questions": [],
+            "main_risks": []
+        });
+
+        assert!(agent_input_has_informative_delta(
+            &current,
+            Some(&previous),
+            &state,
+            &["unanswered_questions", "main_risks"],
+            &["main_risks"]
         ));
     }
 
@@ -10905,6 +11297,47 @@ After.
         assert!(source_updates_agent(SourceKind::SystemOutput, false));
         assert!(!source_updates_agent(SourceKind::Microphone, false));
         assert!(source_updates_agent(SourceKind::Microphone, true));
+    }
+
+    #[test]
+    fn forced_agent_update_allows_reference_only_context() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let agent_tx = Some(tx);
+        send_agent_update(
+            &agent_tx,
+            &std::collections::HashMap::new(),
+            false,
+            true,
+            true,
+            7,
+        );
+
+        let input = rx
+            .try_recv()
+            .expect("selected reference context should allow a forced empty update");
+        assert!(input.system_transcript.is_empty());
+        assert!(input.microphone_transcript.is_none());
+        assert!(input.force);
+        assert_eq!(input.generation, 7);
+    }
+
+    #[test]
+    fn forced_agent_update_skips_empty_contextless_request() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let agent_tx = Some(tx);
+        send_agent_update(
+            &agent_tx,
+            &std::collections::HashMap::new(),
+            false,
+            true,
+            false,
+            7,
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -10945,6 +11378,99 @@ After.
     }
 
     #[test]
+    fn restart_schema_migration_preserves_matching_typed_fields() {
+        let fields = vec![
+            test_agent_field("answer_guidance", super::AgentFieldRender::Text),
+            test_agent_field("unanswered_questions", super::AgentFieldRender::List),
+            test_agent_field("main_risks", super::AgentFieldRender::List),
+        ];
+        let saved = json!({
+            "answer_guidance": "Use the staged rollout.",
+            "unanswered_questions": ["Who owns rollback?"]
+        });
+
+        let (migrated, schema_changed) = migrate_agent_result(&fields, &saved);
+
+        assert!(schema_changed);
+        assert_eq!(migrated["answer_guidance"], "Use the staged rollout.");
+        assert_eq!(
+            migrated["unanswered_questions"],
+            json!(["Who owns rollback?"])
+        );
+        assert_eq!(migrated["main_risks"], json!([]));
+        assert!(agent_result_matches_fields(&migrated, &fields));
+    }
+
+    #[test]
+    fn restart_scrubbing_is_independent_from_immediate_refresh() {
+        let fields = vec![
+            test_agent_field("answer_guidance", super::AgentFieldRender::Text),
+            test_agent_field("critical_hints", super::AgentFieldRender::Text),
+            test_agent_field("main_risks", super::AgentFieldRender::List),
+        ];
+        let original = json!({
+            "answer_guidance": "Use blue.",
+            "critical_hints": "Keep the existing protocol.",
+            "main_risks": ["Rollback is unverified."]
+        });
+        let input = AgentInput {
+            system_transcript: "System context".to_string(),
+            microphone_transcript: Some("Private microphone context".to_string()),
+            force: false,
+            generation: 0,
+        };
+
+        let mut model_change_result = original.clone();
+        let mut model_change_input = Some(input.clone());
+        prepare_agent_restart_state(
+            &mut model_change_result,
+            &mut model_change_input,
+            &fields,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(model_change_result, original);
+        assert!(model_change_input.is_some());
+
+        let mut answer_change_result = original.clone();
+        let mut answer_change_input = Some(input.clone());
+        prepare_agent_restart_state(
+            &mut answer_change_result,
+            &mut answer_change_input,
+            &fields,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(answer_change_result["answer_guidance"], "");
+        assert_eq!(
+            answer_change_result["critical_hints"],
+            "Keep the existing protocol."
+        );
+        assert_eq!(
+            answer_change_result["main_risks"],
+            json!(["Rollback is unverified."])
+        );
+        assert!(answer_change_input.is_none());
+
+        for (reference_changed, microphone_disabled) in [(true, false), (false, true)] {
+            let mut privacy_result = original.clone();
+            let mut privacy_input = Some(input.clone());
+            prepare_agent_restart_state(
+                &mut privacy_result,
+                &mut privacy_input,
+                &fields,
+                false,
+                reference_changed,
+                microphone_disabled,
+            );
+            assert_eq!(privacy_result, super::default_agent_result(&fields));
+            assert!(privacy_input.is_none());
+        }
+    }
+
+    #[test]
     fn transcription_requests_disable_response_storage() {
         let config = AgentConfig::disabled(DEFAULT_AGENT_MODEL);
         let input = AgentInput {
@@ -10957,6 +11483,100 @@ After.
             .expect("request without reference context should build");
 
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn explicit_model_override_suppresses_saved_migration_notice() {
+        let notice = Some("saved model migrated".to_string());
+
+        assert_eq!(
+            migration_notice_for_active_saved_model(notice.clone(), false),
+            notice
+        );
+        assert_eq!(
+            migration_notice_for_active_saved_model(Some("saved model migrated".to_string()), true,),
+            None
+        );
+    }
+
+    #[test]
+    fn built_in_request_bodies_set_tier_appropriate_reasoning_effort() {
+        let input = AgentInput {
+            system_transcript: "What is the deadline?".to_string(),
+            microphone_transcript: None,
+            force: false,
+            generation: 0,
+        };
+        let typing_config = TypingConfig {
+            model: DEFAULT_AGENT_MODEL.to_string(),
+            api_key: None,
+            instructions: String::new(),
+            response_schema: json!({}),
+            max_output_tokens: 256,
+            input_source: SourceKind::Microphone,
+            terminal_hwnd: None,
+            settings_path: PathBuf::new(),
+            settings_load_error: None,
+            settings_migration_notice: None,
+            transparency_index: 0,
+            typing_speed_index: 1,
+            apply_saved_transparency: false,
+            intelligence_enabled: false,
+            flush_mode: TypingFlushMode::Clipboard,
+        };
+
+        for (model, expected_effort) in [
+            ("gpt-5.6-terra", "none"),
+            ("gpt-5.6-luna", "none"),
+            ("gpt-5.6-sol", "medium"),
+            ("gpt-5.6", "medium"),
+        ] {
+            let agent_body =
+                build_agent_request_body(&AgentConfig::disabled(model), &input, None, &json!({}))
+                    .expect("built-in agent request should build");
+            let typing_body = build_typing_request_body(&typing_config, model, "hello");
+
+            assert_eq!(agent_body["reasoning"]["effort"], expected_effort);
+            assert_eq!(typing_body["reasoning"]["effort"], expected_effort);
+        }
+    }
+
+    #[test]
+    fn custom_model_request_bodies_omit_reasoning_effort() {
+        let input = AgentInput {
+            system_transcript: "What is the deadline?".to_string(),
+            microphone_transcript: None,
+            force: false,
+            generation: 0,
+        };
+        let agent_body = build_agent_request_body(
+            &AgentConfig::disabled("custom-model"),
+            &input,
+            None,
+            &json!({}),
+        )
+        .expect("custom agent request should build");
+        let typing_config = TypingConfig {
+            model: "custom-model".to_string(),
+            api_key: None,
+            instructions: String::new(),
+            response_schema: json!({}),
+            max_output_tokens: 256,
+            input_source: SourceKind::Microphone,
+            terminal_hwnd: None,
+            settings_path: PathBuf::new(),
+            settings_load_error: None,
+            settings_migration_notice: None,
+            transparency_index: 0,
+            typing_speed_index: 1,
+            apply_saved_transparency: false,
+            intelligence_enabled: false,
+            flush_mode: TypingFlushMode::Clipboard,
+        };
+        let typing_body = build_typing_request_body(&typing_config, "custom-model", "hello");
+
+        assert!(agent_body.get("reasoning").is_none());
+        assert!(typing_body.get("reasoning").is_none());
     }
 
     #[test]

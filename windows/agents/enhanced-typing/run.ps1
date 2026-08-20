@@ -28,14 +28,32 @@ $TempDir = Join-Path $AgentRoot ".temp"
 $TransparencyTool = Join-Path $WindowsRoot "tools\terminal-transparency.ps1"
 $OpenAiKeyTool = Join-Path $WindowsRoot "tools\openai-api-key.ps1"
 $OpenAiKeyPath = Join-Path $env:APPDATA "tukevejtso\secrets\openai-api-key.dpapi"
+$SettingsPath = Join-Path $env:APPDATA "tukevejtso\enhanced-typing-settings.json"
 
 $transparencyOpacityProvided = $PSBoundParameters.ContainsKey("TransparencyOpacity")
 $modelProvided = $PSBoundParameters.ContainsKey("Model")
+$agentModelProvided = $PSBoundParameters.ContainsKey("AgentModel")
 
 function Update-CurrentProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $env:Path = (@($machinePath, $userPath) | Where-Object { $_ }) -join ";"
+}
+
+function Write-SavedModelMigrationWarning {
+    if ($agentModelProvided -or -not (Test-Path -LiteralPath $SettingsPath -PathType Leaf)) {
+        return
+    }
+
+    try {
+        $saved = Get-Content -Raw -LiteralPath $SettingsPath | ConvertFrom-Json
+        if ($saved.refiner_model -and [string]$saved.refiner_model.Trim() -eq "gpt-5.4-mini") {
+            Write-Warning "Model migration and cost notice: the saved gpt-5.4-mini choice will migrate to gpt-5.6-terra when used. Terra currently has a higher per-token price than the saved Mini tier; review and apply the model choice in F9."
+        }
+    }
+    catch {
+        return
+    }
 }
 
 function Import-VisualStudioBuildEnvironment {
@@ -590,6 +608,7 @@ if ($Mode -ne "EnhancedTyping" -or $Transparency) {
 Invoke-OptionalFullScreen
 $terminalRestoreSnapshot = Get-TerminalRestoreSnapshot
 Import-OpenAiApiKey
+Write-SavedModelMigrationWarning
 
 $resolvedLanguage = Resolve-LanguageOption
 if (-not $modelProvided) {
@@ -627,7 +646,10 @@ if ($terminalRestoreSnapshot -and $terminalRestoreSnapshot.WindowHandle -ne [Int
 if ($NoAgent) {
     $cargoArgs += "--agent-disabled"
 }
-else {
+elseif ($agentModelProvided) {
+    if ([string]::IsNullOrWhiteSpace($AgentModel)) {
+        throw "-AgentModel requires a non-empty OpenAI model ID."
+    }
     $cargoArgs += @("--agent-model", $AgentModel)
 }
 

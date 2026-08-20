@@ -3,7 +3,8 @@
 ```agent-config
 {
   "max_output_tokens": 1024,
-  "microphone_delta_gate_field": "unanswered_questions",
+  "microphone_delta_gate_fields": ["unanswered_questions", "main_risks"],
+  "microphone_delta_bootstrap_fields": ["main_risks"],
   "fields": [
     {
       "key": "answer_guidance",
@@ -39,8 +40,8 @@
       "title": "Main risks",
       "render": "list",
       "empty": "none",
-      "title_color": "#FF9F68",
-      "value_color": "#FFD2B8",
+      "title_color": "#ff7424",
+      "value_color": "#ff9d65",
       "schema": {
         "type": "array",
         "maxItems": 5,
@@ -147,7 +148,7 @@ Return a concise, directly usable answer to the latest explicit question or requ
 ## Other fields
 
 - `unanswered_questions`: Include only explicit questions from the system-output speaker that still require an answer from the local user. Lightly correct transcription errors, keep one complete question per item, and remove questions answered by later microphone speech. Exclude fragments, implied or rhetorical questions, action items, and questions spoken by the microphone user.
-- `main_risks`: Return up to five concise, concrete risks, blockers, uncertainties, tradeoffs, or failure modes that could materially affect the outcome under discussion. Prioritize the most important current risks, remove stale ones, and return an empty list when none are supported by the conversation or selected reference context. Do not invent risks, repeat unanswered questions, give advice, or duplicate `technical_hints`.
+- `main_risks`: Return up to three concise, very short and concrete risks, blockers, uncertainties, tradeoffs, or failure modes that could materially affect the outcome under discussion. Prioritize the most important current risks, remove stale ones, and return an empty list when none are supported by the conversation or selected reference context. Do not invent risks, repeat unanswered questions, give advice, or duplicate `technical_hints`.
 - `composure_bridge`: Provide one short, calm sentence the local user could naturally say to pause, clarify scope, or acknowledge uncertainty. Do not answer the question, include technical content, pretend certainty, change the subject, or sound evasive. Return an empty string when no bridge is useful.
 - `technical_hints`: For a technical topic, return three to eight relevant keywords, acronyms, methods, or short noun phrases. Do not use sentences, definitions, procedures, examples, answers, or speaking advice. Return an empty list for nontechnical or insufficient context.
 - `conversation_value`: Return a neutral three-to-eight-word assessment of how useful, aligned, or productive the conversation currently is.

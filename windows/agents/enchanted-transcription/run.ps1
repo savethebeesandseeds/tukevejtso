@@ -426,6 +426,9 @@ function Read-TranscriptionSettings {
             $settings.agent_enabled = [bool]$saved.agent_enabled
         }
         if ($saved.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$saved.agent_model)) {
+            if (-not $agentModelProvided -and [string]$saved.agent_model.Trim() -eq "gpt-5.4-mini") {
+                Write-Warning "Model migration and cost notice: the saved gpt-5.4-mini choice will migrate to gpt-5.6-terra when used. Terra currently has a higher per-token price than the saved Mini tier; review and apply the model choice in F9."
+            }
             $settings.agent_model = Resolve-CurrentOpenAiModelId -ModelName ([string]$saved.agent_model)
         }
         if ($saved.transparency_label -and -not [string]::IsNullOrWhiteSpace([string]$saved.transparency_label)) {
@@ -490,7 +493,10 @@ function Resolve-AgentModelOption {
     param($Settings)
 
     if ($agentModelProvided) {
-        return Resolve-CurrentOpenAiModelId -ModelName $AgentModel
+        if ([string]::IsNullOrWhiteSpace($AgentModel)) {
+            throw "-AgentModel requires a non-empty OpenAI model ID."
+        }
+        return $AgentModel.Trim()
     }
     if ($Settings -and $Settings.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$Settings.agent_model)) {
         return Resolve-CurrentOpenAiModelId -ModelName ([string]$Settings.agent_model)
@@ -915,7 +921,7 @@ while ($true) {
     if ($agentDisabled) {
         $cargoArgs += "--agent-disabled"
     }
-    else {
+    elseif ($agentModelProvided) {
         $cargoArgs += @("--agent-model", $resolvedAgentModel)
     }
 
