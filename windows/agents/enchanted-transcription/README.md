@@ -42,6 +42,8 @@ Automatic Agent Insights updates wait for about 1.2 seconds of silence after new
 
 Both Silhouette and Natural Answer modes also show a bounded list of the main risks supported by the current conversation or selected reference context.
 
+The built-in Agent model choices are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Terra is the initial default. Saved legacy built-ins migrate by tier—GPT-5.4 nano to Luna, GPT-5.4 mini to Terra, and GPT-5.5 to Sol—while other custom model IDs remain unchanged.
+
 The Responses API requests use `store: false`. System-output transcript text is included when Agent Insights runs. Microphone transcript text remains local unless **Mic context** is enabled in F9.
 
 ### Spanish transcription

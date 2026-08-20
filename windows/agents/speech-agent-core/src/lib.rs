@@ -88,7 +88,7 @@ const DEFAULT_TEXT_FADE_SECONDS: u64 = 70;
 const TEXT_MIN_INTENSITY: f32 = 0.60;
 const FADE_RENDER_INTERVAL: Duration = Duration::from_secs(2);
 const ERROR_BUFFER_CAPACITY: usize = 6;
-const DEFAULT_AGENT_MODEL: &str = "gpt-5.4-nano";
+const DEFAULT_AGENT_MODEL: &str = "gpt-5.6-terra";
 const TRANSCRIPTION_RESTART_EXIT_CODE: i32 = 75;
 const TRANSCRIPTION_RESTART_STATE_VERSION: u32 = 2;
 const AGENT_INSTRUCTIONS_FILE: &str = "agent-instructions.md";
@@ -267,7 +267,7 @@ impl TranscriptionAnswerMode {
     }
 }
 
-const TYPING_REFINER_MODELS: [&str; 3] = ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5"];
+const TYPING_REFINER_MODELS: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const TRANSCRIPTION_LANGUAGE_CHOICES: [&str; 7] = ["auto", "en", "es", "pt", "fr", "de", "it"];
 const TRANSCRIPTION_MODEL_CHOICES: [&str; 8] = [
     "tiny",
@@ -627,9 +627,7 @@ impl EnchantedTranscriptionSettings {
             self.chunk_seconds = DEFAULT_CHUNK_SECONDS;
         }
         self.fade_seconds = self.fade_seconds.clamp(5, 180);
-        if self.agent_model.trim().is_empty() {
-            self.agent_model = DEFAULT_AGENT_MODEL.to_string();
-        }
+        self.agent_model = normalize_openai_model_id(&self.agent_model);
         self.context_file = self
             .context_file
             .as_deref()
@@ -840,6 +838,17 @@ fn normalize_choice(value: u64, choices: &[u64], fallback: u64) -> u64 {
         value
     } else {
         fallback
+    }
+}
+
+fn normalize_openai_model_id(model: &str) -> String {
+    let model = model.trim();
+    match model.to_ascii_lowercase().as_str() {
+        "gpt-5.4-nano" | "gpt-5.6-luna" => "gpt-5.6-luna".to_string(),
+        "gpt-5.4-mini" | "gpt-5.6-terra" => "gpt-5.6-terra".to_string(),
+        "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6" => "gpt-5.6-sol".to_string(),
+        "" => DEFAULT_AGENT_MODEL.to_string(),
+        _ => model.to_string(),
     }
 }
 
@@ -3692,6 +3701,7 @@ fn load_enchanted_transcription_settings(
                     &normalize_transcription_language(&comparable.language),
                 );
             }
+            comparable.agent_model = normalize_openai_model_id(&comparable.agent_model);
             let normalized = settings.clone().normalized();
             let load_error = (comparable != normalized).then(|| {
                 "Some saved transcription settings were adjusted to supported values. Review them before applying; the original file has not been changed."
@@ -3879,7 +3889,10 @@ fn load_enhanced_typing_settings(path: &Path) -> (EnhancedTypingSettings, Option
     };
 
     match serde_json::from_str::<EnhancedTypingSettings>(&text) {
-        Ok(settings) => (settings, None),
+        Ok(mut settings) => {
+            settings.refiner_model = normalize_openai_model_id(&settings.refiner_model);
+            (settings, None)
+        }
         Err(err) => {
             let mut settings = EnhancedTypingSettings::default();
             settings.intelligence_enabled = false;
@@ -3921,11 +3934,7 @@ fn typing_speed_preset_index(label: &str) -> Option<usize> {
 
 fn saved_typing_refiner_model(settings: &EnhancedTypingSettings, fallback: &str) -> String {
     let model = settings.refiner_model.trim();
-    if model.is_empty() {
-        fallback.to_string()
-    } else {
-        model.to_string()
-    }
+    normalize_openai_model_id(if model.is_empty() { fallback } else { model })
 }
 
 fn terminal_transparency_tool_path(agent_root: &Path) -> PathBuf {
@@ -8806,9 +8815,9 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
         4 => vec!["6s", "8s", "10s", "12s", "15s", "20s", "30s"],
         5 | 8 => vec!["On", "Off"],
         6 => vec![
-            "gpt-5.4-nano",
-            "gpt-5.4-mini",
-            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "Other non-empty model IDs from saved settings or CLI",
         ],
         7 => vec!["Silhouette", "Natural Answer"],
@@ -8899,7 +8908,7 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         3 => "Selects the local Whisper model. The non-.en models are multilingual and support Spanish; medium is the largest Spanish-capable choice available here. English-only .en models are offered only when Language is English. Larger models improve recognition but use more memory and compute; changing the model downloads it if needed and restarts.",
         4 => "Controls the rolling audio context sent to local Whisper. Longer windows preserve context but increase inference work and latency; changing it restarts.",
         5 => "Enables the remote insight pane. Local capture and Whisper continue when this is off; applying the change restarts agent wiring.",
-        6 => "Selects the OpenAI model used for insight updates. Model choice affects latency, quality, and API cost; changing it restarts agent wiring.",
+        6 => "Selects the OpenAI model used for insight updates. Sol prioritizes capability, Terra balances intelligence and cost and is the initial default, and Luna prioritizes low cost and high volume. Changing it restarts agent wiring.",
         7 => "Silhouette returns a content-free answer frame with blanks for your own knowledge. Natural Answer returns a concise, directly usable answer. Changing modes uses the normal automatic application restart.",
         8 => "Allows microphone transcript text to be included in API context. Off keeps local speech out of remote requests; changing it restarts agent wiring.",
         9 => "Stops only new API requests after this terminal has remained hidden, minimized, cloaked, or out of the foreground for the selected grace period. Audio capture, Whisper, and context buffering continue locally. If terminal visibility cannot be monitored, API requests pause and F9 shows a warning.",
@@ -9174,7 +9183,7 @@ fn typing_setting_help(selection: usize) -> &'static str {
         2 => "Sets the delay between simulated keystrokes in type mode. Slower speeds are safer for applications that drop fast input.",
         3 => "Chooses microphone or system output as the local Whisper source. Changing it clears the active audio window but does not call the API.",
         4 => "Changes this terminal's opacity and background effect. The visual update applies immediately and is remembered for the next launch.",
-        5 => "Selects the OpenAI model used only for dictation cleanup. It affects refinement quality, latency, and API cost.",
+        5 => "Selects the OpenAI model used only for dictation cleanup. Sol prioritizes capability, Terra balances intelligence and cost and is the initial default, and Luna prioritizes low cost and high volume.",
         _ => "",
     }
 }
@@ -10361,7 +10370,7 @@ mod tests {
         assert_eq!(settings.input_source, SourceKind::Microphone);
         assert_eq!(settings.transparency_label, "opaque");
         assert_eq!(settings.typing_speed_label, "normal");
-        assert_eq!(settings.refiner_model, TYPING_REFINER_MODELS[0]);
+        assert_eq!(settings.refiner_model, DEFAULT_AGENT_MODEL);
     }
 
     #[test]

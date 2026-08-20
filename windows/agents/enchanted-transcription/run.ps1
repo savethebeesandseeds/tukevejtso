@@ -11,7 +11,7 @@ param(
     [int]$TransparencyOpacity = 45,
     [ValidateSet("Clear", "Acrylic")]
     [string]$TransparencyBackground = "Clear",
-    [string]$AgentModel = "gpt-5.4-nano",
+    [string]$AgentModel = "gpt-5.6-terra",
     [switch]$NoAgent,
     [switch]$SetupOpenAiKey,
     [switch]$TranscriptDump,
@@ -369,6 +369,26 @@ function Resolve-CompatibleWhisperModel {
     return $resolved
 }
 
+function Resolve-CurrentOpenAiModelId {
+    param([string]$ModelName)
+
+    if ([string]::IsNullOrWhiteSpace($ModelName)) {
+        return "gpt-5.6-terra"
+    }
+
+    $modelId = $ModelName.Trim()
+    switch ($modelId.ToLowerInvariant()) {
+        "gpt-5.4-nano" { return "gpt-5.6-luna" }
+        "gpt-5.6-luna" { return "gpt-5.6-luna" }
+        "gpt-5.4-mini" { return "gpt-5.6-terra" }
+        "gpt-5.6-terra" { return "gpt-5.6-terra" }
+        "gpt-5.5" { return "gpt-5.6-sol" }
+        "gpt-5.6" { return "gpt-5.6-sol" }
+        "gpt-5.6-sol" { return "gpt-5.6-sol" }
+        default { return $modelId }
+    }
+}
+
 function Get-DefaultTranscriptionSettings {
     [pscustomobject]@{
         sources = @("microphone", "system-output")
@@ -377,7 +397,7 @@ function Get-DefaultTranscriptionSettings {
         chunk_seconds = 12
         fade_seconds = 70
         agent_enabled = $true
-        agent_model = "gpt-5.4-nano"
+        agent_model = "gpt-5.6-terra"
         include_microphone = $false
         transparency_label = $null
     }
@@ -406,7 +426,7 @@ function Read-TranscriptionSettings {
             $settings.agent_enabled = [bool]$saved.agent_enabled
         }
         if ($saved.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$saved.agent_model)) {
-            $settings.agent_model = [string]$saved.agent_model
+            $settings.agent_model = Resolve-CurrentOpenAiModelId -ModelName ([string]$saved.agent_model)
         }
         if ($saved.transparency_label -and -not [string]::IsNullOrWhiteSpace([string]$saved.transparency_label)) {
             $settings.transparency_label = [string]$saved.transparency_label
@@ -470,12 +490,12 @@ function Resolve-AgentModelOption {
     param($Settings)
 
     if ($agentModelProvided) {
-        return $AgentModel
+        return Resolve-CurrentOpenAiModelId -ModelName $AgentModel
     }
     if ($Settings -and $Settings.agent_model -and -not [string]::IsNullOrWhiteSpace([string]$Settings.agent_model)) {
-        return [string]$Settings.agent_model
+        return Resolve-CurrentOpenAiModelId -ModelName ([string]$Settings.agent_model)
     }
-    return "gpt-5.4-nano"
+    return "gpt-5.6-terra"
 }
 
 function Resolve-AgentDisabledOption {

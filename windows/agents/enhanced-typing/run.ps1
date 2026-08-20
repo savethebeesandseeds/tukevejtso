@@ -12,7 +12,7 @@ param(
     [int]$TransparencyOpacity = 45,
     [ValidateSet("Clear", "Acrylic")]
     [string]$TransparencyBackground = "Clear",
-    [string]$AgentModel = "gpt-5.4-nano",
+    [string]$AgentModel = "gpt-5.6-terra",
     [switch]$NoAgent,
     [switch]$SetupOpenAiKey,
     [switch]$FullScreen,
