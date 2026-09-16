@@ -684,16 +684,40 @@ function Get-TuiHelpLine {
     )
 }
 
+function Get-TuiFrameSequence {
+    param(
+        [string[]] $Lines,
+        [switch] $Initial
+    )
+
+    $esc = Get-TuiEsc
+    $reset = Get-TuiAnsiReset
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append($reset)
+    if ($Initial) {
+        [void]$builder.Append("$esc[?25l$esc[2J")
+    }
+    [void]$builder.Append("$esc[H")
+    for ($row = 0; $row -lt $Lines.Count; $row++) {
+        if ($row -gt 0) { [void]$builder.Append("`r`n") }
+        # Repainting shorter labels must remove the previous selection's padding.
+        # Reset first: terminal erase operations inherit the current background.
+        [void]$builder.Append("$reset$esc[2K")
+        [void]$builder.Append($Lines[$row])
+        [void]$builder.Append($reset)
+    }
+    [void]$builder.Append("$reset$esc[J")
+    return $builder.ToString()
+}
+
 function Write-TuiFrame {
     param(
         [string[]] $Lines,
         [switch] $Initial
     )
 
-    if (Test-TuiAnsi -and -not [Console]::IsOutputRedirected) {
-        $esc = Get-TuiEsc
-        $prefix = if ($Initial) { "$esc[?25l$esc[2J$esc[H" } else { "$esc[H" }
-        [Console]::Write($prefix + ($Lines -join "`r`n") + "$esc[J")
+    if ((Test-TuiAnsi) -and -not [Console]::IsOutputRedirected) {
+        [Console]::Write((Get-TuiFrameSequence -Lines $Lines -Initial:$Initial))
         return
     }
 
@@ -704,7 +728,7 @@ function Write-TuiFrame {
 }
 
 function Show-TuiCursor {
-    if (Test-TuiAnsi -and -not [Console]::IsOutputRedirected) {
+    if ((Test-TuiAnsi) -and -not [Console]::IsOutputRedirected) {
         $esc = Get-TuiEsc
         [Console]::Write("$esc[?25h")
     }
@@ -718,6 +742,7 @@ function Select-TuiItem {
         [scriptblock] $FormatItem,
         [scriptblock] $RenderItem,
         [scriptblock] $FormatStyledItem,
+        [scriptblock] $FormatFrame,
         [switch] $ShowLogo
     )
 
@@ -731,7 +756,12 @@ function Select-TuiItem {
 
     try {
         while ($true) {
-            if ($ShowLogo -and $null -ne $FormatStyledItem) {
+            if ($null -ne $FormatFrame) {
+                $frameLines = & $FormatFrame $Items $selected
+                Write-TuiFrame -Lines ([string[]]$frameLines) -Initial:(-not $renderedOnce)
+                $renderedOnce = $true
+            }
+            elseif ($ShowLogo -and $null -ne $FormatStyledItem) {
                 $frameLines = New-Object System.Collections.Generic.List[string]
                 foreach ($line in (Get-TuiHeaderLines -Title $Title -Subtitle $Subtitle)) {
                     $frameLines.Add($line)

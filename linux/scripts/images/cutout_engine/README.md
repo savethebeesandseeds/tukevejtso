@@ -13,6 +13,7 @@ Model-aware background removal package used by:
 - `pipeline.py`: chooses the requested engine and handles fallback behavior.
 - `providers/birefnet.py`: BiRefNet/Hugging Face segmentation provider.
 - `providers/classic.py`: local color/edge fallback provider.
+- `providers/artwork.py`: global paper matte estimation and color-to-alpha unmatting for line art.
 - `postprocess.py`: alpha cleanup, decontamination, and previews.
 - `image_io.py`: image loading and default output naming.
 - `gui.py`: optional PySide6 desktop UI.

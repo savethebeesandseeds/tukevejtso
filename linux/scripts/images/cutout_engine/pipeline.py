@@ -17,6 +17,14 @@ def run_cutout(input_path: Path, options: CutoutOptions) -> CutoutResult:
             floor=options.alpha_floor,
             ceiling=options.alpha_ceiling,
         )
+    if engine == "artwork":
+        from .providers import artwork
+
+        return cleanup_alpha(
+            artwork.run(input_path, options),
+            floor=options.alpha_floor,
+            ceiling=options.alpha_ceiling,
+        )
     if engine == "birefnet":
         from .providers import birefnet
 

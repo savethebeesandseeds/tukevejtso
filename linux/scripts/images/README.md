@@ -99,6 +99,23 @@ Remove a background with the cutout engine:
   --preview-dir ./workspaces/images/product_previews
 ```
 
+For paper-backed engravings, scans, diagrams, or line art, use the artwork
+engine. Unlike the classic border flood, it also removes paper enclosed by the
+subject and unmattes edge colors for clean compositing:
+
+```bash
+./scripts/images/image_tool.sh cutout image \
+  ./workspaces/images/engraving.png \
+  ./workspaces/images/engraving-transparent.png \
+  --engine artwork \
+  --background-model flat \
+  --matte-low 1.25 \
+  --matte-high 5.0
+```
+
+Use `--background-model quadratic` for paper with a smooth vignette or lighting
+gradient. `--edge-guard N` can force a known-empty outer border transparent.
+
 Check dependencies and model notes:
 
 ```bash

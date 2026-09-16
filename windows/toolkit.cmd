@@ -19,6 +19,7 @@ if "%TOOLKIT_CHOICE%"=="25" goto password_manager
 if "%TOOLKIT_CHOICE%"=="26" goto enhanced_typing
 if "%TOOLKIT_CHOICE%"=="27" goto tukevejtso_linux
 if "%TOOLKIT_CHOICE%"=="28" goto cutout_backgrounds
+if "%TOOLKIT_CHOICE%"=="29" goto pdf_join
 
 goto done
 
@@ -32,6 +33,9 @@ if /I "%~1"=="debian" goto tukevejtso_linux
 if /I "%~1"=="cutout" goto cutout_backgrounds
 if /I "%~1"=="backgrounds" goto cutout_backgrounds
 if /I "%~1"=="remove-backgrounds" goto cutout_backgrounds
+if /I "%~1"=="join-pdfs" goto pdf_join
+if /I "%~1"=="pdf-join" goto pdf_join
+if /I "%~1"=="merge-pdfs" goto pdf_join
 if /I "%~1"=="terminal-transparency" goto terminal_transparency
 if /I "%~1"=="openai-key" goto openai_key
 if /I "%~1"=="enchanted-transcription" goto enchanted_transcription
@@ -74,8 +78,10 @@ echo.
 echo Usage:
 echo   tk                         Open the interactive menu
 echo   tk password                Generate passwords with length/complexity options
-echo   tk linux                   Build/open the tukevejtso Debian utility container
+echo   tk linux                   Prepare/open the tukevejtso Debian utility container
 echo   tk cutout INPUT [OUTPUT]   Remove image backgrounds into transparent PNGs
+echo   tk join-pdfs [FOLDER]       Select, order, and join PDFs in a terminal browser
+echo   tk join-pdfs -Help          Show PDF joiner options and keyboard controls
 echo   tk robotics-learning       Open the robotics-learning dev container
 echo   tk terminal-transparency   Set opacity for the current terminal window
 echo   tk openai-key              Store or update the OpenAI API key
@@ -98,7 +104,7 @@ echo   tk caatuu stop             Stop Caatuu; keep the shared tunnel
 echo   tk caatuu stop-tunnel      Stop the shared Caatuu/Minerals tunnel
 echo   tk storage                 Choose start/stop/status for storage sharing
 echo   tk storage start           Start the storage and sharing service
-echo   tk storage rebuild         Rebuild its Docker image, then start it
+echo   tk storage rebuild         Recreate its Debian container, then start it
 echo   tk storage status          Show container health and current URLs
 echo   tk storage stop            Stop the storage and sharing service
 goto done
@@ -156,6 +162,25 @@ goto done
 :terminal_transparency
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\terminal-transparency.ps1"
 goto done
+
+:pdf_join
+set "PDF_JOIN_ARGS="
+if "%TOOLKIT_FROM_MENU%"=="1" goto pdf_join_run
+shift /1
+:pdf_join_args
+if "%~1"=="" goto pdf_join_run
+set PDF_JOIN_ARGS=%PDF_JOIN_ARGS% "%~1"
+shift /1
+goto pdf_join_args
+:pdf_join_run
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "%ROOT%tools\join-pdfs.ps1" %PDF_JOIN_ARGS%
+set "PDF_JOIN_EXIT=%ERRORLEVEL%"
+if "%TOOLKIT_FROM_MENU%"=="1" goto pdf_join_return
+endlocal & exit /b %PDF_JOIN_EXIT%
+:pdf_join_return
+if not "%PDF_JOIN_EXIT%"=="0" pause
+set "TOOLKIT_CHOICE="
+goto menu
 
 :openai_key
 if /I "%~1"=="openai-key" shift /1

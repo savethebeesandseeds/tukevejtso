@@ -8,12 +8,67 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "ui.ps1")
 
 $serviceRoot = "C:\Work\storage-and-sharing-services"
-$composeFile = Join-Path $serviceRoot "compose.yaml"
+$setupFile = Join-Path $serviceRoot "setup.sh"
 $containerName = "storage-and-sharing-services"
+$containerImage = "debian:latest"
+$containerPort = 8084
+$runtimeRoot = "/opt/storage-and-sharing-services"
+$runtimeHome = "/var/lib/storage-and-sharing-services"
+$runtimeUid = 10001
+$runtimeGid = 10001
+$managedLabel = "org.tukevejtso.storage-and-sharing-services.managed"
+$configurationLabel = "org.tukevejtso.storage-and-sharing-services.configuration"
+$provisionRevision = "1"
 $defaultPort = 8084
+$defaultBindAddress = "0.0.0.0"
+$defaultMaximumFileSizeMb = 1024
 $dockerDesktopTimeoutSeconds = 90
-$serviceHealthTimeoutSeconds = 120
+$serviceHealthTimeoutSeconds = 900
 $httpTimeoutSeconds = 45
+
+function Invoke-Docker {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $Arguments,
+        [switch] $Quiet
+    )
+
+    Write-Host ("docker {0}" -f ($Arguments -join " ")) -ForegroundColor DarkGray
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+    }
+
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        $output = @(& docker @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        }
+    }
+
+    if ($exitCode -ne 0) {
+        $detail = ($output | ForEach-Object { "$_" }) -join [Environment]::NewLine
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            $detail = "No diagnostic output was returned."
+        }
+        throw ("docker {0} failed with exit code {1}.{2}{3}" -f ($Arguments -join " "), $exitCode, [Environment]::NewLine, $detail)
+    }
+
+    if (-not $Quiet) {
+        $output
+    }
+}
 
 function Test-DockerDaemon {
     $previousErrorActionPreference = $ErrorActionPreference
@@ -90,40 +145,27 @@ function Assert-ServiceWorkspace {
         throw "The service workspace was not found at $serviceRoot."
     }
 
-    if (-not (Test-Path -LiteralPath $composeFile -PathType Leaf)) {
-        throw "The Docker Compose file was not found at $composeFile."
-    }
-}
-
-function Invoke-StorageCompose {
-    param([string[]] $Arguments)
-
-    Write-Host ("docker compose {0}" -f ($Arguments -join " ")) -ForegroundColor DarkGray
-
-    $previousErrorActionPreference = $ErrorActionPreference
-    $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
-    if ($hasNativePreference) {
-        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
-    }
-
-    try {
-        $ErrorActionPreference = "Continue"
-        if ($hasNativePreference) {
-            $PSNativeCommandUseErrorActionPreference = $false
-        }
-
-        & docker compose --project-directory $serviceRoot --file $composeFile @Arguments
-        $composeExitCode = $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-        if ($hasNativePreference) {
-            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+    $requiredFiles = @(
+        $setupFile,
+        (Join-Path $serviceRoot "package.json"),
+        (Join-Path $serviceRoot "package-lock.json"),
+        (Join-Path $serviceRoot "server.js")
+    )
+    foreach ($requiredFile in $requiredFiles) {
+        if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+            throw "Required service file was not found: $requiredFile"
         }
     }
 
-    if ($composeExitCode -ne 0) {
-        throw "docker compose failed with exit code $composeExitCode."
+    $requiredDirectories = @(
+        (Join-Path $serviceRoot "public"),
+        (Join-Path $serviceRoot "shared\received"),
+        (Join-Path $serviceRoot "shared\available")
+    )
+    foreach ($requiredDirectory in $requiredDirectories) {
+        if (-not (Test-Path -LiteralPath $requiredDirectory -PathType Container)) {
+            throw "Required service directory was not found: $requiredDirectory"
+        }
     }
 }
 
@@ -160,14 +202,269 @@ function Get-ServiceSetting {
     return $DefaultValue
 }
 
-function Get-ServicePort {
+function Get-ServiceConfiguration {
     $portText = Get-ServiceSetting -Name "PORT" -DefaultValue "$defaultPort"
     $port = 0
     if (-not [int]::TryParse($portText, [ref] $port) -or $port -lt 1 -or $port -gt 65535) {
         throw "PORT in $serviceRoot\.env must be a number from 1 to 65535; found '$portText'."
     }
 
-    return $port
+    $maximumFileSizeText = Get-ServiceSetting -Name "MAX_FILE_SIZE_MB" -DefaultValue "$defaultMaximumFileSizeMb"
+    $maximumFileSizeMb = 0
+    if (-not [int]::TryParse($maximumFileSizeText, [ref] $maximumFileSizeMb) -or
+        $maximumFileSizeMb -lt 1 -or $maximumFileSizeMb -gt 10240) {
+        throw "MAX_FILE_SIZE_MB must be a number from 1 to 10240; found '$maximumFileSizeText'."
+    }
+
+    $bindAddressText = Get-ServiceSetting -Name "BIND_ADDRESS" -DefaultValue $defaultBindAddress
+    if ($bindAddressText -notin @("0.0.0.0", "127.0.0.1")) {
+        throw "BIND_ADDRESS must be exactly 0.0.0.0 or 127.0.0.1; found '$bindAddressText'."
+    }
+
+    return [pscustomobject]@{
+        Port = $port
+        BindAddress = $bindAddressText
+        MaximumFileSizeMb = $maximumFileSizeMb
+    }
+}
+
+function Get-ConfigurationFingerprint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Configuration
+    )
+
+    $payload = @(
+        $provisionRevision,
+        $containerImage,
+        $serviceRoot.ToLowerInvariant(),
+        $Configuration.BindAddress,
+        "$($Configuration.Port)",
+        "$($Configuration.MaximumFileSizeMb)",
+        "$containerPort",
+        ("{0}:{1}" -f $runtimeUid, $runtimeGid)
+    ) -join [Environment]::NewLine
+
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $hash = $algorithm.ComputeHash($bytes)
+        return ([System.BitConverter]::ToString($hash)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Get-ContainerRuntime {
+    param([string] $Identity = $containerName)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+    }
+
+    $inspectionOutput = @()
+    $inspectExitCode = $null
+    $invocationError = $null
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        $inspectionOutput = @(& docker container inspect $Identity 2>&1)
+        $inspectExitCode = $LASTEXITCODE
+    }
+    catch {
+        $invocationError = $_.Exception
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        }
+    }
+
+    if ($null -ne $invocationError) {
+        throw "Could not inspect container '$Identity': $($invocationError.Message)"
+    }
+
+    if ($inspectExitCode -ne 0) {
+        $detail = ($inspectionOutput | ForEach-Object { "$_" }) -join [Environment]::NewLine
+        if ($detail -match '(?i)\bno such (?:container|object)\b') {
+            return [pscustomobject]@{
+                Status = "missing"
+                Health = "none"
+                Managed = $false
+                Configuration = ""
+                Image = ""
+                Id = ""
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            $detail = "No diagnostic output was returned."
+        }
+        throw "Could not inspect container '$Identity'. Docker exited with code $inspectExitCode. $detail"
+    }
+
+    try {
+        $parsed = (($inspectionOutput | ForEach-Object { "$_" }) -join [Environment]::NewLine) | ConvertFrom-Json
+        $inspection = @($parsed)[0]
+    }
+    catch {
+        throw "Docker returned invalid inspection JSON for '$Identity': $($_.Exception.Message)"
+    }
+
+    if ($null -eq $inspection -or $null -eq $inspection.State -or $null -eq $inspection.Config) {
+        throw "Docker returned incomplete inspection data for '$Identity'."
+    }
+
+    $health = "none"
+    if ($null -ne $inspection.State.Health -and -not [string]::IsNullOrWhiteSpace("$($inspection.State.Health.Status)")) {
+        $health = "$($inspection.State.Health.Status)"
+    }
+
+    $managedValue = ""
+    $configurationValue = ""
+    if ($null -ne $inspection.Config.Labels) {
+        $managedProperty = $inspection.Config.Labels.PSObject.Properties[$managedLabel]
+        if ($null -ne $managedProperty) {
+            $managedValue = "$($managedProperty.Value)"
+        }
+        $configurationProperty = $inspection.Config.Labels.PSObject.Properties[$configurationLabel]
+        if ($null -ne $configurationProperty) {
+            $configurationValue = "$($configurationProperty.Value)"
+        }
+    }
+
+    return [pscustomobject]@{
+        Status = "$($inspection.State.Status)"
+        Health = $health
+        Managed = ($managedValue -eq "true")
+        Configuration = $configurationValue
+        Image = "$($inspection.Config.Image)"
+        Id = "$($inspection.Id)"
+    }
+}
+
+function Test-ContainerImage {
+    $previousErrorActionPreference = $ErrorActionPreference
+    $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+    if ($hasNativePreference) {
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+    }
+
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+
+        & docker image inspect $containerImage *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($hasNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        }
+    }
+}
+
+function Ensure-ContainerImage {
+    param([switch] $PullLatest)
+
+    if ($PullLatest -or -not (Test-ContainerImage)) {
+        Invoke-Docker -Arguments @("image", "pull", $containerImage) | Out-Host
+    }
+}
+
+function Assert-ManagedContainer {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Runtime
+    )
+
+    if (-not $Runtime.Managed) {
+        throw "Container '$containerName' exists but is not labeled as managed by Tukevejtso. It has been preserved. Do not remove it without inspecting it and approving that exact deletion."
+    }
+}
+
+function New-StorageContainer {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Configuration
+    )
+
+    $fingerprint = Get-ConfigurationFingerprint -Configuration $Configuration
+    $receivedPath = Join-Path $serviceRoot "shared\received"
+    $availablePath = Join-Path $serviceRoot "shared\available"
+    $publishedPort = "$($Configuration.BindAddress):$($Configuration.Port):$containerPort"
+    # Keep this quote-free so Windows PowerShell 5.1 passes it to docker.exe as
+    # one native argument rather than splitting JavaScript punctuation.
+    $healthCommand = "curl --fail --silent --show-error http://127.0.0.1:8084/healthz"
+    $bootstrapCommand = "bash /workspace/setup.sh && exec setpriv --reuid=$runtimeUid --regid=$runtimeGid --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all env HOME=$runtimeHome NODE_ENV=production NODE_PATH=$runtimeRoot/node_modules node /workspace/server.js"
+
+    $arguments = @(
+        "container", "create",
+        "--name", $containerName,
+        "--hostname", $containerName,
+        "--label", "$managedLabel=true",
+        "--label", "$configurationLabel=$fingerprint",
+        "--init",
+        "--restart", "no",
+        "--stop-timeout", "15",
+        "--security-opt", "no-new-privileges:true",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m",
+        "--publish", $publishedPort,
+        "--mount", "type=bind,source=$serviceRoot,target=/workspace,readonly",
+        "--mount", "type=bind,source=$receivedPath,target=/data/received",
+        "--mount", "type=bind,source=$availablePath,target=/data/available,readonly",
+        "--env", "HOST=0.0.0.0",
+        "--env", "PORT=$containerPort",
+        "--env", "UPLOAD_DIR=/data/received",
+        "--env", "DOWNLOAD_DIR=/data/available",
+        "--env", "MAX_FILE_SIZE_MB=$($Configuration.MaximumFileSizeMb)",
+        "--health-cmd", $healthCommand,
+        "--health-interval", "30s",
+        "--health-timeout", "3s",
+        "--health-start-period", "10m",
+        "--health-retries", "3",
+        $containerImage,
+        "bash", "-lc", $bootstrapCommand
+    )
+
+    $createOutput = @(Invoke-Docker -Arguments $arguments)
+    $createdId = $createOutput |
+        ForEach-Object { "$($_)".Trim() } |
+        Where-Object { $_ -match '^[0-9a-f]{12,64}$' } |
+        Select-Object -Last 1
+    if ([string]::IsNullOrWhiteSpace($createdId)) {
+        throw "Docker did not return the ID of the newly created '$containerName' container. Nothing will be removed automatically."
+    }
+    Write-Host "Created only container '$containerName' from $containerImage." -ForegroundColor Green
+    return "$createdId"
+}
+
+function Assert-ContainerConfiguration {
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Runtime,
+        [Parameter(Mandatory = $true)]
+        [pscustomobject] $Configuration
+    )
+
+    Assert-ManagedContainer -Runtime $Runtime
+    $expected = Get-ConfigurationFingerprint -Configuration $Configuration
+    if ($Runtime.Configuration -ne $expected) {
+        throw "Container '$containerName' has different immutable settings. It has been preserved. Run 'tk storage rebuild' only when you intend to replace this exact container."
+    }
 }
 
 function Get-LanIPv4Addresses {
@@ -204,21 +501,22 @@ function Get-LanIPv4Addresses {
 }
 
 function Get-ServiceUrls {
-    $port = Get-ServicePort
-    $localUrl = "http://127.0.0.1`:$port/"
+    $configuration = Get-ServiceConfiguration
+    $localUrl = "http://127.0.0.1:{0}/" -f $configuration.Port
     $lanUrls = @()
 
-    $bindAddress = Get-ServiceSetting -Name "BIND_ADDRESS" -DefaultValue "0.0.0.0"
-    if ($bindAddress -notin @("127.0.0.1", "localhost", "::1")) {
+    if ($configuration.BindAddress -ne "127.0.0.1") {
         foreach ($address in @(Get-LanIPv4Addresses)) {
-            $lanUrls += "http://$address`:$port/"
+            if (-not [string]::IsNullOrWhiteSpace("$address")) {
+                $lanUrls += "http://{0}:{1}/" -f $address, $configuration.Port
+            }
         }
     }
 
     return [pscustomobject]@{
         Local = $localUrl
-        Network = [string[]]$lanUrls
-        BindAddress = $bindAddress
+        Network = [string[]] $lanUrls
+        BindAddress = $configuration.BindAddress
     }
 }
 
@@ -232,7 +530,7 @@ function Write-ServiceUrls {
     Write-Host "Open on another device on this network" -ForegroundColor White
 
     if ($urls.Network.Count -eq 0) {
-        if ($urls.BindAddress -in @("127.0.0.1", "localhost", "::1")) {
+        if ($urls.BindAddress -eq "127.0.0.1") {
             Write-Host "  LAN access is disabled by BIND_ADDRESS=$($urls.BindAddress)." -ForegroundColor Yellow
         }
         else {
@@ -246,48 +544,45 @@ function Write-ServiceUrls {
     }
 }
 
-function Get-ContainerRuntime {
-    $previousErrorActionPreference = $ErrorActionPreference
-    $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
-    if ($hasNativePreference) {
-        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
-    }
+function Get-HttpEndpointResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Url,
+        [int] $TimeoutSeconds = 8
+    )
 
     try {
-        $ErrorActionPreference = "Continue"
-        if ($hasNativePreference) {
-            $PSNativeCommandUseErrorActionPreference = $false
-        }
-
-        $stateLine = (& docker inspect --format "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}" $containerName 2>$null)
-        if ($LASTEXITCODE -ne 0) {
-            return [pscustomobject]@{ Status = "missing"; Health = "none" }
-        }
-
-        $parts = "$stateLine".Trim().Split("|", 2)
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSeconds
         return [pscustomobject]@{
-            Status = $parts[0]
-            Health = if ($parts.Count -gt 1) { $parts[1] } else { "none" }
+            Success = ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400)
+            StatusCode = [int] $response.StatusCode
+            Error = ""
         }
     }
     catch {
-        return [pscustomobject]@{ Status = "missing"; Health = "none" }
-    }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-        if ($hasNativePreference) {
-            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+        return [pscustomobject]@{
+            Success = $false
+            StatusCode = 0
+            Error = $_.Exception.Message
         }
     }
 }
 
 function Wait-ServiceHealth {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ContainerId
+    )
+
     Write-Host "Waiting up to $serviceHealthTimeoutSeconds seconds for $containerName..."
     $deadline = (Get-Date).AddSeconds($serviceHealthTimeoutSeconds)
     $lastDisplayState = $null
 
     do {
-        $runtime = Get-ContainerRuntime
+        $runtime = Get-ContainerRuntime -Identity $ContainerId
+        if ($runtime.Status -eq "missing") {
+            throw "$containerName disappeared while readiness was being checked. No other container will be modified."
+        }
         $displayState = if ($runtime.Health -eq "none") {
             $runtime.Status
         }
@@ -300,43 +595,26 @@ function Wait-ServiceHealth {
             $lastDisplayState = $displayState
         }
 
-        if ($runtime.Status -eq "running" -and $runtime.Health -in @("healthy", "none")) {
+        if ($runtime.Status -eq "running" -and $runtime.Health -eq "healthy") {
             Write-Host "$containerName is ready." -ForegroundColor Green
             return
         }
 
         if ($runtime.Status -in @("dead", "exited")) {
-            throw "$containerName stopped before becoming ready. Run 'tk storage status' for details."
+            Write-Host ""
+            try {
+                Invoke-Docker -Arguments @("container", "logs", "--tail", "80", $ContainerId) | Out-Host
+            }
+            catch {
+                Write-Host "Could not read container logs: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            throw "$containerName stopped before becoming healthy. The container has been preserved."
         }
 
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $deadline)
 
-    throw "$containerName did not become ready within $serviceHealthTimeoutSeconds seconds."
-}
-
-function Get-HttpEndpointResult {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string] $Url,
-        [int] $TimeoutSeconds = 8
-    )
-
-    try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec $TimeoutSeconds
-        return [pscustomobject]@{
-            Success = ($response.StatusCode -ge 200 -and $response.StatusCode -lt 400)
-            StatusCode = [int]$response.StatusCode
-            Error = ""
-        }
-    }
-    catch {
-        return [pscustomobject]@{
-            Success = $false
-            StatusCode = 0
-            Error = $_.Exception.Message
-        }
-    }
+    throw "$containerName did not become healthy within $serviceHealthTimeoutSeconds seconds. The container has been preserved."
 }
 
 function Wait-HttpEndpoint {
@@ -370,19 +648,39 @@ function Show-ServiceStatus {
 
     if ($DockerUnavailable) {
         Write-TuiStatus -Label "Docker engine" -State "Warn" -Detail "Unavailable"
-        Write-Host "A start action will launch Docker Desktop automatically." -ForegroundColor DarkGray
+        Write-Host "A start action can launch Docker Desktop; status and stop never do." -ForegroundColor DarkGray
         Write-ServiceUrls
         return
     }
 
-    Invoke-StorageCompose -Arguments @("ps", "--all")
     $runtime = Get-ContainerRuntime
-    Write-Host ""
+    if ($runtime.Status -eq "missing") {
+        Write-TuiStatus -Label "Container" -State "Warn" -Detail "missing"
+        Write-TuiStatus -Label "HTTP health" -State "Warn" -Detail "Not checked; service is absent"
+        Write-ServiceUrls
+        return
+    }
 
-    if ($runtime.Status -eq "running" -and $runtime.Health -in @("healthy", "none")) {
+    if (-not $runtime.Managed) {
+        Write-TuiStatus -Label "Container" -State "Warn" -Detail "$($runtime.Status); unmanaged and preserved"
+        Write-TuiStatus -Label "HTTP health" -State "Warn" -Detail "Not checked; container is not managed by this tool"
+        Write-Host "The existing container and its settings have been preserved for inspection." -ForegroundColor Yellow
+        return
+    }
+
+    $configuration = Get-ServiceConfiguration
+    $expectedFingerprint = Get-ConfigurationFingerprint -Configuration $configuration
+    if ($runtime.Configuration -ne $expectedFingerprint) {
+        Write-TuiStatus -Label "Container" -State "Warn" -Detail "$($runtime.Status); settings changed"
+        Write-TuiStatus -Label "HTTP health" -State "Warn" -Detail "Not checked; container uses earlier settings"
+        Write-Host "Run 'tk storage rebuild' to apply the current .env; the container has been preserved." -ForegroundColor Yellow
+        return
+    }
+
+    if ($runtime.Status -eq "running" -and $runtime.Health -eq "healthy") {
         Write-TuiStatus -Label "Container" -State "Good" -Detail "$($runtime.Status) / $($runtime.Health)"
     }
-    elseif ($runtime.Status -eq "missing" -or $runtime.Status -eq "exited") {
+    elseif ($runtime.Status -in @("created", "exited")) {
         Write-TuiStatus -Label "Container" -State "Warn" -Detail $runtime.Status
     }
     else {
@@ -406,70 +704,155 @@ function Show-ServiceStatus {
     Write-ServiceUrls
 }
 
-function Invoke-ServiceAction {
-    param([string] $RequestedAction)
-
+function Start-StorageService {
     Assert-ServiceWorkspace
-
-    if ($RequestedAction -eq "status") {
-        if (-not (Test-DockerDaemon)) {
-            Show-ServiceStatus -DockerUnavailable
-            return
-        }
-
-        Show-ServiceStatus
-        return
-    }
-
-    if ($RequestedAction -eq "stop") {
-        if (-not (Test-DockerDaemon)) {
-            Write-TuiHeader -Title "Storage + sharing" -Subtitle "Stop service"
-            Write-Host "Docker is not running, so the service is already off." -ForegroundColor Green
-            return
-        }
-
-        Write-TuiHeader -Title "Storage + sharing" -Subtitle "Stop service"
-        Invoke-StorageCompose -Arguments @("stop")
-        Write-Host ""
-        Write-Host "Storage and sharing is off." -ForegroundColor Green
-        Write-Host "Its restart policy remains 'no'; it will not start with the computer." -ForegroundColor DarkGray
-        return
-    }
-
-    Write-TuiHeader -Title "Storage + sharing" -Subtitle "Start a temporary LAN file-transfer service."
     Start-DockerDesktopIfNeeded
+    $configuration = Get-ServiceConfiguration
+    $runtime = Get-ContainerRuntime
+    $activeContainerId = ""
 
-    if ($RequestedAction -eq "rebuild") {
-        Invoke-StorageCompose -Arguments @("up", "-d", "--build")
+    if ($runtime.Status -eq "missing") {
+        Ensure-ContainerImage
+        $activeContainerId = New-StorageContainer -Configuration $configuration
+        Invoke-Docker -Arguments @("container", "start", $activeContainerId) -Quiet
     }
     else {
-        Invoke-StorageCompose -Arguments @("up", "-d")
+        Assert-ContainerConfiguration -Runtime $runtime -Configuration $configuration
+        $activeContainerId = $runtime.Id
+        if ([string]::IsNullOrWhiteSpace($activeContainerId)) {
+            throw "Docker inspection did not return the immutable ID of '$containerName'. The container has been preserved."
+        }
+        if ($runtime.Status -eq "running") {
+            Write-Host "$containerName is already running; preserving it." -ForegroundColor Green
+        }
+        elseif ($runtime.Status -in @("created", "exited")) {
+            Invoke-Docker -Arguments @("container", "start", $activeContainerId) -Quiet
+        }
+        else {
+            throw "Container '$containerName' is in state '$($runtime.Status)'. It has been preserved for inspection."
+        }
     }
 
-    Wait-ServiceHealth
+    Wait-ServiceHealth -ContainerId $activeContainerId
     $urls = Get-ServiceUrls
     Wait-HttpEndpoint -Url ($urls.Local + "healthz")
 
     Write-Host ""
     Write-Host "Storage and sharing is on." -ForegroundColor Green
-    Write-Host "It will remain off after a reboot unless you run this tool again." -ForegroundColor DarkGray
+    Write-Host "The service remains off after reboot until this tool starts it." -ForegroundColor DarkGray
     Write-ServiceUrls
+}
+
+function Rebuild-StorageService {
+    Assert-ServiceWorkspace
+    Start-DockerDesktopIfNeeded
+    $configuration = Get-ServiceConfiguration
+    $runtime = Get-ContainerRuntime
+
+    # Fetch the requested base before touching an existing container. A failed
+    # pull therefore leaves the old environment completely intact.
+    Ensure-ContainerImage -PullLatest
+
+    if ($runtime.Status -ne "missing") {
+        Assert-ManagedContainer -Runtime $runtime
+        $targetContainerId = $runtime.Id
+        if ([string]::IsNullOrWhiteSpace($targetContainerId)) {
+            throw "Docker inspection did not return the immutable ID of '$containerName'. The container has been preserved."
+        }
+        Write-Host "Replacing only inspected container '$containerName' ($($targetContainerId.Substring(0, 12))); host files and Docker volumes are not removed." -ForegroundColor Yellow
+
+        if ($runtime.Status -eq "paused") {
+            Invoke-Docker -Arguments @("container", "unpause", $targetContainerId) -Quiet
+            Invoke-Docker -Arguments @("container", "stop", "--time", "15", $targetContainerId) -Quiet
+        }
+        elseif ($runtime.Status -in @("running", "restarting")) {
+            Invoke-Docker -Arguments @("container", "stop", "--time", "15", $targetContainerId) -Quiet
+        }
+        Invoke-Docker -Arguments @("container", "rm", $targetContainerId) -Quiet
+    }
+
+    $createdContainerId = New-StorageContainer -Configuration $configuration
+    Invoke-Docker -Arguments @("container", "start", $createdContainerId) -Quiet
+    Wait-ServiceHealth -ContainerId $createdContainerId
+
+    $urls = Get-ServiceUrls
+    Wait-HttpEndpoint -Url ($urls.Local + "healthz")
+    Write-Host ""
+    Write-Host "Fresh Debian environment created and storage sharing is on." -ForegroundColor Green
+    Write-ServiceUrls
+}
+
+function Stop-StorageService {
+    Assert-ServiceWorkspace
+    Write-TuiHeader -Title "Storage + sharing" -Subtitle "Stop service and preserve its container."
+
+    if (-not (Test-DockerDaemon)) {
+        Write-Host "Docker is not running, so the service is already off." -ForegroundColor Green
+        return
+    }
+
+    $runtime = Get-ContainerRuntime
+    if ($runtime.Status -eq "missing") {
+        Write-Host "The container is absent; nothing was removed or created." -ForegroundColor Green
+        return
+    }
+
+    Assert-ManagedContainer -Runtime $runtime
+    if ($runtime.Status -in @("created", "exited")) {
+        Write-Host "The existing container is already stopped and has been preserved." -ForegroundColor Green
+        return
+    }
+
+    if ($runtime.Status -notin @("running", "paused", "restarting")) {
+        throw "Container '$containerName' is in state '$($runtime.Status)' and has been preserved for inspection."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($runtime.Id)) {
+        throw "Docker inspection did not return the immutable ID of '$containerName'. The container has been preserved."
+    }
+    if ($runtime.Status -eq "paused") {
+        Invoke-Docker -Arguments @("container", "unpause", $runtime.Id) -Quiet
+    }
+    Invoke-Docker -Arguments @("container", "stop", "--time", "15", $runtime.Id) -Quiet
+    Write-Host ""
+    Write-Host "Storage and sharing is off. The stopped container and all host files remain intact." -ForegroundColor Green
+}
+
+function Invoke-ServiceAction {
+    param([string] $RequestedAction)
+
+    switch ($RequestedAction) {
+        "status" {
+            Assert-ServiceWorkspace
+            if (-not (Test-DockerDaemon)) {
+                Show-ServiceStatus -DockerUnavailable
+            }
+            else {
+                Show-ServiceStatus
+            }
+        }
+        "stop" {
+            Stop-StorageService
+        }
+        "rebuild" {
+            Rebuild-StorageService
+        }
+        default {
+            Start-StorageService
+        }
+    }
 }
 
 function Invoke-ServiceMenu {
     $items = @(
-        @{ Label = "Start"; Detail = "Start the existing Docker image"; Action = "start" },
-        @{ Label = "Rebuild + start"; Detail = "Rebuild the image, then start it"; Action = "rebuild" },
-        @{ Label = "Status"; Detail = "Show the container, health, and current URLs"; Action = "status" },
-        @{ Label = "Stop"; Detail = "Turn the sharing service off"; Action = "stop" },
+        @{ Label = "Start"; Detail = "Reuse/start the existing container, or create it if absent"; Action = "start" },
+        @{ Label = "Recreate"; Detail = "Replace only this container with fresh debian:latest"; Action = "rebuild" },
+        @{ Label = "Status"; Detail = "Show container, health, and current URLs"; Action = "status" },
+        @{ Label = "Stop"; Detail = "Stop while preserving the container and host files"; Action = "stop" },
         @{ Label = "Back"; Detail = "Return to the toolkit menu"; Action = "back" }
     )
 
-    $choice = Select-TuiItem `
-        -Title "Storage + sharing" `
-        -Subtitle "Control C:\Work\storage-and-sharing-services." `
-        -Items $items `
-        -FormatItem { param($item) "{0,-18} {1}" -f $item.Label, $item.Detail }
+    $choice = Select-TuiItem -Title "Storage + sharing" -Subtitle "Control C:\Work\storage-and-sharing-services." -Items $items -FormatItem { param($item) "{0,-18} {1}" -f $item.Label, $item.Detail }
 
     if ($null -eq $choice -or $choice.Action -eq "back") {
         return

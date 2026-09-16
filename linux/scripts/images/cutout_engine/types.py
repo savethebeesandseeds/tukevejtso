@@ -15,6 +15,11 @@ class CutoutOptions:
     tolerance: float | None = None
     edge_softness: float | None = None
     bg_palette_size: int = 4
+    background_model: str = "flat"
+    matte_low: float = 1.25
+    matte_high: float = 5.0
+    edge_guard: int = 0
+    component_filter: bool = True
     alpha_floor: int = 24
     alpha_ceiling: int = 250
     decontaminate: bool = True

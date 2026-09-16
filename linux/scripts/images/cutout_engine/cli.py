@@ -19,7 +19,7 @@ from .types import CutoutOptions
 def add_engine_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--engine",
-        choices=("auto", "classic", "birefnet"),
+        choices=("auto", "classic", "artwork", "birefnet"),
         default="auto",
         help="auto tries BiRefNet and falls back to classic if ML deps are absent",
     )
@@ -40,6 +40,35 @@ def add_engine_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tolerance", type=float, default=None, help="classic engine RGB tolerance")
     parser.add_argument("--edge-softness", type=float, default=None, help="classic engine alpha blur radius")
     parser.add_argument("--bg-palette-size", type=int, default=4)
+    parser.add_argument(
+        "--background-model",
+        choices=("flat", "quadratic"),
+        default="flat",
+        help="artwork engine parchment model",
+    )
+    parser.add_argument(
+        "--matte-low",
+        type=float,
+        default=1.25,
+        help="artwork engine weak CIE76 foreground threshold",
+    )
+    parser.add_argument(
+        "--matte-high",
+        type=float,
+        default=5.0,
+        help="artwork engine strong CIE76 foreground threshold",
+    )
+    parser.add_argument(
+        "--edge-guard",
+        type=int,
+        default=0,
+        help="artwork engine transparent outer guard in pixels",
+    )
+    parser.add_argument(
+        "--no-component-filter",
+        action="store_true",
+        help="keep every artwork pixel above the weak threshold",
+    )
     parser.add_argument("--alpha-floor", type=int, default=24, help="set alpha values at or below N to 0")
     parser.add_argument("--alpha-ceiling", type=int, default=250, help="set alpha values at or above N to 255")
     parser.add_argument("--no-decontaminate", action="store_true", help="disable edge color cleanup")
@@ -96,6 +125,11 @@ def options_from_args(args: argparse.Namespace) -> CutoutOptions:
         tolerance=args.tolerance,
         edge_softness=args.edge_softness,
         bg_palette_size=args.bg_palette_size,
+        background_model=args.background_model,
+        matte_low=max(0.0, args.matte_low),
+        matte_high=max(0.0, args.matte_high),
+        edge_guard=max(0, args.edge_guard),
+        component_filter=not args.no_component_filter,
         alpha_floor=max(0, min(255, args.alpha_floor)),
         alpha_ceiling=max(0, min(255, args.alpha_ceiling)),
         decontaminate=not args.no_decontaminate,

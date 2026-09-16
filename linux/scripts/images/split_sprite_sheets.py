@@ -630,9 +630,22 @@ def split_sheet(
     records: list[dict[str, Any]] = []
     next_index = start_index
     expected = args.rows * args.cols
-    filled = sum(1 for slot in slots if slot.bbox is not None)
-    if filled != expected:
-        warnings.append(f"{input_path.name}: detected {filled}/{expected} occupied slots")
+    occupied_slots = {
+        index for index, slot in enumerate(slots, start=1) if slot.bbox is not None
+    }
+    empty_slots = set(args.empty_slots)
+    if empty_slots:
+        expected_slots = set(range(1, expected + 1)) - empty_slots
+        missing_slots = sorted(expected_slots - occupied_slots)
+        unexpected_slots = sorted(empty_slots & occupied_slots)
+        if missing_slots:
+            warnings.append(f"{input_path.name}: expected occupied slots are empty: {missing_slots}")
+        if unexpected_slots:
+            warnings.append(
+                f"{input_path.name}: declared empty slots contain foreground: {unexpected_slots}"
+            )
+    elif len(occupied_slots) != expected:
+        warnings.append(f"{input_path.name}: detected {len(occupied_slots)}/{expected} occupied slots")
 
     for slot_index, slot in enumerate(slots, start=1):
         if slot.bbox is None:
@@ -734,6 +747,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--glob", default="*.png")
     parser.add_argument("--rows", type=int, required=True)
     parser.add_argument("--cols", type=int, required=True)
+    parser.add_argument(
+        "--empty-slots",
+        type=int,
+        nargs="+",
+        default=[],
+        metavar="N",
+        help="Intentionally empty 1-based row-major slots, applied to every input sheet.",
+    )
     parser.add_argument("--prefix", default="sprite")
     parser.add_argument("--start-index", type=int, default=1)
     parser.add_argument("--digits", type=int, default=3)
@@ -760,6 +781,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.cols <= 0:
         parser.error("--rows and --cols must be positive")
+    if len(args.empty_slots) != len(set(args.empty_slots)):
+        parser.error("--empty-slots must contain unique slot indices")
+    if any(index < 1 or index > args.rows * args.cols for index in args.empty_slots):
+        parser.error("--empty-slots indices must be between 1 and rows * cols")
+    args.empty_slots = sorted(args.empty_slots)
     if not args.input_dir.is_dir():
         parser.error(f"Input directory not found: {args.input_dir}")
 
@@ -810,6 +836,8 @@ def main(argv: list[str] | None = None) -> int:
         "cols": args.cols,
         "prefix": args.prefix,
         "count": len(all_records),
+        "declared_empty_slots": args.empty_slots,
+        "expected_count": len(inputs) * (args.rows * args.cols - len(args.empty_slots)),
         "warnings": all_warnings,
         "sprites": all_records,
     }

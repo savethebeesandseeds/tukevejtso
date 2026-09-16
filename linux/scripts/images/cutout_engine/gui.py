@@ -51,7 +51,7 @@ class CutoutWindow:
         self.input_path = QLineEdit()
         self.output_path = QLineEdit()
         self.engine = QComboBox()
-        self.engine.addItems(["auto", "classic", "birefnet"])
+        self.engine.addItems(["auto", "classic", "artwork", "birefnet"])
         self.preset = QComboBox()
         self.preset.addItems(["balanced", "fast", "pro"])
         self.device = QComboBox()

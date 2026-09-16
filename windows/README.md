@@ -6,6 +6,13 @@ Local Windows command launcher. Run it with:
 tk
 ```
 
+The menu groups tools into Files & media, Voice & text, Containers & services,
+System & security, and Help & demos. A description below the list explains the
+highlighted tool. Use Up/Down to move, Enter to open, a tool's number to jump,
+Home/End to reach the first or last tool, and Q/Esc to quit. The list scrolls
+inside its panel when needed, with arrows in the borders; the parrot appears
+alongside it when the terminal is wide enough.
+
 Useful direct commands:
 
 ```cmd
@@ -13,6 +20,8 @@ tk demo
 tk password
 tk linux
 tk cutout INPUT [OUTPUT]
+tk join-pdfs
+tk join-pdfs "C:\Work\documents" -Recursive
 tk transcription
 tk enchanted-transcription
 tk enhanced-typing
@@ -41,7 +50,9 @@ tk storage stop
 
 `tk password` opens the password manager. It only generates local passwords using Windows/.NET cryptographic randomness and does not save generated passwords. Choose Generate password, enter the length, then select the complexity.
 
-`tk linux` builds and opens the `tukevejtso` Debian utility container. The container is based on `debian:latest`, keeps the repo mounted at `/workspace/tukevejtso`, mounts the cutout Python runtime volume at `/opt/tukevejtso-venvs`, and starts in `/workspace/tukevejtso/linux`. When Docker GPU support is available, newly created containers are created with `--gpus all`; use `tk linux -RecreateForGpu` to replace an older CPU-only container with a GPU-enabled one.
+`tk join-pdfs` opens the Windows folder picker, then the terminal PDF joiner. Choose a folder, browse its PDFs in a folder tree, select files, arrange their order, and review the result before merging. Subfolders are included by default. The previous folder is the picker's starting view; confirming that folder restores its selection. See [PDF joiner](#pdf-joiner) below for controls and setup.
+
+`tk linux` opens the directly managed `tukevejtso` Debian utility container. It uses the already-local `debian:latest` image and the repository's dependency-only `setup.sh`; there is no project Dockerfile or Compose file. The repo is mounted at `/workspace/tukevejtso`, while the existing `tukevejtso-cutout-venvs` volume is reattached without copying at `/opt/tukevejtso-venvs`. Normal startup reuses stopped containers, refuses missing or mismatched persistent state, and never replaces a container automatically. Newly created containers receive GPU access when read-only host and Docker runtime checks find NVIDIA support.
 
 `tk cutout INPUT [OUTPUT]` removes image backgrounds with the Linux cutout engine and writes transparent PNG files. `INPUT` is a Windows folder, and `OUTPUT` defaults to a sibling folder named `<input> - transparent`. Good defaults are BiRefNet, `device=auto` so CUDA is used when the container and PyTorch support it, 1024px model input, alpha floor 24, and alpha ceiling 250. Add `-CleanOutput` to delete the output folder before writing, and `-SaveExtras` only when you want alpha/mask/diagnostic sidecars. Temporary staging under `linux\workspaces\images\cutout-stage` is cleaned automatically after successful copyback. See `..\CUTOUT.md` for usage and deprecated legacy background-removal commands.
 
@@ -55,7 +66,68 @@ The reboot guard keeps Windows Update enabled, but blocks automatic Windows Upda
 
 `tk caatuu` opens a startup menu for the Caatuu workspace at `C:\Work\caatuu`. It can start the local server alone, start it with the shared Cloudflare tunnel, show container and endpoint status, verify the local and active public endpoints, or stop Caatuu while preserving the tunnel used by Minerals. Stopping the shared tunnel is a separate, explicitly warned action. Startup is idempotent, Docker Desktop is started automatically when needed, and each start waits for both container health and the corresponding HTTP endpoint before reporting success. Starting Caatuu also exposes its explicitly versioned Android sideload channel so installed debug-signed builds can check and download updates.
 
-`tk storage` opens a control menu for `C:\Work\storage-and-sharing-services`. It can start or rebuild the Docker service, show its container and HTTP health, print the current local and LAN URLs, or stop it. Starting launches Docker Desktop when needed and waits until the service is ready. The service keeps `restart: "no"`, so it does not start automatically with the computer.
+`tk storage` opens a control menu for `C:\Work\storage-and-sharing-services`. It directly manages one `debian:latest` container and runs the repository's dependency-only `setup.sh` when that environment starts; no Dockerfile or Compose file is used. Normal start reuses a stopped container, while explicit rebuild replaces only that named container and preserves the host sharing folders. Status and stop never launch Docker Desktop or delete anything. The service has no automatic restart policy.
+
+## PDF joiner
+
+Open **PDF / Join files** in the `tk` menu, or run:
+
+```cmd
+tk join-pdfs
+tk join-pdfs "C:\Work\documents" -Recursive
+tk join-pdfs -Help
+```
+
+`pdf-join` and `merge-pdfs` are aliases. An explicit folder argument selects that folder and skips the Windows picker. Subfolder scanning starts enabled for new settings and is enabled once when upgrading older settings. Press **R** to switch to the selected folder only; that preference is remembered. `-Recursive` explicitly enables subfolder scanning; when omitted, the saved recursion setting is used.
+
+The joined PDF is always saved directly in the folder selected for searching, including when its inputs come from subfolders. Its filename uses the first PDF's full name without `.pdf`, followed by the first word of each remaining PDF in merge order, separated by ` - `. Spaces, underscores, and hyphens separate words. For example, `Application form.pdf`, `nested\Passport copy.PDF`, and `Bank_statement.pdf` produce `Application form - Passport - Bank.pdf` in the search folder. The output name updates when you select, deselect, or reorder files. Existing files and source PDFs are never overwritten: a collision adds ` (2)`, ` (3)`, and so on before `.pdf`. If the resulting full path exceeds 240 characters, the tool reports an error so you can shorten the source filenames or adjust the selection.
+
+After a successful merge, the tool shows the saved PDF path and **Press any key to close**. A keypress exits the PDF joiner without reopening the selection list; your folder and selections remain saved for the next launch.
+
+Without a folder argument, the Windows folder picker opens on every launch. The last folder is only its initial view: press **Select folder** to confirm it or choose another folder. No Documents or working folder is assumed. Cancelling at startup exits without scanning files or changing saved settings. In the PDF list, press **F** to reopen the Windows picker or **P** to paste or type a folder path.
+
+The browse view shows a PDF-only folder tree with indentation and branch lines, inside a bordered area with a dark gray background. Folder headings provide context and cannot be selected; navigation moves between PDFs. The list scrolls as the highlight reaches its top or bottom edge. **↑ More above** and **↓ More below** appear in the panel borders when more rows are available in that direction. Filtering keeps the matching PDFs' ancestor folders visible. **Tab** switches to a flat list showing the exact merge order, and the review screen uses that same order. Use these controls:
+
+| Key | Action |
+| --- | --- |
+| Up / Down | Move one PDF at a time, scrolling at the list edges and skipping folder headings |
+| Page Up / Page Down | Same as Up / Down |
+| Home / End | Move to the first / last PDF |
+| F / P | Open the Windows folder picker / paste a folder path |
+| R | Toggle between all subfolders and the selected folder only |
+| / | Filter filenames |
+| Space | Select or deselect the highlighted PDF |
+| A / N | Select all visible files / clear visible selections |
+| Tab | Switch between the folder tree and flat selected merge order |
+| + / - | Move the highlighted selected PDF later / earlier |
+| F5 | Refresh the folder contents |
+| Enter | Review the selected files, then merge |
+| Q / Esc | Go back or exit |
+
+The last folder, recursion setting, selected files, merge order, and most recent result are stored in `%LOCALAPPDATA%\tukevejtso\pdf-join.json` using settings version 2. Older settings migrate once to include subfolders while preserving the chosen folder, selections, and merge order; later changes to the recursion preference are retained. Only the most recent folder is remembered. Confirming the same folder preserves its selection and order; choosing another folder clears the selection. The output name is derived from the current selection, and a destination saved by an older version is ignored. Filtering the list does not remove selected files hidden by the filter. Review the selected-order view before merging.
+
+The merger runs locally using Python 3.10 or newer and `pypdf` 6.x. It discovers a suitable Python on `PATH`, then checks the Codex bundled runtime when available. To choose a specific executable, set `TUKEVEJTSO_PDF_PYTHON` to its full path. If no suitable runtime is available, install the dependency into your own Python:
+
+```cmd
+py -m pip install "pypdf>=6,<7"
+```
+
+The tool does not download dependencies or launch Docker. Encrypted PDFs must be saved as unprotected copies before merging. A failed merge reports the problem without publishing a partial result.
+
+For a scan-only diagnostic that prints JSON without opening the interface, saving settings, or merging files, pass `-NoMenu`. Specify a folder explicitly or use the previously confirmed folder; if neither is available, the command reports an error:
+
+```cmd
+tk join-pdfs "C:\Work\documents" -Recursive -NoMenu
+```
+
+To check the workflow, use a small disposable folder containing two PDFs and a nested folder with another PDF. Choose it in the Windows picker, toggle recursion, select and reorder the files, merge, and inspect the output page order. Relaunch, confirm the remembered folder, and check the selection. Cancel a launch to check that settings remain unchanged. Repeat with an existing output name to check that it remains unchanged.
+
+Automated checks from the repository root:
+
+```powershell
+py -m unittest discover -s windows/tools/tests -p test_pdf_join.py
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/tools/tests/test_join_pdfs.ps1
+```
 
 ## Layout
 

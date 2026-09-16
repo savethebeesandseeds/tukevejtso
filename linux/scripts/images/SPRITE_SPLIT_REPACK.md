@@ -93,6 +93,40 @@ Macaw loading-animation sheets, `3 x 3`:
 On Windows outside the container, use the same paths with `C:\Work\...` and run
 the Python script directly if needed.
 
+## Intentionally Empty Cells
+
+Declare known empty positions with `--empty-slots`, using unique 1-based,
+row-major slot numbers. The declaration applies to every input sheet. A
+three-column, two-row sheet with five frames and a blank bottom-right cell uses
+`--rows 2 --cols 3 --empty-slots 6`:
+
+```bash
+./scripts/images/image_tool.sh sprite-split \
+  INPUT_ORIGINALS_DIR \
+  OUTPUT_SPLIT_DIR \
+  --rows 2 \
+  --cols 3 \
+  --empty-slots 6 \
+  --prefix macaw-walk \
+  --padding 32 \
+  --tile-padding 72 \
+  --repack-dir OUTPUT_REPACKED_DIR \
+  --preview-dir OUTPUT_PREVIEW_DIR \
+  --manifest OUTPUT_MANIFEST.json
+```
+
+The splitter still checks that every undeclared slot contains foreground and
+every declared empty slot is empty. Unexpected foreground is preserved in the
+outputs and reported as a warning; it is never silently discarded. Repacked
+sheets retain empty cells in their original positions. Omitting
+`--empty-slots` retains the full-grid expectation.
+
+The manifest records `declared_empty_slots` and `expected_count` for the whole
+input batch. Five sheets with this layout should produce exactly 25 sprites,
+matching `expected_count`, with an empty `warnings` list. A matching count alone
+does not prove success: a missing required slot and unexpected foreground in a
+declared empty slot can cancel out numerically, so always check `warnings`.
+
 ## Outputs
 
 - `split/`: final individual transparent PNGs.
@@ -113,7 +147,8 @@ Always inspect preview outputs before using the generated sprites:
 - Build or inspect `_repacked_contact_sheet.jpg` when there are many sheets.
 - Look for detached details assigned to the wrong image: smoke, flags, fumes,
   floating rocks, hanging lamps, tiny plants, or loose props.
-- Confirm the manifest count equals `sheet_count * rows * cols`.
+- Confirm the manifest count equals `expected_count`, which is
+  `sheet_count * (rows * cols - declared_empty_slot_count)`.
 - Confirm `warnings` is empty in the manifest.
 - Spot-check individual sprites from crowded areas.
 
@@ -125,6 +160,8 @@ padding can hide the issue while still assigning ownership incorrectly.
 
 - `--rows` / `--cols`: required. They describe the rough sheet layout, not a
   direct crop grid.
+- `--empty-slots`: optional unique 1-based row-major positions that must remain
+  empty on every sheet; all other positions are still required.
 - `--padding`: extra transparent space around each cropped sprite.
 - `--tile-padding`: extra gutter used when writing repacked sheets.
 - `--mask-mode auto`: recommended default. It uses existing alpha when present,

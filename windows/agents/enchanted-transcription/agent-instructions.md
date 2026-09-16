@@ -41,7 +41,7 @@
       "render": "list",
       "empty": "none",
       "title_color": "#ff7424",
-      "value_color": "#ff9d65",
+      "value_color": "#fe8d4c",
       "schema": {
         "type": "array",
         "maxItems": 5,

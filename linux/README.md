@@ -19,8 +19,8 @@ linux/
 
 - [Image Scripts](scripts/images/README.md): ImageMagick, GIF, palette,
   transparency, PDF helpers, and learned background removal.
-- [Docker Runtime](docker/README.md): `debian:latest` utility container named
-  `tukevejtso`.
+- [Docker Runtime](docker/README.md): direct `debian:latest` utility container
+  named `tukevejtso`, reproduced by the repository-root `setup.sh`.
 
 ## Adding More Utilities
 

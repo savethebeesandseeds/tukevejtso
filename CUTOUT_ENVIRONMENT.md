@@ -1,11 +1,12 @@
 # Cutout Environment Recovery
 
-This note rebuilds the image cutout environment used by `tk cutout` and
-`linux/scripts/images/image_tool.sh cutout`.
+This note recovers the image cutout environment used by `tk cutout` and
+`linux/scripts/images/image_tool.sh cutout` without replacing its persistent
+Python environment or model cache.
 
-## What Gets Created
+## What Gets Reused
 
-- Docker image: `tukevejtso:debian-latest`
+- Base image: the already-local `debian:latest`
 - Docker container: `tukevejtso`
 - Persistent cutout volume: `tukevejtso-cutout-venvs`
 - Cutout Python environment inside the container:
@@ -13,17 +14,30 @@ This note rebuilds the image cutout environment used by `tk cutout` and
 - Hugging Face model cache:
   `/opt/tukevejtso-venvs/huggingface`
 
-The Windows helper recreates the container with `--gpus all` when Docker can
-see the GPU. The cutout CLI defaults to `--device auto`, so BiRefNet uses CUDA
-when `torch.cuda.is_available()` is true and falls back to CPU otherwise.
+The container uses the repository-root dependency-only `setup.sh`; there is no
+project Dockerfile or Compose file. The Windows helper uses read-only host and
+Docker runtime checks before giving a newly created container `--gpus all`.
+The cutout CLI defaults to `--device auto`, so BiRefNet uses CUDA when
+`torch.cuda.is_available()` is true and falls back to CPU otherwise.
 
-## Recreate The Container
+## Recover The Container Safely
 
-From the repository root on Windows:
+First confirm that the existing volume is present. The launcher intentionally
+refuses to create an empty replacement under the same name:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\tools\docker-tukevejtso-shell.ps1 -RecreateForGpu -NoShell
+docker volume inspect tukevejtso-cutout-venvs
 ```
+
+Then create or start only the `tukevejtso` container:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\tools\docker-tukevejtso-shell.ps1 -NoShell
+```
+
+The launcher reattaches `tukevejtso-cutout-venvs` at
+`/opt/tukevejtso-venvs` with volume copying disabled. It never removes,
+reinitializes, or downloads over that volume during normal recovery.
 
 Verify Docker can see the GPU:
 
@@ -35,34 +49,19 @@ docker inspect tukevejtso --format "{{json .HostConfig.DeviceRequests}}"
 If GPU passthrough is working, `nvidia-smi` should list the NVIDIA GPU and the
 inspect command should include a `gpu` device request.
 
-## Bootstrap The Cutout Venv
+## Existing Cutout Venv
 
-Install the CUDA-enabled PyTorch stack, model dependencies, and GUI runtime:
-
-```powershell
-docker exec -w /workspace/tukevejtso/linux tukevejtso ./scripts/images/bootstrap_cutout_env.sh --ml-cuda --gui
-```
-
-The first CUDA install is large and can take a while. The bootstrap script uses
-longer pip network timeouts by default. If the network is weak, raise them:
+Verify the preserved environment before considering any installation:
 
 ```powershell
-docker exec -w /workspace/tukevejtso/linux `
-  -e TUK_CUTOUT_PIP_TIMEOUT=300 `
-  -e TUK_CUTOUT_PIP_RETRIES=60 `
-  tukevejtso ./scripts/images/bootstrap_cutout_env.sh --ml-cuda --gui
+docker exec tukevejtso test -x /opt/tukevejtso-venvs/cutout/bin/python
+docker exec -w /workspace/tukevejtso/linux tukevejtso ./scripts/images/image_tool.sh cutout doctor
 ```
 
-The CUDA wheel defaults are:
-
-```text
-TUK_CUTOUT_TORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu128
-TUK_CUTOUT_TORCH_CUDA_SPEC=torch==2.11.0+cu128
-TUK_CUTOUT_TORCHVISION_CUDA_SPEC=torchvision==0.26.0+cu128
-```
-
-Override those environment variables only when the CUDA wheel set needs to be
-changed.
+Do not run `bootstrap_cutout_env.sh --recreate` during container recovery. If
+the preserved environment is missing or incompatible, stop and obtain explicit
+approval before reinstalling PyTorch, GUI packages, or model data; those
+downloads are large and are separate from the base-container setup.
 
 ## Verify CUDA
 
@@ -98,20 +97,13 @@ Outputs are transparent PNGs by default. Temporary staging is cleaned
 automatically unless `-KeepStage` is used with
 `windows/tools/cutout-backgrounds.ps1`.
 
-## Full Reset
+## Protected Recovery Rules
 
-Use this only when the cutout venv or cache is corrupt:
-
-```powershell
-docker rm -f tukevejtso
-docker volume rm tukevejtso-cutout-venvs
-powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\tools\docker-tukevejtso-shell.ps1 -RecreateForGpu -NoShell
-docker exec -w /workspace/tukevejtso/linux tukevejtso ./scripts/images/bootstrap_cutout_env.sh --ml-cuda --gui
-```
-
-For a CPU-only rebuild:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\tools\docker-tukevejtso-shell.ps1 -CpuOnly -Recreate -NoShell
-docker exec -w /workspace/tukevejtso/linux tukevejtso ./scripts/images/bootstrap_cutout_env.sh --ml --gui
-```
+- A missing or mismatched volume is a stopping condition, not permission to
+  create an empty replacement.
+- Normal startup reuses an existing container, including a stopped one.
+- A same-named unmanaged container is preserved and reported.
+- Explicit recreation may replace only the inspected, managed `tukevejtso`
+  container by immutable ID. It never removes the volume or host repository.
+- Volume deletion and cutout-environment recreation are separate destructive
+  operations and require an itemized plan plus explicit approval.

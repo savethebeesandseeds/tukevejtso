@@ -45,7 +45,7 @@ Useful flags:
 -SaveExtras            Save alpha, mask, diagnostics, and preview sidecars.
 -KeepStage             Keep temporary staged files for debugging.
 -Device auto|cuda|cpu  Defaults to auto.
--Engine birefnet|auto|classic
+-Engine birefnet|auto|classic|artwork
 ```
 
 Good defaults are already set:
@@ -58,12 +58,31 @@ alpha-floor=24
 alpha-ceiling=250
 ```
 
+## Paper-Backed Artwork
+
+BiRefNet is designed to segment whole subjects. For engravings, diagrams, and
+scans where the paper must also disappear from enclosed holes, use the local
+`artwork` engine:
+
+```bash
+./scripts/images/image_tool.sh cutout image input.png output.png \
+  --engine artwork \
+  --background-model flat \
+  --matte-low 1.25 \
+  --matte-high 5.0
+```
+
+The artwork engine estimates the paper, keeps faint marks through two-threshold
+connectivity, removes small paper-grain components, and unmattes partial-alpha
+edge colors. Choose `quadratic` for a smooth paper vignette and use
+`--edge-guard N` only when the outer N pixels are known to contain no artwork.
+
 ## Linux Container Use
 
 Open or prepare the container:
 
 ```powershell
-tk linux -RecreateForGpu -NoShell
+tk linux -NoShell
 ```
 
 Run a single image from inside `linux/`:

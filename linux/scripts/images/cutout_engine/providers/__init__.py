@@ -14,6 +14,13 @@ class ModelInfo:
 
 MODEL_INFOS = [
     ModelInfo(
+        key="artwork",
+        label="Artwork color-to-alpha matte",
+        license="Repo-local",
+        role="Paper-backed line art, engravings, scans, and diagrams",
+        notes="Fits a flat or quadratic background, removes enclosed paper, and unmattes edge colors.",
+    ),
+    ModelInfo(
         key="classic",
         label="Classic border flood-fill",
         license="Repo-local",

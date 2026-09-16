@@ -190,9 +190,6 @@ $prepareArgs = @(
     "-File", (Join-Path $PSScriptRoot "docker-tukevejtso-shell.ps1"),
     "-NoShell"
 )
-if ($Device -ne "cpu") {
-    $prepareArgs += "-RecreateForGpu"
-}
 & powershell.exe @prepareArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Could not prepare the tukevejtso Linux container."
