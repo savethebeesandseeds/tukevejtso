@@ -126,6 +126,7 @@ function Get-MenuFrame {
 
 $items = @(
     @{ Group = 'Files & media'; Label = 'Join PDFs'; Detail = 'Select, order, and combine PDFs from a folder.'; ExitCode = 29 },
+    @{ Group = 'Files & media'; Label = 'Compress PDF'; Detail = 'Tune PDF quality and size; save a copy or replace the original.'; ExitCode = 30 },
     @{ Group = 'Files & media'; Label = 'Remove image backgrounds'; Detail = 'Turn image backgrounds into transparent PNGs.'; ExitCode = 28 },
     @{ Group = 'Voice & text'; Label = 'Live transcription'; Detail = 'Transcribe microphone or system audio with optional AI insights.'; ExitCode = 23 },
     @{ Group = 'Voice & text'; Label = 'Enhanced typing'; Detail = 'Dictate and refine text, then copy or type it into an app.'; ExitCode = 26 },

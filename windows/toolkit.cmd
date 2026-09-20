@@ -20,6 +20,7 @@ if "%TOOLKIT_CHOICE%"=="26" goto enhanced_typing
 if "%TOOLKIT_CHOICE%"=="27" goto tukevejtso_linux
 if "%TOOLKIT_CHOICE%"=="28" goto cutout_backgrounds
 if "%TOOLKIT_CHOICE%"=="29" goto pdf_join
+if "%TOOLKIT_CHOICE%"=="30" goto pdf_compress
 
 goto done
 
@@ -33,6 +34,9 @@ if /I "%~1"=="debian" goto tukevejtso_linux
 if /I "%~1"=="cutout" goto cutout_backgrounds
 if /I "%~1"=="backgrounds" goto cutout_backgrounds
 if /I "%~1"=="remove-backgrounds" goto cutout_backgrounds
+if /I "%~1"=="compress-pdf" goto pdf_compress
+if /I "%~1"=="pdf-compress" goto pdf_compress
+if /I "%~1"=="shrink-pdf" goto pdf_compress
 if /I "%~1"=="join-pdfs" goto pdf_join
 if /I "%~1"=="pdf-join" goto pdf_join
 if /I "%~1"=="merge-pdfs" goto pdf_join
@@ -80,6 +84,8 @@ echo   tk                         Open the interactive menu
 echo   tk password                Generate passwords with length/complexity options
 echo   tk linux                   Prepare/open the tukevejtso Debian utility container
 echo   tk cutout INPUT [OUTPUT]   Remove image backgrounds into transparent PNGs
+echo   tk compress-pdf [PDF]      Compress PDFs with quality and save options
+echo   tk compress-pdf -Help      Show compression presets and options
 echo   tk join-pdfs [FOLDER]       Select, order, and join PDFs in a terminal browser
 echo   tk join-pdfs -Help          Show PDF joiner options and keyboard controls
 echo   tk robotics-learning       Open the robotics-learning dev container
@@ -179,6 +185,25 @@ if "%TOOLKIT_FROM_MENU%"=="1" goto pdf_join_return
 endlocal & exit /b %PDF_JOIN_EXIT%
 :pdf_join_return
 if not "%PDF_JOIN_EXIT%"=="0" pause
+set "TOOLKIT_CHOICE="
+goto menu
+
+:pdf_compress
+set "PDF_COMPRESS_ARGS="
+if "%TOOLKIT_FROM_MENU%"=="1" goto pdf_compress_run
+shift /1
+:pdf_compress_args
+if "%~1"=="" goto pdf_compress_run
+set PDF_COMPRESS_ARGS=%PDF_COMPRESS_ARGS% "%~1"
+shift /1
+goto pdf_compress_args
+:pdf_compress_run
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "%ROOT%tools\compress-pdf.ps1" %PDF_COMPRESS_ARGS%
+set "PDF_COMPRESS_EXIT=%ERRORLEVEL%"
+if "%TOOLKIT_FROM_MENU%"=="1" goto pdf_compress_return
+endlocal & exit /b %PDF_COMPRESS_EXIT%
+:pdf_compress_return
+if not "%PDF_COMPRESS_EXIT%"=="0" pause
 set "TOOLKIT_CHOICE="
 goto menu
 

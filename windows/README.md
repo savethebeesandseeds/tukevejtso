@@ -22,6 +22,8 @@ tk linux
 tk cutout INPUT [OUTPUT]
 tk join-pdfs
 tk join-pdfs "C:\Work\documents" -Recursive
+tk compress-pdf
+tk compress-pdf "C:\Work\documents\report.pdf" -Preset Balanced
 tk transcription
 tk enchanted-transcription
 tk enhanced-typing
@@ -67,6 +69,75 @@ The reboot guard keeps Windows Update enabled, but blocks automatic Windows Upda
 `tk caatuu` opens a startup menu for the Caatuu workspace at `C:\Work\caatuu`. It can start the local server alone, start it with the shared Cloudflare tunnel, show container and endpoint status, verify the local and active public endpoints, or stop Caatuu while preserving the tunnel used by Minerals. Stopping the shared tunnel is a separate, explicitly warned action. Startup is idempotent, Docker Desktop is started automatically when needed, and each start waits for both container health and the corresponding HTTP endpoint before reporting success. Starting Caatuu also exposes its explicitly versioned Android sideload channel so installed debug-signed builds can check and download updates.
 
 `tk storage` opens a control menu for `C:\Work\storage-and-sharing-services`. It directly manages one `debian:latest` container and runs the repository's dependency-only `setup.sh` when that environment starts; no Dockerfile or Compose file is used. Normal start reuses a stopped container, while explicit rebuild replaces only that named container and preserves the host sharing folders. Status and stop never launch Docker Desktop or delete anything. The service has no automatic restart policy.
+
+## PDF compression
+
+Open **Files & media / Compress PDF** in `tk`, or run `tk compress-pdf`. Choose a PDF in the Windows picker to open the settings editor. It shows the file size, page count, compression controls, save mode, and destination together. Settings apply to the current session.
+
+```cmd
+tk compress-pdf
+tk compress-pdf "C:\Work\documents\report.pdf" -Menu
+tk compress-pdf "C:\Work\documents\report.pdf"
+tk compress-pdf "C:\Work\documents\report.pdf" -Preset Small
+tk compress-pdf "C:\Work\documents\report.pdf" -Quality 80 -MaxImageDimension 1600
+tk compress-pdf "C:\Work\documents\report.pdf" -Grayscale -RemoveMetadata
+tk compress-pdf "C:\Work\documents\report.pdf" -OverwriteOriginal
+tk compress-pdf "C:\Work\documents\report.pdf" -OverwriteOriginal -NoBackup
+tk compress-pdf "C:\Work\documents\report.pdf" "C:\Work\documents\smaller.pdf" -Json
+tk compress-pdf -Help
+```
+
+`pdf-compress` and `shrink-pdf` are aliases. An explicit PDF runs immediately with the supplied options; add `-Menu` to edit them interactively first. Relative and Unicode paths are supported. `-Json` requires a PDF and cannot be combined with `-Menu`.
+
+### Compression settings
+
+| Preset | Image quality | Maximum image edge |
+| --- | --- | --- |
+| Balanced (default) | JPEG 88 | Original resolution |
+| HighQuality | JPEG 95 | Original resolution |
+| Small | JPEG 65 | 1600 pixels |
+| Lossless | Image pixels unchanged | Original resolution |
+| Custom | Adjustable from 20 to 95 | Original, or 128 to 10000 pixels |
+
+Adjust image quality or resolution to switch to Custom. Resizing preserves proportions, never enlarges images, and resizes transparency masks with their images. `-MaxImageDimension 0` keeps original resolution. `-Grayscale` affects supported raster images only: vector text and graphics keep their colors. `-RemoveMetadata` removes document properties and document-level XMP; it does not remove visible text or attachments. Lossless can remove metadata, but cannot be combined with image quality, resizing, or grayscale changes.
+
+All presets compress page streams and remove duplicate/unreferenced PDF objects. Pages, selectable text, bookmarks, links, forms, and attachments remain. Tiny icons, inline images, custom color spaces, color-key masks, and unsupported image encodings are kept unchanged. Scanned text is part of raster images and can lose detail with lower quality or resolution. Use Lossless when every image pixel matters.
+
+### Saving
+
+**New copy is the default:** `report.pdf` becomes `report - compressed.pdf` beside the source. Existing filenames add ` (2)`, ` (3)`, and so on. **D / Save as** chooses a custom new filename or folder. Existing files cannot be selected through Save as.
+
+Switch **Save mode** to **Overwrite original** to save at the input path. The screen clearly shows `REPLACE`, the destination filename, and whether a backup will be kept. Press **C**, or Enter on **COMPRESS & SAVE**, to compress and save with the displayed choices. No separate confirmation dialog is needed. Overwrite keeps a byte-for-byte backup as `report - original.pdf` by default, with numbered suffixes for collisions. Toggle **Original backup** off, or pass `-NoBackup` with `-OverwriteOriginal`, to replace without that backup.
+
+The engine writes a temporary PDF in the destination directory, reopens it to verify page content, navigation, and form values, and publishes it only if it is smaller. Overwrite also checks that the original file has not changed during compression before replacing it. A failed replacement preserves the original; a completed backup is retained and its path is included in the error. If there is no size reduction, no copy, backup, or replacement is made. Digitally signed and encrypted PDFs require unsigned/unprotected copies.
+
+### Terminal controls
+
+| Key | Action |
+| --- | --- |
+| Up / Down, Home / End | Select a setting or the Compress & Save action |
+| Left / Right, Space | Change a preset, value, or toggle |
+| Enter | Edit quality/resolution numerically, toggle a setting, or start the selected save action |
+| C | Compress and save with the displayed settings and destination |
+| F / P | Choose another PDF / paste a path |
+| D | Choose a custom new output filename and folder |
+| R | Reset to Balanced and saving a new copy |
+| Q / Esc | Close without starting compression |
+
+The settings list scrolls in smaller terminals. Selecting another PDF keeps compression choices but resets the save mode to New copy. After compression, the result screen shows sizes, reduction, image changes, output path, and any backup; use **O** to open the saved PDF, **T** to tweak settings, **F** for another file, or Enter/Q/Esc to close. A failed compression returns to the editor with its error. Sizes use binary KB/MB units.
+
+Compression runs locally with Python 3.10+, `pypdf` 6.x, and Pillow. Python discovery and `TUKEVEJTSO_PDF_PYTHON` work the same way as the PDF joiner. Nothing is uploaded, dependencies are not installed automatically, and Docker is not used. If dependencies are missing:
+
+```cmd
+py -m pip install "pypdf>=6,<7" Pillow
+```
+
+Run the automated checks from the repository root:
+
+```powershell
+py -m unittest discover -s windows/tools/tests -p test_pdf_compress.py
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/tools/tests/test_compress_pdf.ps1
+```
 
 ## PDF joiner
 
@@ -139,6 +210,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/tools/tests/test
 - `models\whisper` contains the shared local Whisper model cache used by both agents.
 - `tools/*.ps1` contains the real utilities.
 - `tools/ui.ps1` contains shared terminal rendering helpers.
+- `tools/pdf-runtime.ps1` shares Python discovery and JSON transport between the PDF tools.
 
 ## Interface Primitives
 

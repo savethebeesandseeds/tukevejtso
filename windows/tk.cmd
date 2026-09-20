@@ -3,4 +3,4 @@ setlocal
 
 call "%~dp0toolkit.cmd" %*
 
-endlocal
+endlocal & exit /b %ERRORLEVEL%
