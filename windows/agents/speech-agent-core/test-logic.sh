@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Linux" || ! -f /.dockerenv ]]; then
+  echo "Run test-logic.sh inside the managed Linux container." >&2
+  exit 1
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if ! command -v rustc >/dev/null 2>&1; then
-  echo "Rust is missing. Run the approved dependency setup inside the managed container." >&2
+  echo "Rust is missing. Run setup-tests.sh inside the managed container." >&2
   exit 1
 fi
 

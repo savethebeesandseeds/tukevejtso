@@ -18,11 +18,17 @@ Product-specific API entrypoints live in `transcription::run_app` and `typing::r
 
 ## Portable logic tests
 
-Run the regression suite inside the managed `tukevejtso` container:
+Install the test dependencies and run the regression suite inside the managed
+`tukevejtso` container:
 
 ```bash
+bash /workspace/tukevejtso/windows/agents/speech-agent-core/setup-tests.sh
 bash /workspace/tukevejtso/windows/agents/speech-agent-core/test-logic.sh
 ```
+
+`setup-tests.sh` installs Debian's `rustc`, `gcc`, and `libc6-dev` packages with
+recommended packages disabled. It only configures dependencies inside the
+existing container; the root setup and launcher fingerprint remain unchanged.
 
 The suite compiles the same platform-independent module used by both agents,
 using only the container's Rust compiler and standard library. It covers final
