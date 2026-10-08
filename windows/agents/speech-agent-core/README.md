@@ -6,7 +6,7 @@ This crate owns the runtime shared by Enchanted Transcription and Enhanced Typin
 - rolling local Whisper inference and transcript reconciliation
 - OpenAI Responses API transport, optional reference-document grounding, and usage accounting
 - terminal/Win32 lifecycle management
-- protected restart continuity and API pause/exit safeguards
+- protected restart continuity, session response history, and API pause/exit safeguards
 - shared rendering and settings primitives
 
 The product packages are deliberately thin entrypoints:
@@ -15,6 +15,10 @@ The product packages are deliberately thin entrypoints:
 - `enhanced-typing` selects the typing product, focus/hotkey behavior, draft flushing, clipboard/type output, and refiner settings.
 
 Product-specific API entrypoints live in `transcription::run_app` and `typing::run_app`. Shared behavior is changed here once rather than copied between both binaries.
+
+Enchanted Transcription keeps complete successful Agent Insights responses in session memory. Up/Down browse older/newer responses on its main screen and pin the selected response while new responses arrive; End restores live following. The pane shows the selected position and the count of newer responses. F5 clears history. Settings and dialog navigation retain their existing controls.
+
+Automatic settings restarts preserve history and its selection in the handoff protected with Windows DPAPI. Changes to answer mode, the selected reference file, or context strictness, and disabling microphone sharing clear history. Independent launches begin with no history.
 
 ## Portable logic tests
 
@@ -30,9 +34,11 @@ bash /workspace/tukevejtso/windows/agents/speech-agent-core/test-logic.sh
 recommended packages disabled. It only configures dependencies inside the
 existing container; the root setup and launcher fingerprint remain unchanged.
 
-The suite compiles the same platform-independent module used by both agents,
-using only the container's Rust compiler and standard library. It covers final
-audio decoding, the F5 audio cutoff, transcript reconciliation, short replies,
-and forced-update consolidation. Test binaries live in a temporary container
-directory and are removed afterward. Native audio, Whisper inference, and Win32
-window behavior require separate runtime validation.
+The suite compiles `speech_logic.rs` and `response_history.rs`, the same
+platform-independent modules used by the agents, using only the container's
+Rust compiler and standard library. It covers final audio decoding, the F5 audio
+cutoff, transcript reconciliation, short replies, forced-update consolidation,
+and response history navigation, pinned selection, and live following. Test
+binaries live in a temporary container directory and are removed afterward.
+Native audio, Whisper inference, and Win32 window behavior require separate
+runtime validation.

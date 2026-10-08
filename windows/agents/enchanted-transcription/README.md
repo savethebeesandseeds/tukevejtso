@@ -28,11 +28,13 @@ The key is encrypted with Windows DPAPI for the current user and stored under `%
 | Key | Action |
 | --- | --- |
 | F1 | Request an immediate Agent Insights update. When the token budget is paused, reopen its continuation prompt. |
-| F5 | Clear the current transcript and Agent Insights state. Lifetime request and token counters remain visible. |
+| F5 | Clear the current transcript, Agent Insights state, and response history. Lifetime request and token counters remain visible. |
 | F9 | Open persistent settings, details, choices, status, warnings, and recent errors. |
+| Up / Down | Browse older / newer Agent Insights responses from the main screen. |
+| End | Return Agent Insights to following the latest response. |
 | Q, Esc, or Ctrl+C | Exit from the main screen. |
 
-Inside F9, use Up/Down to select a setting and Left/Right to change it. F9 or Esc closes the settings list; if values changed, choose Apply or Discard. Page Up, Page Down, Home, and End scroll long settings and diagnostics views.
+Inside F9, use Up/Down to select a setting and Left/Right to change it. F9 or Esc closes the settings list; if values changed, choose Apply or Discard. Page Up, Page Down, Home, and End scroll long settings and diagnostics views. History navigation applies only on the main screen; settings and confirmation dialogs keep their existing controls.
 
 ## Transcription and Agent Insights
 
@@ -45,6 +47,12 @@ Both Silhouette and Natural Answer modes also show a bounded list of the main ri
 The built-in Agent model choices are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Terra is the initial default. Saved legacy built-ins migrate by tier—GPT-5.4 nano to Luna, GPT-5.4 mini to Terra, and GPT-5.5 to Sol—while other custom model IDs remain unchanged.
 
 The Responses API requests use `store: false`. System-output transcript text is included when Agent Insights runs. Microphone transcript text remains local unless **Mic context** is enabled in F9.
+
+### Response history
+
+Each successful Agent Insights update is kept as a complete response snapshot for the current session. The pane follows the latest response by default. Press Up to browse older responses or Down to browse newer ones; either arrow leaves live-follow mode. Your selected response stays pinned while new responses arrive, including when you were viewing the newest response. The pane shows your position in the history and the number of newer responses available. Press End to follow the latest response again.
+
+F5 clears response history with the transcript and Agent Insights state. History and your browsing selection survive automatic settings restarts in the launcher-scoped state protected with Windows DPAPI. Changing the answer mode, selected reference file, or context strictness, or turning microphone sharing off clears old responses so content from the previous response contract or sharing choice is removed. Other settings restarts retain history. An independent launch begins with no session history.
 
 ### Spanish transcription
 
@@ -59,7 +67,7 @@ The model list follows the global language setting: English shows the four stand
 - **Silhouette** is the default. It returns a short, content-free spoken-answer frame with `...` blanks for the user's own knowledge.
 - **Natural Answer** returns a concise, directly usable answer to the latest question and states uncertainty instead of inventing missing facts.
 
-Changing the answer mode restarts the agent wiring, clears answer content derived from the previous mode, and requests a fresh update.
+Changing the answer mode restarts the agent wiring, clears answer content and response history derived from the previous mode, and requests a fresh update.
 
 ## Reference context
 
@@ -72,7 +80,7 @@ Place private UTF-8 `.md`, `.txt`, `.json`, or `.csv` files in `contexts`, besid
 
 The selected file is loaded fresh and sent in full with every Agent Insights request. Editing it takes effect on the next request without another restart. Context-file selection is session-only and returns to **None** on every independent launch; F9 worker restarts preserve it within the current session. Context strictness remains persistent. Files are limited to 32 KiB, both to bound API cost and to prevent accidentally selecting a large export. Missing, empty, unreadable, non-UTF-8, symbolic-link, or oversized files stop before the API call and produce an F9 error.
 
-Changing the selected file or strictness clears Agent results derived under the old context and requests a fresh update. Document content is sent as untrusted user data; a higher-priority developer policy tells the model never to treat instructions inside the document as prompt instructions. Private context files are ignored by Git, and only `example.md` is tracked. This is lightweight whole-document grounding, not chunked retrieval or full RAG.
+Changing the selected file or strictness clears Agent results and response history derived under the old context and requests a fresh update. Document content is sent as untrusted user data; a higher-priority developer policy tells the model never to treat instructions inside the document as prompt instructions. Private context files are ignored by Git, and only `example.md` is tracked. This is lightweight whole-document grounding, not chunked retrieval or full RAG.
 
 ## F9 settings
 

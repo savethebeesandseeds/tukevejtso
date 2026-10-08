@@ -1,4 +1,6 @@
+mod response_history;
 mod speech_logic;
+use response_history::ResponseHistory;
 use speech_logic::{
     audio_frame_is_current, coalesce_latest, comparable_word_spans, compare_token,
     is_informative_delta, merge_transcript_estimate, new_text_since, recent_chars,
@@ -969,7 +971,8 @@ fn default_typing_flush_mode() -> TypingFlushMode {
     TypingFlushMode::Clipboard
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AgentFieldConfig {
     key: String,
     title: String,
@@ -982,7 +985,7 @@ struct AgentFieldConfig {
     schema: Value,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum AgentFieldRender {
     Text,
     List,
@@ -1457,6 +1460,12 @@ struct TranscriptionRestartContext {
     agent_result: Value,
     #[serde(default)]
     agent_last_successful_input: Option<AgentInput>,
+    #[serde(default)]
+    agent_field_configs: Vec<AgentFieldConfig>,
+    #[serde(default)]
+    agent_response_history: Vec<RestartAgentResponse>,
+    #[serde(default)]
+    agent_history_selection: Option<usize>,
     errors: Vec<RestartErrorEntry>,
 }
 
@@ -1489,10 +1498,43 @@ struct RestartErrorEntry {
     repeat_count: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RestartAgentResponse {
+    result: Value,
+    age_ms: u64,
+}
+
+struct AgentResponse {
+    result: Value,
+    fields: Vec<AgentFieldState>,
+    received_at: Instant,
+}
+
+impl AgentResponse {
+    fn new(configs: &[AgentFieldConfig], result: Value, received_at: Instant) -> Self {
+        let mut fields = default_agent_fields(configs);
+        // Adapt only the display to the current schema. Retain the original full
+        // suggestion state even if an instruction edit removes a configured field.
+        let (display_result, _) = migrate_agent_result(configs, &result);
+        for field in &mut fields {
+            field.lines =
+                agent_field_value_lines(&field.config, display_result.get(&field.config.key));
+            field.updated_at = Some(received_at);
+        }
+        Self {
+            result,
+            fields,
+            received_at,
+        }
+    }
+}
+
 struct AgentPaneState {
     enabled: bool,
     fields: Vec<AgentFieldState>,
     canonical_result: Value,
+    response_history: ResponseHistory<AgentResponse>,
     last_successful_input: Option<AgentInput>,
     status: String,
     microphone_active: bool,
@@ -1672,6 +1714,7 @@ impl AppState {
                 enabled: config.agent.enabled,
                 fields: default_agent_fields(&config.agent.fields),
                 canonical_result: config.agent.initial_result.clone(),
+                response_history: ResponseHistory::new(),
                 last_successful_input: config.agent.initial_input.clone(),
                 status: if config.agent.enabled {
                     "waiting for system output".to_string()
@@ -1851,6 +1894,11 @@ impl AppState {
         }
         self.transcripts = transcripts;
 
+        if self.agent.fields.is_empty() {
+            let mut configs = context.agent_field_configs.clone();
+            set_answer_field_title(&mut configs, self.transcription_settings.active.answer_mode);
+            self.agent.fields = default_agent_fields(&configs);
+        }
         let agent_field_configs = self
             .agent
             .fields
@@ -1866,6 +1914,19 @@ impl AppState {
         if value_has_content(&restored_result) {
             let _ = self.agent.apply_result(restored_result, true);
         }
+        let responses = context
+            .agent_response_history
+            .iter()
+            .map(|entry| {
+                Ok(AgentResponse::new(
+                    &agent_field_configs,
+                    entry.result.clone(),
+                    restored_instant(entry.age_ms, "Agent response age")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.agent.response_history =
+            ResponseHistory::from_entries(responses, context.agent_history_selection);
         let restored_input = if schema_changed {
             None
         } else {
@@ -1941,6 +2002,23 @@ impl AppState {
                 .collect(),
             agent_result: self.agent.canonical_result.clone(),
             agent_last_successful_input: self.agent.last_successful_input.clone(),
+            agent_field_configs: self
+                .agent
+                .fields
+                .iter()
+                .map(|field| field.config.clone())
+                .collect(),
+            agent_response_history: self
+                .agent
+                .response_history
+                .entries()
+                .iter()
+                .map(|response| RestartAgentResponse {
+                    result: response.result.clone(),
+                    age_ms: duration_millis(response.received_at.elapsed()),
+                })
+                .collect(),
+            agent_history_selection: self.agent.response_history.selected_index(),
             errors: self
                 .errors
                 .iter()
@@ -2032,6 +2110,7 @@ impl AppState {
             .collect::<Vec<_>>();
         self.agent.fields = default_agent_fields(&field_configs);
         self.agent.canonical_result = default_agent_result(&field_configs);
+        self.agent.response_history = ResponseHistory::new();
         self.agent.last_successful_input = None;
         self.agent.status = if self.agent.enabled {
             "refreshed".to_string()
@@ -2260,6 +2339,7 @@ impl AppState {
                 if generation != self.agent_generation {
                     return usage.is_some();
                 }
+                self.agent.append_response(&result);
                 self.agent.canonical_result = result.clone();
                 self.agent.last_successful_input = Some(successful_input);
                 self.agent.apply_result(result, force_hints);
@@ -2501,6 +2581,73 @@ impl TranscriptionRestartSettings {
 }
 
 impl AgentPaneState {
+    fn append_response(&mut self, result: &Value) {
+        let configs = self
+            .fields
+            .iter()
+            .map(|field| field.config.clone())
+            .collect::<Vec<_>>();
+        self.response_history
+            .append(AgentResponse::new(&configs, result.clone(), Instant::now()));
+    }
+
+    fn displayed_fields(&self) -> &[AgentFieldState] {
+        // Live updates retain the configured minimum display time and empty-value
+        // policy. Browsing renders the complete, immutable response from that request.
+        if self.response_history.is_browsing() {
+            if let Some(response) = self.response_history.current() {
+                return &response.fields;
+            }
+        }
+        &self.fields
+    }
+
+    fn header_title(&self) -> String {
+        let total = self.response_history.len();
+        if total == 0 {
+            return "Agent insights".to_string();
+        }
+        let position = self
+            .response_history
+            .selected_index()
+            .map(|index| index + 1)
+            .unwrap_or(total);
+        let newer = self.response_history.unseen_count();
+        if newer > 0 {
+            format!("Agent insights {position}/{total} +{newer} newer")
+        } else if self.response_history.is_browsing() {
+            format!("Agent insights {position}/{total} browsing")
+        } else {
+            format!("Agent insights {position}/{total} live")
+        }
+    }
+
+    fn prepare_restart(
+        &mut self,
+        answer_mode_changed: bool,
+        reference_context_changed: bool,
+        microphone_sharing_disabled: bool,
+    ) {
+        let configs = self
+            .fields
+            .iter()
+            .map(|field| field.config.clone())
+            .collect::<Vec<_>>();
+        prepare_agent_restart_state(
+            &mut self.canonical_result,
+            &mut self.last_successful_input,
+            &configs,
+            answer_mode_changed,
+            reference_context_changed,
+            microphone_sharing_disabled,
+        );
+        if answer_mode_changed || reference_context_changed || microphone_sharing_disabled {
+            self.response_history = ResponseHistory::new();
+            self.fields = default_agent_fields(&configs);
+            self.apply_result(self.canonical_result.clone(), true);
+        }
+    }
+
     fn set_source_activity(&mut self, source: SourceKind, active: bool) -> bool {
         let current = match source {
             SourceKind::Microphone => &mut self.microphone_active,
@@ -2609,7 +2756,7 @@ impl AgentPaneState {
     }
 
     fn has_content(&self) -> bool {
-        self.fields.iter().any(|field| !field.lines.is_empty())
+        self.displayed_fields().iter().any(|field| !field.lines.is_empty())
     }
 }
 
@@ -4152,6 +4299,12 @@ fn build_config(args: CliArgs) -> Result<AppConfig> {
     let mut agent = build_transcription_agent_config(&settings, &sources, &agent_root)?;
     if let Some(restored_state) = restart_state.as_mut() {
         if let Some(restored_context) = restored_state.context.as_ref() {
+            // Disabled agents have no request schema. Retain only the saved display
+            // schema so switching Agent Insights off does not erase session history.
+            if agent.fields.is_empty() {
+                agent.fields = restored_context.agent_field_configs.clone();
+                set_answer_field_title(&mut agent.fields, settings.answer_mode);
+            }
             let (restored_result, schema_changed) =
                 migrate_agent_result(&agent.fields, &restored_context.agent_result);
             agent.initial_result = restored_result;
@@ -4282,6 +4435,15 @@ fn agent_root_from_model_path(model_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn set_answer_field_title(fields: &mut [AgentFieldConfig], answer_mode: TranscriptionAnswerMode) {
+    if let Some(field) = fields
+        .iter_mut()
+        .find(|field| field.key == "answer_guidance")
+    {
+        field.title = answer_mode.display_name().to_string();
+    }
+}
+
 fn build_transcription_agent_config(
     settings: &EnchantedTranscriptionSettings,
     sources: &[SourceKind],
@@ -4314,13 +4476,7 @@ fn build_transcription_agent_config(
     let include_microphone =
         settings.include_microphone && sources.contains(&SourceKind::Microphone);
     let mut agent_context = load_agent_context(agent_root)?;
-    if let Some(answer_field) = agent_context
-        .fields
-        .iter_mut()
-        .find(|field| field.key == "answer_guidance")
-    {
-        answer_field.title = settings.answer_mode.display_name().to_string();
-    }
+    set_answer_field_title(&mut agent_context.fields, settings.answer_mode);
     agent_context
         .instructions
         .push_str("\n\n## Active answer mode\n\n");
@@ -7549,7 +7705,17 @@ fn handle_transcription_key(
     }
 
     if !state.transcription_settings.open {
-        return TypingKeyOutcome::Ignored;
+        let changed = match key.code {
+            KeyCode::Up => state.agent.response_history.older(),
+            KeyCode::Down => state.agent.response_history.newer(),
+            KeyCode::End => state.agent.response_history.resume_live(),
+            _ => return TypingKeyOutcome::Ignored,
+        };
+        return if changed {
+            TypingKeyOutcome::Changed
+        } else {
+            TypingKeyOutcome::Consumed
+        };
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return TypingKeyOutcome::Ignored;
@@ -7672,16 +7838,7 @@ fn apply_transcription_settings(
                 // protected restart snapshot.
                 state.agent_generation = state.agent_generation.wrapping_add(1);
                 state.restart_force_agent_update = refresh_agent_after_restart;
-                let field_configs = state
-                    .agent
-                    .fields
-                    .iter()
-                    .map(|field| field.config.clone())
-                    .collect::<Vec<_>>();
-                prepare_agent_restart_state(
-                    &mut state.agent.canonical_result,
-                    &mut state.agent.last_successful_input,
-                    &field_configs,
+                state.agent.prepare_restart(
                     answer_mode_changed,
                     reference_context_changed,
                     microphone_sharing_disabled,
@@ -9535,7 +9692,7 @@ fn render_agent_header(out: &mut io::Stdout, state: &AppState, width: usize) -> 
         return Ok(());
     }
 
-    let title = "Agent insights";
+    let title = state.agent.header_title();
     let marker = state.agent.marker();
     let title_width = title.chars().count();
     let marker_width = marker
@@ -9543,12 +9700,12 @@ fn render_agent_header(out: &mut io::Stdout, state: &AppState, width: usize) -> 
         .unwrap_or_default();
 
     let Some((marker_text, marker_color)) = marker else {
-        render_segment(out, title, width, Color::DarkGrey)?;
+        render_segment(out, &title, width, Color::DarkGrey)?;
         return Ok(());
     };
 
     if title_width + 1 + marker_width > width {
-        render_segment(out, title, width, Color::DarkGrey)?;
+        render_segment(out, &title, width, Color::DarkGrey)?;
         return Ok(());
     }
 
@@ -9762,7 +9919,10 @@ fn source_transcript_rows(
 }
 
 fn visible_agent_rows(state: &AppState, width: usize, max_lines: usize) -> Vec<StyledLine> {
-    if max_lines == 0 || width == 0 || !state.agent.enabled {
+    if max_lines == 0
+        || width == 0
+        || (!state.agent.enabled && state.agent.response_history.len() == 0)
+    {
         return Vec::new();
     }
 
@@ -9797,7 +9957,7 @@ fn visible_agent_field_rows(state: &AppState, width: usize, max_lines: usize) ->
 
     let active_fields = state
         .agent
-        .fields
+        .displayed_fields()
         .iter()
         .filter(|field| !field.lines.is_empty())
         .collect::<Vec<_>>();
@@ -10049,7 +10209,7 @@ fn scale_rgb(fresh: (u8, u8, u8), intensity: f32) -> Color {
 
 fn build_footer_line(state: &AppState) -> String {
     format!(
-        "F9 settings | F1 update | F5 reset | requests {} | {} | {}",
+        "Up/Down history | End live | F9 settings | F1 update | F5 reset | requests {} | {} | {}",
         state.agent.request_count, state.agent.status, state.status
     )
 }
@@ -11398,6 +11558,191 @@ After.
         assert!(typing_body.get("reasoning").is_none());
     }
 
+    fn test_response_state() -> super::AppState {
+        let mut state = test_typing_state("");
+        state.mode = AppMode::Transcription;
+        state.agent.enabled = true;
+        state.agent.fields = super::default_agent_fields(&[
+            test_agent_field("answer_guidance", super::AgentFieldRender::Text),
+            test_agent_field("main_risks", super::AgentFieldRender::List),
+        ]);
+        state
+    }
+
+    fn accept_test_response(state: &mut super::AppState, answer: &str) {
+        assert!(state.apply(super::UiEvent::AgentOutput {
+            result: json!({ "answer_guidance": answer, "main_risks": [format!("risk: {answer}")] }),
+            successful_input: AgentInput {
+                system_transcript: answer.to_string(),
+                microphone_transcript: None,
+                force: false,
+                generation: state.agent_generation,
+            },
+            usage: None,
+            force_hints: true,
+            elapsed_ms: 100,
+            generation: state.agent_generation,
+        }));
+    }
+
+    fn history_key(state: &mut super::AppState, code: super::KeyCode) -> super::TypingKeyOutcome {
+        super::handle_transcription_key(
+            state,
+            &super::event::KeyEvent::new(code, super::KeyModifiers::NONE),
+            None,
+        )
+    }
+
+    #[test]
+    fn response_history_navigation_keeps_the_latest_api_context() {
+        let mut state = test_response_state();
+        accept_test_response(&mut state, "first");
+        accept_test_response(&mut state, "second");
+        assert_eq!(state.agent.displayed_fields()[0].lines, vec!["second"]);
+        assert!(matches!(
+            history_key(&mut state, super::KeyCode::Up),
+            super::TypingKeyOutcome::Changed
+        ));
+        assert_eq!(state.agent.displayed_fields()[0].lines, vec!["first"]);
+        assert_eq!(
+            state.agent.displayed_fields()[1].lines,
+            vec!["- risk: first"]
+        );
+        accept_test_response(&mut state, "third");
+        assert_eq!(state.agent.response_history.len(), 3);
+        assert_eq!(state.agent.displayed_fields()[0].lines, vec!["first"]);
+        assert_eq!(state.agent.canonical_result["answer_guidance"], "third");
+        assert_eq!(
+            state
+                .agent
+                .last_successful_input
+                .as_ref()
+                .unwrap()
+                .system_transcript,
+            "third"
+        );
+        assert!(state.agent.header_title().contains("1/3 +2 newer"));
+        history_key(&mut state, super::KeyCode::Down);
+        assert_eq!(state.agent.displayed_fields()[0].lines, vec!["second"]);
+        history_key(&mut state, super::KeyCode::End);
+        assert_eq!(state.agent.displayed_fields()[0].lines, vec!["third"]);
+        assert!(!state.agent.response_history.is_browsing());
+    }
+
+    #[test]
+    fn settings_arrows_do_not_move_response_history() {
+        let mut state = test_response_state();
+        accept_test_response(&mut state, "first");
+        accept_test_response(&mut state, "second");
+        history_key(&mut state, super::KeyCode::Up);
+        history_key(&mut state, super::KeyCode::F(9));
+        assert!(state.transcription_settings.open);
+        let selection = state.transcription_settings.selection;
+        history_key(&mut state, super::KeyCode::Down);
+        assert_ne!(state.transcription_settings.selection, selection);
+        assert_eq!(state.agent.response_history.selected_index(), Some(0));
+        history_key(&mut state, super::KeyCode::End);
+        assert_eq!(state.agent.response_history.selected_index(), Some(0));
+    }
+
+    #[test]
+    fn refresh_clears_history_and_rejects_a_late_response() {
+        let mut state = test_response_state();
+        accept_test_response(&mut state, "first");
+        history_key(&mut state, super::KeyCode::Down);
+        state.refresh_session(1);
+        assert_eq!(state.agent.response_history.len(), 0);
+        assert!(!state.agent.response_history.is_browsing());
+        assert!(!state.apply(super::UiEvent::AgentOutput {
+            result: json!({ "answer_guidance": "late", "main_risks": [] }),
+            successful_input: AgentInput {
+                system_transcript: "late".to_string(),
+                microphone_transcript: None,
+                force: false,
+                generation: 0,
+            },
+            usage: None,
+            force_hints: true,
+            elapsed_ms: 100,
+            generation: 0,
+        }));
+        assert_eq!(state.agent.response_history.len(), 0);
+        assert!(state.agent.fields[0].lines.is_empty());
+    }
+
+    #[test]
+    fn restart_contract_changes_clear_history_while_ordinary_changes_keep_it() {
+        let mut state = test_response_state();
+        accept_test_response(&mut state, "first");
+        history_key(&mut state, super::KeyCode::Down);
+        state.agent.prepare_restart(false, false, false);
+        assert_eq!(state.agent.response_history.len(), 1);
+        assert_eq!(state.agent.response_history.selected_index(), Some(0));
+        for (answer, reference, microphone) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            accept_test_response(&mut state, "next");
+            history_key(&mut state, super::KeyCode::Down);
+            state.agent.prepare_restart(answer, reference, microphone);
+            assert_eq!(state.agent.response_history.len(), 0);
+            assert!(!state.agent.response_history.is_browsing());
+            assert!(state.agent.last_successful_input.is_none());
+        }
+    }
+
+    #[test]
+    fn protected_restart_keeps_history_and_display_fields_when_agent_is_off() {
+        let mut state = test_response_state();
+        accept_test_response(&mut state, "first");
+        accept_test_response(&mut state, "second");
+        history_key(&mut state, super::KeyCode::Up);
+        let saved = state
+            .restart_state()
+            .expect("restart state should protect response history");
+        let decrypted = super::unprotect_restart_context(&saved.protected_context)
+            .expect("protected response history should decrypt");
+        assert_eq!(decrypted.agent_response_history.len(), 2);
+        assert_eq!(decrypted.agent_history_selection, Some(0));
+        assert_eq!(decrypted.agent_result["answer_guidance"], "second");
+        let outer = serde_json::to_string(&saved).unwrap();
+        assert!(!outer.contains("answer_guidance"));
+        let mut restored = test_typing_state("");
+        restored.mode = AppMode::Transcription;
+        restored
+            .restore_restart_state(&saved)
+            .expect("disabled pane should restore history");
+        assert!(!restored.agent.enabled);
+        assert_eq!(restored.agent.response_history.len(), 2);
+        assert_eq!(restored.agent.response_history.selected_index(), Some(0));
+        assert_eq!(restored.agent.displayed_fields()[0].lines, vec!["first"]);
+        assert_eq!(restored.agent.canonical_result["answer_guidance"], "second");
+        assert!(!super::visible_agent_rows(&restored, 40, 20).is_empty());
+        history_key(&mut restored, super::KeyCode::End);
+        assert_eq!(restored.agent.displayed_fields()[0].lines, vec!["second"]);
+        assert_eq!(restored.agent.response_history.len(), 2);
+        let response = restored.agent.response_history.entries()[0].result.clone();
+        let changed_schema = vec![test_agent_field(
+            "answer_guidance",
+            super::AgentFieldRender::Text,
+        )];
+        let adapted = super::AgentResponse::new(&changed_schema, response, Instant::now());
+        assert_eq!(adapted.fields.len(), 1);
+        assert_eq!(adapted.result["main_risks"], json!(["risk: first"]));
+    }
+
+    #[test]
+    fn legacy_restart_context_defaults_to_empty_live_history() {
+        let context: super::TranscriptionRestartContext = serde_json::from_value(json!({
+            "transcripts": [], "agent_result": {}, "errors": [],
+        }))
+        .expect("existing version-2 contexts remain compatible");
+        assert!(context.agent_response_history.is_empty());
+        assert!(context.agent_field_configs.is_empty());
+        assert_eq!(context.agent_history_selection, None);
+    }
+
     #[test]
     fn stale_agent_output_counts_usage_without_repopulating_fields() {
         let parsed = parse_agent_config(
@@ -11439,6 +11784,7 @@ After.
             generation: 0,
         }));
         assert!(state.agent.fields[0].lines.is_empty());
+        assert_eq!(state.agent.response_history.len(), 0);
         assert_eq!(state.agent.total_tokens, 15);
     }
 

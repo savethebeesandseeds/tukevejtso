@@ -14,5 +14,7 @@ fi
 
 test_dir="$(mktemp -d)"
 trap 'rm -rf -- "$test_dir"' EXIT
-rustc --edition=2021 --test "$script_dir/src/speech_logic.rs" -o "$test_dir/speech-logic-tests"
-"$test_dir/speech-logic-tests" "$@"
+for module in speech_logic response_history; do
+  rustc --edition=2021 --test "$script_dir/src/$module.rs" -o "$test_dir/$module-tests"
+  "$test_dir/$module-tests" "$@"
+done
