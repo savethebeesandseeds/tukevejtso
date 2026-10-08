@@ -192,22 +192,18 @@ function Get-CurrentTerminalWindowHandle {
 $terminalWindowHandle = Get-CurrentTerminalWindowHandle
 
 function Invoke-OptionalFullScreen {
-    if ($Mode -ne "EnhancedTyping" -or -not $FullScreen -or [Console]::IsInputRedirected) {
+    if (-not $FullScreen -or [Console]::IsInputRedirected) {
         return
     }
 
-    Add-TerminalKeyNativeType
-    if ((Get-ForegroundTerminalWindowHandle) -eq [IntPtr]::Zero) {
+    if (-not (Test-TerminalWindowHandle -WindowHandle $terminalWindowHandle)) {
         return
     }
 
-    $KEYEVENTF_KEYUP = 0x2
-    $VK_F11 = 0x7A
-
-    [Tukevejtso.TerminalKeys]::keybd_event([byte] $VK_F11, 0, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 40
-    [Tukevejtso.TerminalKeys]::keybd_event([byte] $VK_F11, 0, $KEYEVENTF_KEYUP, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 250
+    # Maximize the captured terminal directly. F11 would toggle full-screen and
+    # could reach another foreground application if focus changes during launch.
+    $SW_MAXIMIZE = 3
+    [void] [Tukevejtso.TerminalKeys]::ShowWindow($terminalWindowHandle, $SW_MAXIMIZE)
 }
 
 function Get-TerminalRestoreSnapshot {

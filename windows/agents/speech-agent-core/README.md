@@ -15,3 +15,18 @@ The product packages are deliberately thin entrypoints:
 - `enhanced-typing` selects the typing product, focus/hotkey behavior, draft flushing, clipboard/type output, and refiner settings.
 
 Product-specific API entrypoints live in `transcription::run_app` and `typing::run_app`. Shared behavior is changed here once rather than copied between both binaries.
+
+## Portable logic tests
+
+Run the regression suite inside the managed `tukevejtso` container:
+
+```bash
+bash /workspace/tukevejtso/windows/agents/speech-agent-core/test-logic.sh
+```
+
+The suite compiles the same platform-independent module used by both agents,
+using only the container's Rust compiler and standard library. It covers final
+audio decoding, the F5 audio cutoff, transcript reconciliation, short replies,
+and forced-update consolidation. Test binaries live in a temporary container
+directory and are removed afterward. Native audio, Whisper inference, and Win32
+window behavior require separate runtime validation.

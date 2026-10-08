@@ -1,3 +1,12 @@
+mod speech_logic;
+use speech_logic::{
+    audio_frame_is_current, coalesce_latest, comparable_word_spans, compare_token,
+    is_informative_delta, merge_transcript_estimate, new_text_since, recent_chars,
+    should_decode_final, MIN_RESTART_PREFIX_WORDS,
+};
+#[cfg(test)]
+use speech_logic::is_informative_text;
+
 use anyhow::{anyhow, Context, Result};
 use crossterm::{
     cursor,
@@ -81,7 +90,6 @@ const DEFAULT_TYPING_KEYSTROKE_DELAY_MS: u64 = 22;
 const TYPING_KEY_EVENT_DELAY: Duration = Duration::from_millis(3);
 const DEFAULT_LANGUAGE: &str = "en";
 const COLUMN_GAP: u16 = 6;
-const MIN_RESTART_PREFIX_WORDS: usize = 4;
 const TEMP_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const TEXT_FULL_INTENSITY: Duration = Duration::from_secs(8);
 const DEFAULT_TEXT_FADE_SECONDS: u64 = 70;
@@ -1130,6 +1138,7 @@ struct StreamingSourceState {
     last_pass: Instant,
     last_commit: Instant,
     last_voice_at: Option<Instant>,
+    last_decoded_voice_at: Option<Instant>,
 }
 
 impl StreamingSourceState {
@@ -1145,6 +1154,7 @@ impl StreamingSourceState {
             last_pass: Instant::now() - STREAM_PARTIAL_INTERVAL,
             last_commit: Instant::now() - STREAM_COMMIT_INTERVAL,
             last_voice_at: None,
+            last_decoded_voice_at: None,
         }
     }
 
@@ -1159,6 +1169,7 @@ impl StreamingSourceState {
         self.last_pass = Instant::now() - STREAM_PARTIAL_INTERVAL;
         self.last_commit = Instant::now() - STREAM_COMMIT_INTERVAL;
         self.last_voice_at = None;
+        self.last_decoded_voice_at = None;
     }
 
     fn full_text(&self) -> String {
@@ -1191,6 +1202,7 @@ impl StreamingSourceState {
         self.last_pass = Instant::now() - STREAM_PARTIAL_INTERVAL;
         self.last_commit = Instant::now() - STREAM_COMMIT_INTERVAL;
         self.last_voice_at = None;
+        self.last_decoded_voice_at = None;
 
         if current.is_empty() {
             return false;
@@ -1216,7 +1228,12 @@ fn flush_silenced_stream(
     ui_tx: &Sender<UiEvent>,
     generation: u64,
 ) -> Result<(bool, Option<String>)> {
-    if stream.best_text.trim().is_empty() && !stream.samples.is_empty() {
+    if should_decode_final(
+        !stream.samples.is_empty(),
+        stream.best_text.trim().is_empty(),
+        stream.last_voice_at,
+        stream.last_decoded_voice_at,
+    ) {
         let minimum_samples = if is_typing_source {
             SAMPLE_RATE / 4
         } else {
@@ -1230,6 +1247,7 @@ fn flush_silenced_stream(
                 // to decode a single short word without delaying the live path.
                 final_window.resize(SAMPLE_RATE, 0.0);
             }
+            let decoded_voice_at = stream.last_voice_at;
             let started = Instant::now();
             let text = transcribe_chunk(
                 ctx,
@@ -1240,6 +1258,7 @@ fn flush_silenced_stream(
             .trim()
             .to_string();
             let elapsed_ms = started.elapsed().as_millis();
+            stream.last_decoded_voice_at = decoded_voice_at;
             if !text.is_empty() {
                 let merged_text = merge_transcript_estimate(&stream.best_text, &text);
                 let text_changed = stream.best_text.trim() != merged_text.trim();
@@ -3358,6 +3377,7 @@ fn run(product: ProductMode) -> Result<()> {
 
     let stop = Arc::new(AtomicBool::new(false));
     let refresh_generation = Arc::new(AtomicU64::new(0));
+    let refresh_audio_cutoff = Arc::new(Mutex::new(None::<Instant>));
     let agent_force_generation = Arc::new(AtomicU64::new(0));
     // Start fail-closed. The render lifecycle enables requests only after it has
     // evaluated terminal focus, restored token limits, and automatic-off rules.
@@ -3440,6 +3460,7 @@ fn run(product: ProductMode) -> Result<()> {
         typing_tx,
         stop.clone(),
         refresh_generation.clone(),
+        refresh_audio_cutoff.clone(),
         agent_force_generation.clone(),
         typing_paused.clone(),
         typing_input_source.clone(),
@@ -3469,6 +3490,7 @@ fn run(product: ProductMode) -> Result<()> {
             ui_rx,
             stop,
             refresh_generation,
+            refresh_audio_cutoff,
             agent_force_generation,
             typing_intelligence_enabled,
             typing_refiner_model,
@@ -4755,6 +4777,7 @@ fn spawn_whisper_thread(
     typing_tx: Option<Sender<TypingInput>>,
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
+    refresh_audio_cutoff: Arc<Mutex<Option<Instant>>>,
     agent_force_generation: Arc<AtomicU64>,
     typing_paused: Arc<AtomicBool>,
     typing_input_source: Arc<Mutex<SourceKind>>,
@@ -4770,6 +4793,7 @@ fn spawn_whisper_thread(
                 typing_tx,
                 stop.clone(),
                 refresh_generation,
+                refresh_audio_cutoff,
                 agent_force_generation,
                 typing_paused,
                 typing_input_source,
@@ -4778,6 +4802,32 @@ fn spawn_whisper_thread(
             }
         })
         .expect("failed to spawn Whisper thread");
+}
+
+fn sync_audio_refresh(
+    streams: &mut HashMap<SourceKind, StreamingSourceState>,
+    refresh_generation: &AtomicU64,
+    refresh_audio_cutoff: &Mutex<Option<Instant>>,
+    seen_generation: &mut u64,
+    ui_tx: &Sender<UiEvent>,
+) -> Option<Instant> {
+    // Snapshot both values under the lock used by the F5 key action.
+    let (generation, cutoff) = {
+        let cutoff = refresh_audio_cutoff.lock().unwrap_or_else(|err| err.into_inner());
+        (refresh_generation.load(Ordering::SeqCst), *cutoff)
+    };
+    if generation != *seen_generation {
+        for (source, stream) in streams.iter_mut() {
+            stream.reset();
+            let _ = ui_tx.send(UiEvent::SourceActivity {
+                source: *source,
+                active: false,
+            });
+        }
+        *seen_generation = generation;
+        let _ = ui_tx.send(UiEvent::Status("Session refreshed".to_string()));
+    }
+    cutoff
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4789,6 +4839,7 @@ fn whisper_loop(
     typing_tx: Option<Sender<TypingInput>>,
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
+    refresh_audio_cutoff: Arc<Mutex<Option<Instant>>>,
     agent_force_generation: Arc<AtomicU64>,
     typing_paused: Arc<AtomicBool>,
     typing_input_source: Arc<Mutex<SourceKind>>,
@@ -4851,7 +4902,8 @@ fn whisper_loop(
             set_prompt(&mut stream.prompt, &history_text);
         }
     }
-    let mut seen_refresh_generation = refresh_generation.load(Ordering::SeqCst);
+    // Audio streams were created for generation zero, including during model loading.
+    let mut seen_refresh_generation = 0;
     let mut seen_agent_force_generation = agent_force_generation.load(Ordering::SeqCst);
     if config
         .restart_state
@@ -4869,18 +4921,13 @@ fn whisper_loop(
     }
 
     while !stop.load(Ordering::SeqCst) {
-        let current_refresh_generation = refresh_generation.load(Ordering::SeqCst);
-        if current_refresh_generation != seen_refresh_generation {
-            for (source, stream) in streams.iter_mut() {
-                stream.reset();
-                let _ = ui_tx.send(UiEvent::SourceActivity {
-                    source: *source,
-                    active: false,
-                });
-            }
-            seen_refresh_generation = current_refresh_generation;
-            let _ = ui_tx.send(UiEvent::Status("Session refreshed".to_string()));
-        }
+        sync_audio_refresh(
+            &mut streams,
+            &refresh_generation,
+            &refresh_audio_cutoff,
+            &mut seen_refresh_generation,
+            &ui_tx,
+        );
 
         let current_agent_force_generation = agent_force_generation.load(Ordering::SeqCst);
         if current_agent_force_generation != seen_agent_force_generation {
@@ -4897,6 +4944,18 @@ fn whisper_loop(
 
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(frame) => {
+                // F5 may have happened while waiting. Reset before handling this
+                // frame, so speech captured after the cutoff stays in the new session.
+                let audio_cutoff = sync_audio_refresh(
+                    &mut streams,
+                    &refresh_generation,
+                    &refresh_audio_cutoff,
+                    &mut seen_refresh_generation,
+                    &ui_tx,
+                );
+                if !audio_frame_is_current(frame.captured_at, audio_cutoff) {
+                    continue;
+                }
                 let source = frame.source;
                 let frame_captured_at = frame.captured_at;
                 let selected_typing_source =
@@ -4983,6 +5042,7 @@ fn whisper_loop(
                     }
 
                     let window = stream.samples.clone();
+                    let decoded_voice_at = stream.last_voice_at;
                     let energy = rms(&window);
 
                     if energy < SILENCE_RMS {
@@ -5010,6 +5070,7 @@ fn whisper_loop(
                     .to_string();
                     let elapsed_ms = started.elapsed().as_millis();
                     stream.last_pass = Instant::now();
+                    stream.last_decoded_voice_at = decoded_voice_at;
 
                     if text.is_empty() {
                         let _ = ui_tx.send(UiEvent::Status(format!(
@@ -5064,6 +5125,13 @@ fn whisper_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                sync_audio_refresh(
+                    &mut streams,
+                    &refresh_generation,
+                    &refresh_audio_cutoff,
+                    &mut seen_refresh_generation,
+                    &ui_tx,
+                );
                 let selected_typing_source =
                     current_typing_input_source(&typing_input_source, SourceKind::Microphone);
                 if !typing_mode || !typing_paused.load(Ordering::SeqCst) {
@@ -5205,6 +5273,15 @@ fn spawn_agent_thread(
         .expect("failed to spawn agent thread");
 }
 
+fn coalesce_agent_input(pending: &mut Option<AgentInput>, next: AgentInput) {
+    coalesce_latest(
+        pending,
+        next,
+        |input| input.generation,
+        |next, previous| next.force |= previous.force,
+    );
+}
+
 fn agent_loop(
     config: AgentConfig,
     rx: Receiver<AgentInput>,
@@ -5242,13 +5319,13 @@ fn agent_loop(
     while !stop.load(Ordering::SeqCst) {
         let mut received_input = None;
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(input) => received_input = Some(input),
+            Ok(input) => coalesce_agent_input(&mut received_input, input),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
         while let Ok(input) = rx.try_recv() {
-            received_input = Some(input);
+            coalesce_agent_input(&mut received_input, input);
         }
 
         let current_refresh_generation = refresh_generation.load(Ordering::SeqCst);
@@ -5269,7 +5346,7 @@ fn agent_loop(
             input.generation == seen_refresh_generation
                 && input.generation == refresh_generation.load(Ordering::SeqCst)
         }) {
-            latest_input = Some(input);
+            coalesce_agent_input(&mut latest_input, input);
         }
 
         let allowed = requests_allowed.load(Ordering::SeqCst);
@@ -6134,7 +6211,9 @@ fn agent_input_has_informative_delta<G: AsRef<str>, B: AsRef<str>>(
         &input.system_transcript,
         AGENT_CONTEXT_CHARS,
     );
-    if is_informative_text(&system_new) {
+    let has_system_context = previous
+        .is_some_and(|input| !input.system_transcript.trim().is_empty());
+    if is_informative_delta(&system_new, has_system_context) {
         return true;
     }
 
@@ -6159,7 +6238,7 @@ fn agent_input_has_informative_delta<G: AsRef<str>, B: AsRef<str>>(
                 AGENT_CONTEXT_CHARS,
             )
         })
-        .is_some_and(|microphone_new| is_informative_text(&microphone_new))
+        .is_some_and(|microphone_new| is_informative_delta(&microphone_new, has_open_gate))
 }
 
 fn has_explicit_system_question_delta(input: &AgentInput, previous: Option<&AgentInput>) -> bool {
@@ -6169,85 +6248,6 @@ fn has_explicit_system_question_delta(input: &AgentInput, previous: Option<&Agen
         AGENT_CONTEXT_CHARS,
     );
     system_new.contains('?')
-}
-
-fn is_informative_text(text: &str) -> bool {
-    let alnum_count = text.chars().filter(|value| value.is_alphanumeric()).count();
-    let word_count = text
-        .split_whitespace()
-        .filter(|word| word.chars().any(|value| value.is_alphanumeric()))
-        .count();
-
-    text.contains('?') || (alnum_count >= 8 && word_count >= 2)
-}
-
-fn new_text_since(previous: Option<&str>, current: &str, max_chars: usize) -> String {
-    let current = current.trim();
-    let Some(previous) = previous.map(str::trim).filter(|value| !value.is_empty()) else {
-        return recent_chars(current, max_chars);
-    };
-    if current.is_empty() {
-        return String::new();
-    }
-    if current == previous {
-        return String::new();
-    }
-    if let Some(new_text) = current.strip_prefix(previous) {
-        return recent_chars(new_text.trim(), max_chars);
-    }
-
-    let previous_words = comparable_word_spans(previous);
-    let current_words = comparable_word_spans(current);
-    if !previous_words.is_empty() && !current_words.is_empty() {
-        let previous_cmp = previous_words
-            .iter()
-            .map(|word| word.0.clone())
-            .collect::<Vec<_>>();
-        let current_cmp = current_words
-            .iter()
-            .map(|word| word.0.clone())
-            .collect::<Vec<_>>();
-        if previous_cmp == current_cmp {
-            return String::new();
-        }
-
-        let shared_words = shared_prefix_len(&previous_cmp, &current_cmp);
-        if shared_words > 0 {
-            return current_words
-                .get(shared_words)
-                .map(|word| recent_chars(current[word.1..].trim(), max_chars))
-                .unwrap_or_default();
-        }
-
-        let max_overlap = previous_cmp.len().min(current_cmp.len());
-        for overlap in (2..=max_overlap).rev() {
-            if previous_cmp[previous_cmp.len() - overlap..] == current_cmp[..overlap] {
-                return current_words
-                    .get(overlap)
-                    .map(|word| recent_chars(current[word.1..].trim(), max_chars))
-                    .unwrap_or_default();
-            }
-        }
-    }
-
-    let shared_chars = shared_prefix_char_count(previous, current);
-    let current_tail = current
-        .char_indices()
-        .nth(shared_chars)
-        .map(|(index, _)| &current[index..])
-        .unwrap_or("");
-    if current_tail.trim().is_empty() {
-        recent_chars(current, max_chars)
-    } else {
-        recent_chars(current_tail.trim(), max_chars)
-    }
-}
-
-fn shared_prefix_char_count(left: &str, right: &str) -> usize {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(left, right)| left == right)
-        .count()
 }
 
 fn extract_response_text(value: &Value) -> Option<String> {
@@ -6913,15 +6913,6 @@ fn set_clipboard_text(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn recent_chars(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
-        return text.to_string();
-    }
-
-    chars[chars.len() - max_chars..].iter().collect()
-}
-
 fn compact_error(text: &str, max_chars: usize) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= max_chars {
@@ -7086,152 +7077,6 @@ fn align_transcript_words(
         .collect()
 }
 
-fn merge_transcript_estimate(existing: &str, current: &str) -> String {
-    let existing = compact_restarted_prefix(existing);
-    let current = compact_restarted_prefix(current);
-    let existing = existing.trim();
-    let current = current.trim();
-    if existing.is_empty() {
-        return current.to_string();
-    }
-    if current.is_empty() {
-        return existing.to_string();
-    }
-
-    let existing_words: Vec<&str> = existing.split_whitespace().collect();
-    let current_words: Vec<&str> = current.split_whitespace().collect();
-    if existing_words.is_empty() {
-        return current.to_string();
-    }
-    if current_words.is_empty() {
-        return existing.to_string();
-    }
-
-    let existing_cmp: Vec<String> = existing_words
-        .iter()
-        .map(|word| compare_token(word))
-        .collect();
-    let current_cmp: Vec<String> = current_words
-        .iter()
-        .map(|word| compare_token(word))
-        .collect();
-
-    if contains_word_sequence(&current_cmp, &existing_cmp) {
-        return current.to_string();
-    }
-    if contains_word_sequence(&existing_cmp, &current_cmp) {
-        return existing.to_string();
-    }
-
-    let max_overlap = existing_cmp.len().min(current_cmp.len());
-    let shared_prefix = shared_prefix_len(&existing_cmp, &current_cmp);
-    if shared_prefix >= MIN_RESTART_PREFIX_WORDS && shared_prefix < max_overlap {
-        let existing_tail_len = existing_words.len().saturating_sub(shared_prefix);
-        let current_tail_len = current_words.len().saturating_sub(shared_prefix);
-        if current_tail_len >= existing_tail_len || current_words.len() + 2 >= existing_words.len()
-        {
-            return current.to_string();
-        }
-    }
-
-    let min_overlap = if max_overlap <= 2 { 1 } else { 2 };
-    for overlap in (min_overlap..=max_overlap).rev() {
-        if existing_cmp[existing_cmp.len() - overlap..] == current_cmp[..overlap] {
-            let mut words = Vec::with_capacity(existing_words.len() + current_words.len());
-            words.extend_from_slice(&existing_words[..existing_words.len() - overlap]);
-            words.extend_from_slice(&current_words);
-            return words.join(" ");
-        }
-    }
-
-    for overlap in (min_overlap..=max_overlap).rev() {
-        if current_cmp[current_cmp.len() - overlap..] == existing_cmp[..overlap] {
-            let mut words = Vec::with_capacity(existing_words.len() + current_words.len());
-            words.extend_from_slice(&current_words[..current_words.len() - overlap]);
-            words.extend_from_slice(&existing_words);
-            return words.join(" ");
-        }
-    }
-
-    format!("{existing} {current}")
-}
-
-fn compact_restarted_prefix(text: &str) -> String {
-    let mut words: Vec<&str> = text.split_whitespace().collect();
-    if words.len() < MIN_RESTART_PREFIX_WORDS * 2 {
-        return text.trim().to_string();
-    }
-
-    loop {
-        let cmp: Vec<String> = words.iter().map(|word| compare_token(word)).collect();
-        let Some((first_start, second_start, _overlap)) = repeated_revision_span(&cmp) else {
-            break;
-        };
-
-        let mut compacted = Vec::with_capacity(words.len() - (second_start - first_start));
-        compacted.extend_from_slice(&words[..first_start]);
-        compacted.extend_from_slice(&words[second_start..]);
-        words = compacted;
-
-        if words.len() < MIN_RESTART_PREFIX_WORDS * 2 {
-            break;
-        }
-    }
-
-    words.join(" ")
-}
-
-fn repeated_revision_span(tokens: &[String]) -> Option<(usize, usize, usize)> {
-    let mut best = None;
-
-    for first_start in 0..tokens.len() {
-        for second_start in first_start + 1..tokens.len() {
-            let max_overlap = (second_start - first_start).min(tokens.len() - second_start);
-            let mut overlap = 0;
-            while overlap < max_overlap
-                && tokens[first_start + overlap] == tokens[second_start + overlap]
-            {
-                overlap += 1;
-            }
-
-            if overlap < MIN_RESTART_PREFIX_WORDS {
-                continue;
-            }
-
-            let replace = best
-                .map(|(_, _, best_overlap)| overlap > best_overlap)
-                .unwrap_or(true);
-            if replace {
-                best = Some((first_start, second_start, overlap));
-            }
-        }
-    }
-
-    best
-}
-
-fn contains_word_sequence(haystack: &[String], needle: &[String]) -> bool {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return false;
-    }
-
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
-fn shared_prefix_len(left: &[String], right: &[String]) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn compare_token(word: &str) -> String {
-    word.trim_matches(|value: char| !value.is_alphanumeric())
-        .to_ascii_lowercase()
-}
-
 fn rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
@@ -7252,6 +7097,7 @@ fn render_loop(
     rx: Receiver<UiEvent>,
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
+    refresh_audio_cutoff: Arc<Mutex<Option<Instant>>>,
     agent_force_generation: Arc<AtomicU64>,
     typing_intelligence_enabled: Arc<AtomicBool>,
     typing_refiner_model: Arc<Mutex<String>>,
@@ -7472,9 +7318,13 @@ fn render_loop(
 
                 if key.code == KeyCode::F(5) {
                     agent_requests_allowed.store(false, Ordering::SeqCst);
-                    let generation = refresh_generation
-                        .fetch_add(1, Ordering::SeqCst)
-                        .wrapping_add(1);
+                    let generation = {
+                        let mut cutoff = refresh_audio_cutoff
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner());
+                        *cutoff = Some(Instant::now());
+                        refresh_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+                    };
                     state.refresh_session(generation);
                     dirty = true;
                     continue;
@@ -9445,7 +9295,6 @@ fn typing_display_text(state: &AppState) -> String {
 }
 
 fn append_typing_text(draft: &mut String, text: &str) {
-    let text = compact_restarted_prefix(text);
     let text = text.trim();
     if text.is_empty() {
         return;
@@ -9518,36 +9367,6 @@ fn replace_typing_revision_tail(draft: &mut String, text: &str) -> bool {
     merged.push_str(suffix);
     *draft = merged;
     true
-}
-
-fn comparable_word_spans(text: &str) -> Vec<(String, usize, usize)> {
-    let mut words = Vec::new();
-    let mut start = None;
-    for (index, character) in text.char_indices() {
-        if character.is_whitespace() {
-            if let Some(word_start) = start.take() {
-                push_comparable_word_span(text, word_start, index, &mut words);
-            }
-        } else if start.is_none() {
-            start = Some(index);
-        }
-    }
-    if let Some(word_start) = start {
-        push_comparable_word_span(text, word_start, text.len(), &mut words);
-    }
-    words
-}
-
-fn push_comparable_word_span(
-    text: &str,
-    start: usize,
-    end: usize,
-    words: &mut Vec<(String, usize, usize)>,
-) {
-    let comparable = compare_token(&text[start..end]);
-    if !comparable.is_empty() {
-        words.push((comparable, start, end));
-    }
 }
 
 fn typing_desired_width(text: &str, minimum_width: usize, max_content_width: usize) -> u16 {
@@ -10797,7 +10616,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_restarted_prefix_inside_single_hypothesis() {
+    fn preserves_repeated_prefix_inside_single_hypothesis() {
         let estimate = merge_transcript_estimate(
             "",
             "Hi, hello. How are you? Well, I would just... Hi, hello. How are you? Well, I was just thinking how to...",
@@ -10805,12 +10624,12 @@ mod tests {
 
         assert_eq!(
             estimate,
-            "Hi, hello. How are you? Well, I was just thinking how to..."
+            "Hi, hello. How are you? Well, I would just... Hi, hello. How are you? Well, I was just thinking how to..."
         );
     }
 
     #[test]
-    fn compact_internal_repeated_revision_inside_single_hypothesis() {
+    fn preserves_internal_repetition_inside_single_hypothesis() {
         let estimate = merge_transcript_estimate(
             "",
             "Hey, hello. What were you? I was just looking into it. I was just looking into getting something done.",
@@ -10818,7 +10637,7 @@ mod tests {
 
         assert_eq!(
             estimate,
-            "Hey, hello. What were you? I was just looking into getting something done."
+            "Hey, hello. What were you? I was just looking into it. I was just looking into getting something done."
         );
     }
 
@@ -11662,5 +11481,99 @@ After.
             at_deadline,
             SILENCE_BREAK_AFTER,
         ));
+    }
+}
+
+#[cfg(test)]
+mod transcription_reliability_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_during_audio_wait_keeps_the_first_new_frame() {
+        let mut streams = HashMap::from([(
+            SourceKind::SystemOutput,
+            StreamingSourceState::new(SAMPLE_RATE),
+        )]);
+        streams.get_mut(&SourceKind::SystemOutput).unwrap().samples.push(0.5);
+        let generation = AtomicU64::new(0);
+        let cutoff = Mutex::new(None);
+        let mut seen_generation = 0;
+        let (ui_tx, _ui_rx) = mpsc::channel();
+        sync_audio_refresh(&mut streams, &generation, &cutoff, &mut seen_generation, &ui_tx);
+
+        // The renderer refreshes while the receiver is waiting for the next frame.
+        let boundary = Instant::now();
+        *cutoff.lock().unwrap() = Some(boundary);
+        generation.store(1, Ordering::SeqCst);
+        let frame_at = boundary + Duration::from_millis(1);
+        let current_cutoff = sync_audio_refresh(
+            &mut streams, &generation, &cutoff, &mut seen_generation, &ui_tx,
+        );
+        assert_eq!(seen_generation, 1);
+        assert!(streams[&SourceKind::SystemOutput].samples.is_empty());
+        assert!(audio_frame_is_current(frame_at, current_cutoff));
+        streams.get_mut(&SourceKind::SystemOutput).unwrap().samples.push(0.7);
+        sync_audio_refresh(&mut streams, &generation, &cutoff, &mut seen_generation, &ui_tx);
+        assert_eq!(streams[&SourceKind::SystemOutput].samples, vec![0.7]);
+    }
+
+    #[test]
+    fn pending_question_accepts_a_one_word_microphone_answer() {
+        let previous = AgentInput {
+            system_transcript: "When is the launch?".to_string(),
+            microphone_transcript: Some("Let me check.".to_string()),
+            force: false,
+            generation: 0,
+        };
+        for reply in ["Friday.", "Yes.", "No.", "42."] {
+            let current = AgentInput {
+                microphone_transcript: Some(format!("Let me check. {reply}")),
+                ..previous.clone()
+            };
+            assert!(agent_input_has_informative_delta(
+                &current,
+                Some(&previous),
+                &json!({ "unanswered_questions": ["When is the launch?"] }),
+                &["unanswered_questions"],
+                &[] as &[&str],
+            ));
+        }
+    }
+
+    #[test]
+    fn system_date_correction_passes_the_agent_gate() {
+        let previous = AgentInput {
+            system_transcript: "The launch is Thursday.".to_string(),
+            microphone_transcript: None,
+            force: false,
+            generation: 0,
+        };
+        let current = AgentInput {
+            system_transcript: "The launch is Friday.".to_string(),
+            ..previous.clone()
+        };
+        assert!(agent_input_has_informative_delta(
+            &current, Some(&previous), &json!({}),
+            &[] as &[&str], &[] as &[&str],
+        ));
+    }
+
+    #[test]
+    fn agent_queue_keeps_force_and_the_newest_transcript() {
+        let mut pending = Some(AgentInput {
+            system_transcript: "F1 snapshot".to_string(),
+            microphone_transcript: None,
+            force: true,
+            generation: 0,
+        });
+        coalesce_agent_input(&mut pending, AgentInput {
+            system_transcript: "latest automatic snapshot".to_string(),
+            microphone_transcript: None,
+            force: false,
+            generation: 0,
+        });
+        let pending = pending.unwrap();
+        assert!(pending.force);
+        assert_eq!(pending.system_transcript, "latest automatic snapshot");
     }
 }
