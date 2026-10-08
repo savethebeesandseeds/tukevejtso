@@ -1,4 +1,8 @@
 mod response_history;
+mod screen_capture;
+mod screenshot_requests;
+use base64::Engine;
+use screenshot_requests::{ScreenshotContextMode, ScreenshotRequest, ScreenshotWorker};
 mod speech_logic;
 use response_history::ResponseHistory;
 use speech_logic::{
@@ -585,6 +589,8 @@ struct EnchantedTranscriptionSettings {
     #[serde(default = "default_transcription_answer_mode")]
     answer_mode: TranscriptionAnswerMode,
     #[serde(default)]
+    screenshot_context: ScreenshotContextMode,
+    #[serde(default)]
     include_microphone: bool,
     #[serde(default)]
     context_file: Option<String>,
@@ -617,6 +623,7 @@ impl Default for EnchantedTranscriptionSettings {
             agent_enabled: default_enabled_setting(),
             agent_model: default_agent_model_setting(),
             answer_mode: default_transcription_answer_mode(),
+            screenshot_context: ScreenshotContextMode::default(),
             include_microphone: false,
             context_file: None,
             context_strictness: default_context_strictness(),
@@ -1076,7 +1083,8 @@ enum UiEvent {
     },
     AgentOutput {
         result: Value,
-        successful_input: AgentInput,
+        // Screenshot responses are displayed but do not become audio context.
+        successful_input: Option<AgentInput>,
         usage: Option<AgentUsage>,
         force_hints: bool,
         elapsed_ms: u128,
@@ -1578,6 +1586,7 @@ struct TranscriptionRestartSettings {
     agent_enabled: bool,
     agent_model: String,
     answer_mode: TranscriptionAnswerMode,
+    screenshot_context: ScreenshotContextMode,
     include_microphone: bool,
     context_file: Option<String>,
     context_strictness: ContextStrictness,
@@ -1717,7 +1726,7 @@ impl AppState {
                 response_history: ResponseHistory::new(),
                 last_successful_input: config.agent.initial_input.clone(),
                 status: if config.agent.enabled {
-                    "waiting for system output".to_string()
+                    "waiting for audio or F2 screenshot".to_string()
                 } else {
                     "off".to_string()
                 },
@@ -1807,11 +1816,7 @@ impl AppState {
             && config.transcription_settings.agent_enabled
             && !config.agent.enabled
         {
-            let message = if !config.sources.contains(&SourceKind::SystemOutput) {
-                "Agent Insights unavailable: System output capture is disabled."
-            } else {
-                "Agent Insights unavailable: the OpenAI API key was not loaded."
-            };
+            let message = "Agent Insights unavailable: the OpenAI API key was not loaded.";
             state.agent.status = message.to_string();
             state.record_error(message);
         }
@@ -1927,6 +1932,13 @@ impl AppState {
             .collect::<Result<Vec<_>>>()?;
         self.agent.response_history =
             ResponseHistory::from_entries(responses, context.agent_history_selection);
+        // The latest displayed response may be from a screenshot, while the
+        // separately saved canonical result remains the audio-request baseline.
+        if let Some(response) = self.agent.response_history.entries().last() {
+            let result = response.result.clone();
+            self.agent.fields = default_agent_fields(&agent_field_configs);
+            self.agent.apply_result(result, true);
+        }
         let restored_input = if schema_changed {
             None
         } else {
@@ -2340,8 +2352,18 @@ impl AppState {
                     return usage.is_some();
                 }
                 self.agent.append_response(&result);
-                self.agent.canonical_result = result.clone();
-                self.agent.last_successful_input = Some(successful_input);
+                if let Some(successful_input) = successful_input {
+                    self.agent.canonical_result = result.clone();
+                    self.agent.last_successful_input = Some(successful_input);
+                } else {
+                    let configs = self
+                        .agent
+                        .fields
+                        .iter()
+                        .map(|field| field.config.clone())
+                        .collect::<Vec<_>>();
+                    self.agent.fields = default_agent_fields(&configs);
+                }
                 self.agent.apply_result(result, force_hints);
                 self.agent.finish_request();
                 self.agent.clear_error();
@@ -2541,6 +2563,7 @@ impl TranscriptionSettingsState {
             agent_enabled: self.pending.agent_enabled,
             agent_model: self.pending.agent_model.clone(),
             answer_mode: self.pending.answer_mode,
+            screenshot_context: self.pending.screenshot_context,
             include_microphone: self.pending.include_microphone,
             context_file: self.pending.context_file.clone(),
             context_strictness: self.pending.context_strictness,
@@ -2566,6 +2589,7 @@ impl TranscriptionRestartSettings {
             agent_enabled: settings.agent_enabled,
             agent_model: settings.agent_model.clone(),
             answer_mode: settings.answer_mode,
+            screenshot_context: settings.screenshot_context,
             include_microphone: settings.include_microphone,
             context_file: settings.context_file.clone(),
             context_strictness: settings.context_strictness,
@@ -3530,6 +3554,7 @@ fn run(product: ProductMode) -> Result<()> {
     // evaluated terminal focus, restored token limits, and automatic-off rules.
     let agent_requests_allowed = Arc::new(AtomicBool::new(false));
     let agent_request_in_flight = Arc::new(AtomicBool::new(false));
+    let screenshot_busy = Arc::new(AtomicBool::new(false));
     let typing_request_in_flight = Arc::new(AtomicBool::new(false));
     let typing_intelligence_enabled = Arc::new(AtomicBool::new(
         config
@@ -3562,20 +3587,23 @@ fn run(product: ProductMode) -> Result<()> {
         stop.clone(),
     );
     let typing_transparency_tx = Some(transparency_tx);
-    let agent_tx = if config.agent.enabled {
+    let (agent_tx, screenshot_tx) = if config.agent.enabled {
         let (agent_tx, agent_rx) = mpsc::channel::<AgentInput>();
+        let (screenshot_tx, screenshot_rx) = mpsc::channel::<ScreenshotRequest>();
         spawn_agent_thread(
             config.agent.clone(),
             agent_rx,
+            screenshot_rx,
+            screenshot_busy.clone(),
             ui_tx.clone(),
             stop.clone(),
             refresh_generation.clone(),
             agent_requests_allowed.clone(),
             agent_request_in_flight.clone(),
         );
-        Some(agent_tx)
+        (Some(agent_tx), Some(screenshot_tx))
     } else {
-        None
+        (None, None)
     };
     let typing_tx = if let Some(typing_config) = config.typing.clone() {
         let (typing_tx, typing_rx) = mpsc::channel::<TypingInput>();
@@ -3646,6 +3674,8 @@ fn run(product: ProductMode) -> Result<()> {
             typing_transparency_tx,
             agent_requests_allowed,
             agent_request_in_flight,
+            screenshot_tx,
+            screenshot_busy,
         )?;
         if state.restart_requested {
             Some(state.restart_state()?)
@@ -4450,7 +4480,7 @@ fn build_transcription_agent_config(
     agent_root: &Path,
 ) -> Result<AgentConfig> {
     let context_dir = agent_root.join("contexts");
-    if !settings.agent_enabled || !sources.contains(&SourceKind::SystemOutput) {
+    if !settings.agent_enabled {
         return Ok(
             AgentConfig::disabled(&settings.agent_model).with_reference_context(
                 context_dir,
@@ -5400,6 +5430,8 @@ fn send_typing_update(typing_tx: &Option<Sender<TypingInput>>, raw_text: String,
 fn spawn_agent_thread(
     config: AgentConfig,
     rx: Receiver<AgentInput>,
+    screenshot_rx: Receiver<ScreenshotRequest>,
+    screenshot_busy: Arc<AtomicBool>,
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
@@ -5412,6 +5444,8 @@ fn spawn_agent_thread(
             if let Err(err) = agent_loop(
                 config,
                 rx,
+                screenshot_rx,
+                screenshot_busy,
                 ui_tx.clone(),
                 stop.clone(),
                 refresh_generation.clone(),
@@ -5441,6 +5475,8 @@ fn coalesce_agent_input(pending: &mut Option<AgentInput>, next: AgentInput) {
 fn agent_loop(
     config: AgentConfig,
     rx: Receiver<AgentInput>,
+    screenshot_rx: Receiver<ScreenshotRequest>,
+    screenshot_busy: Arc<AtomicBool>,
     ui_tx: Sender<UiEvent>,
     stop: Arc<AtomicBool>,
     refresh_generation: Arc<AtomicU64>,
@@ -5458,6 +5494,7 @@ fn agent_loop(
         .build()
         .context("failed to create OpenAI HTTP client")?;
 
+    let mut screenshots = ScreenshotWorker::new(screenshot_rx, screenshot_busy);
     let mut latest_input: Option<AgentInput> = None;
     let mut last_submitted = String::new();
     let mut last_result = config.initial_result.clone();
@@ -5505,6 +5542,7 @@ fn agent_loop(
             coalesce_agent_input(&mut latest_input, input);
         }
 
+        screenshots.sync_generation(seen_refresh_generation);
         let allowed = requests_allowed.load(Ordering::SeqCst);
         if !allowed {
             if was_allowed {
@@ -5521,6 +5559,28 @@ fn agent_loop(
             ));
         }
         was_allowed = true;
+
+        if screenshots.poll(
+            &config,
+            &client,
+            &api_key,
+            &ui_tx,
+            stop.as_ref(),
+            refresh_generation.as_ref(),
+            seen_refresh_generation,
+            requests_allowed.as_ref(),
+            request_in_flight.as_ref(),
+            last_successful_input.as_ref(),
+            &last_result,
+            if received_successful_response {
+                AGENT_HTTP_TIMEOUT
+            } else {
+                AGENT_FIRST_HTTP_TIMEOUT
+            },
+        ) {
+            last_request = Instant::now();
+            continue;
+        }
 
         let Some(input) = latest_input.as_ref() else {
             continue;
@@ -5630,7 +5690,7 @@ fn agent_loop(
                 retry_not_before = None;
                 let _ = ui_tx.send(UiEvent::AgentOutput {
                     result,
-                    successful_input: input.clone(),
+                    successful_input: Some(input.clone()),
                     usage: call_result.usage,
                     force_hints,
                     elapsed_ms: started.elapsed().as_millis(),
@@ -7262,6 +7322,8 @@ fn render_loop(
     typing_transparency_tx: Option<Sender<TypingTransparencyRequest>>,
     agent_requests_allowed: Arc<AtomicBool>,
     agent_request_in_flight: Arc<AtomicBool>,
+    screenshot_tx: Option<Sender<ScreenshotRequest>>,
+    screenshot_busy: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut dirty = true;
     let mut last_render = Instant::now() - RENDER_INTERVAL;
@@ -7461,6 +7523,17 @@ fn render_loop(
                     }
                 }
 
+                if key.code == KeyCode::F(2) && state.mode == AppMode::Transcription {
+                    request_screenshot(
+                        state,
+                        &screenshot_tx,
+                        &screenshot_busy,
+                        &agent_requests_allowed,
+                    );
+                    dirty = true;
+                    continue;
+                }
+
                 if key.code == KeyCode::F(1) {
                     agent_force_generation.fetch_add(1, Ordering::SeqCst);
                     state.agent.status = if state.agent.enabled {
@@ -7479,7 +7552,9 @@ fn render_loop(
                             .lock()
                             .unwrap_or_else(|err| err.into_inner());
                         *cutoff = Some(Instant::now());
-                        refresh_generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+                        refresh_generation
+                            .fetch_add(1, Ordering::SeqCst)
+                            .wrapping_add(1)
                     };
                     state.refresh_session(generation);
                     dirty = true;
@@ -7505,6 +7580,93 @@ fn render_loop(
     }
 
     Ok(())
+}
+
+fn request_screenshot(
+    state: &mut AppState,
+    tx: &Option<Sender<ScreenshotRequest>>,
+    busy: &AtomicBool,
+    requests_allowed: &AtomicBool,
+) {
+    let Some(tx) = tx
+        .as_ref()
+        .filter(|_| state.agent.enabled && !state.restart_requested)
+    else {
+        state.agent.status =
+            "Screenshot unavailable; enable Agent Insights and load an API key".to_string();
+        return;
+    };
+    if !requests_allowed.load(Ordering::SeqCst) || agent_token_budget_reached(state) {
+        state.agent.status = "Screenshot not taken; API requests are paused".to_string();
+        return;
+    }
+    if busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        state.agent.status = "Screenshot request already pending".to_string();
+        return;
+    }
+    let mode = state.transcription_settings.active.screenshot_context;
+    let include_context = mode == ScreenshotContextMode::ImageAndContext;
+    let include_microphone = include_context
+        && state.transcription_settings.active.include_microphone
+        && state.sources.contains(&SourceKind::Microphone);
+    let context = AgentInput {
+        system_transcript: if include_context {
+            state
+                .transcripts
+                .get(&SourceKind::SystemOutput)
+                .map(TranscriptState::text)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+        microphone_transcript: if include_microphone {
+            state
+                .transcripts
+                .get(&SourceKind::Microphone)
+                .map(TranscriptState::text)
+                .filter(|text| !text.is_empty())
+        } else {
+            None
+        },
+        force: true,
+        generation: state.agent_generation,
+    };
+    let capture =
+        screen_capture::capture_screen_below_terminal(state.terminal_hwnd).and_then(|png| {
+            if png.len() > 12 * 1024 * 1024 {
+                return Err(anyhow!("Screenshot exceeds the 12 MiB PNG limit"));
+            }
+            let image_url = format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            );
+            tx.send(ScreenshotRequest {
+                image_url,
+                mode,
+                context,
+            })
+            .map_err(|_| anyhow!("Screenshot worker is unavailable"))
+        });
+    match capture {
+        Ok(()) => {
+            state.last_context_activity_at = Instant::now();
+            state.agent.clear_error();
+            state.agent.status = "Screenshot queued".to_string();
+        }
+        Err(err) => {
+            busy.store(false, Ordering::SeqCst);
+            let message = format!(
+                "Screenshot failed: {}",
+                compact_error(&format!("{err:#}"), 160)
+            );
+            state.agent.status = message.clone();
+            state.agent.record_error(message.clone());
+            state.record_error(message);
+        }
+    }
 }
 
 fn update_transcription_lifecycle(
@@ -7859,7 +8021,7 @@ fn apply_transcription_settings(
 }
 
 fn transcription_settings_option_count() -> usize {
-    17
+    18
 }
 
 fn transcription_settings_viewport(state: &AppState) -> (usize, usize, usize) {
@@ -8026,6 +8188,7 @@ fn change_transcription_setting(
             settings.pending.context_strictness =
                 settings.pending.context_strictness.cycle(direction);
         }
+        17 => settings.pending.screenshot_context = settings.pending.screenshot_context.toggle(),
         _ => return TypingKeyOutcome::Consumed,
     }
     if settings.selection != 0 {
@@ -8805,6 +8968,10 @@ fn transcription_settings_columns(
             "Context strictness",
             pending.context_strictness.display_name().to_string(),
         ),
+        (
+            "Screenshot input",
+            pending.screenshot_context.display_name().to_string(),
+        ),
     ];
 
     let mut option_lines = Vec::new();
@@ -9071,6 +9238,7 @@ fn transcription_setting_choices(state: &AppState) -> Vec<String> {
             .map(|preset| preset.label)
             .collect(),
         16 => vec!["Soft", "Strong"],
+        17 => vec!["Image + Context", "Image Only"],
         _ => Vec::new(),
     };
     let mut choices = values.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -9150,8 +9318,9 @@ fn transcription_setting_help(selection: usize) -> &'static str {
         12 => "Sets a hard wall-clock limit for one transcription session. Off removes the maximum-session safeguard.",
         13 => "Pauses new insight requests at this reported API-token threshold and asks before granting another block of the same size. Local transcription and context collection keep running; Off removes the prompt and cap.",
         14 => "Applies the existing terminal transparency tool to this window. Opaque disables the effect; clear presets keep a sharp background, while blurry presets use acrylic blur. The choice is saved and does not restart capture.",
-        15 => "Selects one Markdown, text, JSON, or CSV reference from the local contexts folder. Its full contents are added to each Agent Insights request, up to 32 KiB; None sends no reference document. Applying a different selection restarts only the worker wiring.",
+        15 => "Selects one Markdown, text, JSON, or CSV reference from the local contexts folder. Its full contents are added to text and Image + Context requests, up to 32 KiB; Image only omits it. None sends no reference document. Applying a different selection restarts only the worker wiring.",
         16 => "Soft treats the selected document as useful background while allowing transcript evidence and reliable general knowledge. Strong treats it as authoritative grounding, avoids outside facts, and states when the context is insufficient. Document text is always treated as data, not as instructions.",
+        17 => "F2 briefly hides this terminal, captures its monitor, restores the terminal, and requests insights. Image + Context includes the shared transcripts and selected reference file; Image only sends the screenshot without conversation or reference context. Applies immediately. Images stay in memory only for that request and its retries.",
         _ => "",
     }
 }
@@ -10209,7 +10378,7 @@ fn scale_rgb(fresh: (u8, u8, u8), intensity: f32) -> Color {
 
 fn build_footer_line(state: &AppState) -> String {
     format!(
-        "Up/Down history | End live | F9 settings | F1 update | F5 reset | requests {} | {} | {}",
+        "F1 update F2 screenshot F5 reset F9 settings | ↑↓ history End live | req {} | {} | {}",
         state.agent.request_count, state.agent.status, state.status
     )
 }
@@ -11572,12 +11741,12 @@ After.
     fn accept_test_response(state: &mut super::AppState, answer: &str) {
         assert!(state.apply(super::UiEvent::AgentOutput {
             result: json!({ "answer_guidance": answer, "main_risks": [format!("risk: {answer}")] }),
-            successful_input: AgentInput {
+            successful_input: Some(AgentInput {
                 system_transcript: answer.to_string(),
                 microphone_transcript: None,
                 force: false,
                 generation: state.agent_generation,
-            },
+            }),
             usage: None,
             force_hints: true,
             elapsed_ms: 100,
@@ -11655,12 +11824,12 @@ After.
         assert!(!state.agent.response_history.is_browsing());
         assert!(!state.apply(super::UiEvent::AgentOutput {
             result: json!({ "answer_guidance": "late", "main_risks": [] }),
-            successful_input: AgentInput {
+            successful_input: Some(AgentInput {
                 system_transcript: "late".to_string(),
                 microphone_transcript: None,
                 force: false,
                 generation: 0,
-            },
+            }),
             usage: None,
             force_hints: true,
             elapsed_ms: 100,
@@ -11733,6 +11902,160 @@ After.
     }
 
     #[test]
+    fn screenshot_mode_is_compatible_with_legacy_settings_and_applies_without_restart() {
+        let legacy: super::EnchantedTranscriptionSettings =
+            serde_json::from_value(json!({})).unwrap();
+        assert_eq!(
+            legacy.screenshot_context,
+            super::ScreenshotContextMode::ImageAndContext
+        );
+        let mut state = test_response_state();
+        state.transcription_settings.selection = 17;
+        super::change_transcription_setting(&mut state, super::TypingSettingDirection::Next);
+        assert_eq!(
+            state.transcription_settings.pending.screenshot_context,
+            super::ScreenshotContextMode::ImageOnly
+        );
+        assert!(!state.transcription_settings.has_restart_changes());
+        let persisted = state
+            .transcription_settings
+            .persisted_settings(state.fade_duration);
+        let restored: super::EnchantedTranscriptionSettings =
+            serde_json::from_str(&serde_json::to_string(&persisted).unwrap()).unwrap();
+        assert_eq!(
+            restored.screenshot_context,
+            super::ScreenshotContextMode::ImageOnly
+        );
+        assert_eq!(super::transcription_settings_option_count(), 18);
+        assert_eq!(
+            super::transcription_setting_choices(&state),
+            vec!["Image + Context", "Image Only"]
+        );
+    }
+
+    #[test]
+    fn screenshot_response_is_displayed_and_restored_without_changing_audio_context() {
+        let mut state = test_response_state();
+        accept_test_response(&mut state, "audio baseline");
+        assert!(state.apply(super::UiEvent::AgentOutput {
+            result: json!({ "answer_guidance": "screen answer", "main_risks": [] }),
+            successful_input: None,
+            usage: Some(AgentUsage {
+                input_tokens: 20,
+                output_tokens: 5,
+                total_tokens: 25
+            }),
+            force_hints: true,
+            elapsed_ms: 100,
+            generation: 0,
+        }));
+        assert_eq!(
+            state.agent.displayed_fields()[0].lines,
+            vec!["screen answer"]
+        );
+        assert_eq!(state.agent.displayed_fields()[1].lines, vec!["none"]);
+        assert_eq!(
+            state.agent.canonical_result["answer_guidance"],
+            "audio baseline"
+        );
+        assert_eq!(
+            state
+                .agent
+                .last_successful_input
+                .as_ref()
+                .unwrap()
+                .system_transcript,
+            "audio baseline"
+        );
+        assert_eq!(state.agent.response_history.len(), 2);
+        assert_eq!(state.agent.total_tokens, 25);
+        history_key(&mut state, super::KeyCode::Up);
+        assert_eq!(
+            state.agent.displayed_fields()[0].lines,
+            vec!["audio baseline"]
+        );
+        history_key(&mut state, super::KeyCode::End);
+        let saved = state.restart_state().unwrap();
+        let context = super::unprotect_restart_context(&saved.protected_context).unwrap();
+        assert!(!serde_json::to_string(&context)
+            .unwrap()
+            .contains("data:image"));
+        assert_eq!(context.agent_result["answer_guidance"], "audio baseline");
+        let mut restored = test_typing_state("");
+        restored.restore_restart_state(&saved).unwrap();
+        assert_eq!(
+            restored.agent.displayed_fields()[0].lines,
+            vec!["screen answer"]
+        );
+        assert_eq!(
+            restored.agent.canonical_result["answer_guidance"],
+            "audio baseline"
+        );
+        assert_eq!(restored.agent.response_history.len(), 2);
+    }
+
+    #[test]
+    fn image_only_request_omits_all_conversation_and_missing_reference_content() {
+        let mut config = AgentConfig::disabled("test-model");
+        config.context_dir = PathBuf::from("missing-screenshot-reference-directory");
+        config.context_file = Some("private.md".to_string());
+        let request = super::ScreenshotRequest {
+            image_url: "data:image/png;base64,aW1hZ2U=".to_string(),
+            mode: super::ScreenshotContextMode::ImageOnly,
+            context: AgentInput {
+                system_transcript: "PRIVATE_SYSTEM".to_string(),
+                microphone_transcript: Some("PRIVATE_MIC".to_string()),
+                force: true,
+                generation: 0,
+            },
+        };
+        let body = super::screenshot_requests::build_screenshot_request_body(
+            &config,
+            &request,
+            Some(&request.context),
+            &json!({"answer_guidance":"PRIVATE_STATE"}),
+        )
+        .expect("Image only never loads a selected reference");
+        let text = serde_json::to_string(&body).unwrap();
+        for forbidden in [
+            "PRIVATE_SYSTEM",
+            "PRIVATE_MIC",
+            "PRIVATE_STATE",
+            "private.md",
+            "transcript_context",
+            "current_agent_state",
+            "new_since_last_agent_update",
+            "reference_context",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "image-only payload leaked {forbidden}"
+            );
+        }
+        assert_eq!(body["input"][1]["content"][1]["type"], "input_image");
+        assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn screenshot_capture_is_skipped_when_requests_are_paused_or_worker_is_busy() {
+        let mut state = test_response_state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Some(tx);
+        let busy = super::AtomicBool::new(false);
+        let allowed = super::AtomicBool::new(false);
+        super::request_screenshot(&mut state, &tx, &busy, &allowed);
+        assert!(rx.try_recv().is_err());
+        assert!(!busy.load(super::Ordering::SeqCst));
+        assert!(state.agent.status.contains("not taken"));
+        allowed.store(true, super::Ordering::SeqCst);
+        busy.store(true, super::Ordering::SeqCst);
+        super::request_screenshot(&mut state, &tx, &busy, &allowed);
+        assert!(rx.try_recv().is_err());
+        assert!(busy.load(super::Ordering::SeqCst));
+        assert!(state.agent.status.contains("already pending"));
+    }
+
+    #[test]
     fn legacy_restart_context_defaults_to_empty_live_history() {
         let context: super::TranscriptionRestartContext = serde_json::from_value(json!({
             "transcripts": [], "agent_result": {}, "errors": [],
@@ -11768,12 +12091,12 @@ After.
 
         assert!(state.apply(super::UiEvent::AgentOutput {
             result: json!({ "answer_guidance": "stale" }),
-            successful_input: AgentInput {
+            successful_input: Some(AgentInput {
                 system_transcript: "stale context".to_string(),
                 microphone_transcript: None,
                 force: false,
                 generation: 0,
-            },
+            }),
             usage: Some(AgentUsage {
                 input_tokens: 10,
                 output_tokens: 5,

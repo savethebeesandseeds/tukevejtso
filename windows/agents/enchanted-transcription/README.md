@@ -28,6 +28,7 @@ The key is encrypted with Windows DPAPI for the current user and stored under `%
 | Key | Action |
 | --- | --- |
 | F1 | Request an immediate Agent Insights update. When the token budget is paused, reopen its continuation prompt. |
+| F2 | Capture the terminal's monitor and request Agent Insights from the screenshot. |
 | F5 | Clear the current transcript, Agent Insights state, and response history. Lifetime request and token counters remain visible. |
 | F9 | Open persistent settings, details, choices, status, warnings, and recent errors. |
 | Up / Down | Browse older / newer Agent Insights responses from the main screen. |
@@ -40,13 +41,26 @@ Inside F9, use Up/Down to select a setting and Left/Right to change it. F9 or Es
 
 The terminal maintains rolling Whisper hypotheses instead of treating each audio interval as an isolated clip. Stable transcript text is reconciled locally and retained as context.
 
-Automatic Agent Insights updates wait for about 1.2 seconds of silence after new text in an Agent-shared audio source instead of issuing requests continuously while speech is active. Updates are consolidated, rate-limited, and based on the newest context; F1 can request an update manually. Agent Insights requires system-output capture, an enabled agent, and a stored API key.
+Automatic Agent Insights updates wait for about 1.2 seconds of silence after new text in an Agent-shared audio source instead of issuing requests continuously while speech is active. Updates are consolidated, rate-limited, and based on the newest context; F1 can request an update manually. Agent Insights requires an enabled agent and a stored API key. Automatic requests use system-output text when that source is captured; microphone text is shared only when **Mic context** is enabled.
 
 Both Silhouette and Natural Answer modes also show a bounded list of the main risks supported by the current conversation or selected reference context.
 
 The built-in Agent model choices are `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`. Terra is the initial default. Saved legacy built-ins migrate by tier—GPT-5.4 nano to Luna, GPT-5.4 mini to Terra, and GPT-5.5 to Sol—while other custom model IDs remain unchanged.
 
-The Responses API requests use `store: false`. System-output transcript text is included when Agent Insights runs. Microphone transcript text remains local unless **Mic context** is enabled in F9.
+The Responses API requests use `store: false`. Ordinary transcript requests include system-output text when captured. Microphone transcript text remains local unless **Mic context** is enabled in F9. Screenshot requests follow the separate **Screenshot input** setting described below.
+
+### Screenshot input
+
+Press F2 from the main screen to request insights from the monitor containing the terminal. The application hides the terminal briefly, captures that monitor, and restores the window before sending the image. F2 also works with microphone-only capture when Agent Insights is on and an API key is available. Capture errors restore the window, send nothing to the API, and appear in F9 diagnostics.
+
+The persistent **Screenshot input** setting in F9 applies immediately without restarting:
+
+- **Image + Context** is the default. It sends the screenshot with current transcripts, the selected reference document, and the current text Agent state. Microphone text follows the **Mic context** sharing choice.
+- **Image only** sends the screenshot without transcripts, reference documents, or prior Agent state.
+
+Screenshots are captured and shared with the API only when you press F2. Images stay in memory; they are not written to files or the clipboard, included in response history, or saved in restart state. Only one screenshot request can be outstanding. Retries reuse the same image; F5 and automatic settings restarts cancel pending screenshots without capturing another image. Later audio updates use text context without reusing the screenshot or Agent state derived from it.
+
+Successful screenshot responses enter the normal response history, and requests count toward the usual usage counters and token budget. API pause and budget rules still apply.
 
 ### Response history
 
@@ -78,7 +92,7 @@ Place private UTF-8 `.md`, `.txt`, `.json`, or `.csv` files in `contexts`, besid
     - **Soft** uses it as helpful background while allowing transcript evidence and reliable general knowledge.
     - **Strong** treats it as authoritative factual grounding, avoids outside facts, and states when the available context is insufficient.
 
-The selected file is loaded fresh and sent in full with every Agent Insights request. Editing it takes effect on the next request without another restart. Context-file selection is session-only and returns to **None** on every independent launch; F9 worker restarts preserve it within the current session. Context strictness remains persistent. Files are limited to 32 KiB, both to bound API cost and to prevent accidentally selecting a large export. Missing, empty, unreadable, non-UTF-8, symbolic-link, or oversized files stop before the API call and produce an F9 error.
+The selected file is loaded fresh and sent in full with ordinary transcript requests and **Image + Context** screenshot requests. **Image only** excludes the reference document. Editing it takes effect on the next request without another restart. Context-file selection is session-only and returns to **None** on every independent launch; F9 worker restarts preserve it within the current session. Context strictness remains persistent. Files are limited to 32 KiB, both to bound API cost and to prevent accidentally selecting a large export. Missing, empty, unreadable, non-UTF-8, symbolic-link, or oversized files stop before the API call and produce an F9 error.
 
 Changing the selected file or strictness clears Agent results and response history derived under the old context and requests a fresh update. Document content is sent as untrusted user data; a higher-priority developer policy tells the model never to treat instructions inside the document as prompt instructions. Private context files are ignored by Git, and only `example.md` is tracked. This is lightweight whole-document grounding, not chunked retrieval or full RAG.
 
@@ -91,6 +105,7 @@ Changing the selected file or strictness clears Agent results and response histo
 | Transcription | Language, Whisper model | Session-only; defaults to English with `medium.en` on a fresh launch and survives automatic worker restarts. |
 | Agent | Agent on/off, Agent model, Answer mode, Mic context, Context strictness | Persistent and applied through an automatic worker restart. |
 | Agent | Reference context | Session-only; defaults to **None** on a fresh launch and survives automatic worker restarts. |
+| Agent | Screenshot input | Persistent; Image + Context or Image only applies immediately without a restart. |
 | API safeguards | Hidden API pause, hidden exit, idle exit, maximum session, token budget | Applies without restarting capture. |
 | Appearance | Transparency | Applies immediately through the existing terminal-transparency tool. |
 
@@ -112,7 +127,7 @@ Every safeguard can be changed or disabled in F9. Turning Agent Insights off sto
 
 Plaintext transcript dumps are disabled by default. Enable them only for local debugging with `-TranscriptDump` or `TUKEVEJTSO_TRANSCRIPT_DUMP=1`; enabled dumps use the existing seven-day cleanup policy.
 
-The launcher restores any pre-existing `OPENAI_API_KEY` and `TUKEVEJTSO_TRANSCRIPT_DUMP` environment values when it exits. The client sets `store: false` on every request, but selected transcript and reference-context content still leaves the computer as request input whenever Agent Insights is enabled.
+The launcher restores any pre-existing `OPENAI_API_KEY` and `TUKEVEJTSO_TRANSCRIPT_DUMP` environment values when it exits. The client sets `store: false` on every request. Shared transcript and reference-context content leaves the computer in applicable Agent Insights requests, and pressing F2 shares the captured monitor image with the API according to **Screenshot input**. The image remains only in session memory; generated text can remain in response history and its protected restart handoff.
 
 ## Launcher options
 
