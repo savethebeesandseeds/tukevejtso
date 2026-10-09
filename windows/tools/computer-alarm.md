@@ -85,7 +85,8 @@ layout. UTC timestamps remain in the journal file.
 3. A confirmed AC-connected to AC-disconnected transition while the session is
    locked starts the fixed **two-second** countdown.
 4. If the session remains locked and AC remains disconnected for the entire
-   countdown, the siren and spoken warning start.
+   countdown, the siren and spoken warning start softly. Their rise to maximum
+   takes **15 seconds from playback starting**, after the two-second countdown.
 5. **Reconnect AC power or unlock the session to stop the alarm.** Either action
    also cancels a pending countdown. The controller stays enabled so a later
    valid locked-session disconnection can start a new countdown.
@@ -107,6 +108,13 @@ Saved state is local to the user in
 a service.
 
 ## Siren and spoken warning
+
+The shared audio-sample gain starts at **1% (-40 dB)**, then rises smoothly
+in decibels to **100% at 15 seconds**. The same envelope covers the siren and
+spoken warning and continues across their cycles and pauses. Each new alarm
+trigger restarts the soft beginning. The 15-second timer starts when playback
+starts; enabling the alarm and the preceding two-second countdown do not
+consume it.
 
 The alarm repeats a **1.6-second siren burst**, a **0.2-second pause**, the
 complete English warning, and a **0.4-second pause**. The siren pauses during
@@ -130,10 +138,18 @@ checks. Speech uses Windows' [SAPI memory stream](https://learn.microsoft.com/en
 assigned before synthesis according to the
 [SAPI output-stream documentation](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ms723597%28v%3Dvs.85%29).
 
-On activation, the alarm unmutes the selected speaker endpoint and raises its
-master and alarm-session volumes to full. Other sound using that endpoint can
-become louder. Reconnecting AC, unlocking, or normal shutdown stops playback and
-attempts to restore the original endpoint volume and mute state.
+On activation, the selected speaker's master and channel levels rise from their
+saved effective levels toward maximum over the same 15-second interval. An
+originally muted endpoint starts from an effective level of zero before being
+unmuted. The shared audio-sample envelope keeps both siren and voice soft at
+the beginning even when the saved speaker level was already high. Other sound
+using that endpoint can become louder as its levels rise.
+
+Reconnecting AC or unlocking immediately cancels the rise and stops playback;
+normal cleanup attempts to restore the original master/channel levels and mute
+state. Normal shutdown performs the same cleanup. The 1% starting gain applies
+to the alarm's audio samples; Windows sliders and perceived loudness depend on
+saved levels, hardware, and the Windows audio system.
 
 Windows' speaker metadata does not establish that an output is physically
 internal; combination headphone jacks can route a speaker endpoint externally.
@@ -190,8 +206,15 @@ Historical quiet validation on 8–9 October 2026:
   voice enumeration, speech preparation, playback, and volume changes were not
   executed for the voice update.
 
+For the 15-second soft-start update on 9 October 2026, the helper recompiled
+without warnings in the same managed Debian container. All **67 data-only
+checks** passed: 28 decision tests and 39 numeric audio tests, including 14 new
+checks for the gain curve, exact fifteen-second boundary, reset behavior,
+independence from repeated siren/voice cycles, and speaker-level interpolation.
+No Windows monitor, speech engine, audio device, or playback was used.
+
 The user deferred the real **Win+L → unplug → reconnect** test and intends to
 try the finished alarm later. These historical checks do not establish live
 transition timing, lock-screen behavior, current voice availability, Windows
-COM behavior, intelligibility, or audible cancellation. No audible tests have
-been performed or authorized for Codex.
+COM behavior, intelligibility, the perceived soft start, or audible cancellation.
+No audible tests have been performed or authorized for Codex.

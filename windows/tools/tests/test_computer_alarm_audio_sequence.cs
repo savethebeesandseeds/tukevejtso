@@ -262,6 +262,171 @@ public static class ComputerAlarmAudioSequenceTests
             ExpectException<ArgumentOutOfRangeException>(delegate { sequence.SegmentAt(-1); });
         });
 
+        Run("volume progress clamps at both finite boundaries", delegate {
+            Near(AlarmVolumeRamp.ProgressAtSeconds(-5), 0, "Negative time changed starting progress");
+            Near(AlarmVolumeRamp.ProgressAtSeconds(0), 0, "Starting progress is not zero");
+            Check(AlarmVolumeRamp.ProgressAtSeconds(14.999) < 1, "Progress reached maximum before fifteen seconds");
+            Near(AlarmVolumeRamp.ProgressAtSeconds(15), 1, "Progress missing at fifteen seconds");
+            Near(AlarmVolumeRamp.ProgressAtSeconds(Double.MaxValue), 1, "Large finite time did not hold maximum");
+        });
+
+        Run("volume gain starts at one percent and reaches exact maximum", delegate {
+            Near(AlarmVolumeRamp.GainAtSeconds(0), .01, "Ramp did not start at one percent");
+            Near(AlarmVolumeRamp.GainAtSeconds(-1), .01, "Negative time did not preserve initial gain");
+            Near(AlarmVolumeRamp.GainAtSeconds(7.5), .1, "Halfway gain is not ten percent");
+            Check(AlarmVolumeRamp.GainAtSeconds(14.999) < 1, "Gain reached maximum too early");
+            Check(AlarmVolumeRamp.GainAtSeconds(15) == 1, "Fifteen-second gain is not exact maximum");
+            Check(AlarmVolumeRamp.GainAtSeconds(900) == 1, "Maximum gain was not held");
+        });
+
+        Run("volume rise has equal decibel steps", delegate {
+            double first = AlarmVolumeRamp.GainAtSeconds(0);
+            double quarter = AlarmVolumeRamp.GainAtSeconds(3.75);
+            double half = AlarmVolumeRamp.GainAtSeconds(7.5);
+            double later = AlarmVolumeRamp.GainAtSeconds(11.25);
+            Near(quarter / first, half / quarter, "First two equal time intervals have different gain ratios");
+            Near(half / quarter, later / half, "Later interval changed decibel slope");
+        });
+
+        Run("volume gain is monotonic finite and bounded", delegate {
+            double previous = AlarmVolumeRamp.InitialGain;
+            for (int step = 0; step <= 1200; step++)
+            {
+                double gain = AlarmVolumeRamp.GainAtSeconds(step * .015);
+                Check(!Double.IsNaN(gain) && !Double.IsInfinity(gain), "Gain became nonfinite");
+                Check(gain >= .01 && gain <= 1, "Gain exceeded normalized bounds");
+                Check(gain >= previous, "Gain decreased during ramp");
+                previous = gain;
+            }
+        });
+
+        Run("frame volume reaches maximum at exactly fifteen seconds", delegate {
+            AlarmVolumeRamp ramp = new AlarmVolumeRamp(8000);
+            for (long frame = 0; frame < 120000; frame++)
+            {
+                double gain = ramp.NextGain();
+                if (frame == 0) Near(gain, .01, "First frame not quiet");
+                Check(gain < 1, "Frame ramp reached full volume before fifteen seconds");
+            }
+            Check(ramp.FramePosition == 120000, "Frame timeline missing deadline");
+            Check(ramp.NextGain() == 1, "Deadline frame did not reach full volume");
+            for (int extra = 0; extra < 1000; extra++)
+                Check(ramp.NextGain() == 1, "Volume did not stay at maximum");
+            Check(ramp.FramePosition == 120000, "Saturated timeline kept increasing");
+        });
+
+        Run("new trigger resets gain to one percent", delegate {
+            AlarmVolumeRamp ramp = new AlarmVolumeRamp(8000);
+            for (int frame = 0; frame < 80000; frame++) ramp.NextGain();
+            Check(ramp.NextGain() > .01, "Setup did not increase gain");
+            ramp.Reset();
+            Check(ramp.FramePosition == 0, "Reset retained previous trigger timeline");
+            Near(ramp.NextGain(), .01, "New trigger reused elevated gain");
+            Near(ramp.NextGain(), AlarmVolumeRamp.GainAtSeconds(1.0 / 8000), "New trigger did not restart smooth rise");
+        });
+
+        Run("volume timeline spans repeated siren and voice cycles", delegate {
+            AlarmSequence sequence = new AlarmSequence(Constant(400, 1000), 8000, 8000);
+            AlarmVolumeRamp ramp = new AlarmVolumeRamp(8000);
+            int completedCycles = 0;
+            for (long frame = 0; frame < 120000; frame++)
+            {
+                double gain = ramp.NextGain();
+                sequence.NextSample();
+                if (frame > 0 && frame % sequence.CycleFrames == 0)
+                {
+                    completedCycles++;
+                    Check(gain > .01 && gain < 1, "A sequence cycle restarted or completed the volume ramp");
+                }
+                Near(gain, AlarmVolumeRamp.GainAtSeconds((double)frame / 8000), "Sequence cycle changed absolute ramp time");
+            }
+            Check(completedCycles > 1, "Scenario did not cross multiple sequence cycles");
+            Check(ramp.NextGain() == 1, "Cycle repetitions delayed fifteen-second maximum");
+        });
+
+        Run("resetting audio sequence does not reset volume", delegate {
+            AlarmSequence sequence = new AlarmSequence(new short[] { 1000 }, 8000, 8000);
+            AlarmVolumeRamp ramp = new AlarmVolumeRamp(8000);
+            for (int frame = 0; frame < 60000; frame++)
+            {
+                sequence.NextSample();
+                ramp.NextGain();
+            }
+            sequence.Reset();
+            Near(ramp.NextGain(), .1, "Resetting sequence changed volume timeline");
+        });
+
+        Run("volume timing is independent of sample rate", delegate {
+            int[] rates = new int[] { 8000, 44100, 192000 };
+            foreach (int rate in rates)
+            {
+                AlarmVolumeRamp ramp = new AlarmVolumeRamp(rate);
+                long halfway = (long)rate * 15 / 2;
+                long deadline = (long)rate * 15;
+                while (ramp.FramePosition < halfway) ramp.NextGain();
+                Near(ramp.NextGain(), .1, "Sample rate changed halfway gain");
+                while (ramp.FramePosition < deadline) ramp.NextGain();
+                Check(ramp.NextGain() == 1, "Sample rate changed maximum deadline");
+            }
+        });
+
+        Run("endpoint original level is preserved at startup", delegate {
+            double[] originals = new double[] { 0, .25, 1 };
+            foreach (double original in originals)
+            {
+                Near(AlarmVolumeRamp.EndpointLevelAtSeconds(original, 0), original, "Startup changed original endpoint level");
+                Near(AlarmVolumeRamp.EndpointLevelAtSeconds(original, -10), original, "Negative time changed endpoint level");
+            }
+        });
+
+        Run("endpoint level rises from original to maximum over fifteen seconds", delegate {
+            Near(AlarmVolumeRamp.EndpointLevelAtSeconds(0, 7.5), .5, "Zero endpoint halfway level incorrect");
+            Near(AlarmVolumeRamp.EndpointLevelAtSeconds(.25, 7.5), .625, "Quarter endpoint halfway level incorrect");
+            Near(AlarmVolumeRamp.EndpointLevelAtSeconds(1, 7.5), 1, "Maximum original endpoint was reduced");
+            double[] originals = new double[] { 0, .25, 1 };
+            foreach (double original in originals)
+            {
+                Check(AlarmVolumeRamp.EndpointLevelAtSeconds(original, 15) == 1, "Endpoint not full at fifteen seconds");
+                Check(AlarmVolumeRamp.EndpointLevelAtSeconds(original, 90) == 1, "Endpoint did not remain full");
+            }
+            Check(AlarmVolumeRamp.EndpointLevelAtSeconds(.25, 14.999) < 1, "Endpoint reached full volume early");
+        });
+
+        Run("endpoint levels remain monotonic finite and bounded", delegate {
+            double[] originals = new double[] { 0, .25, 1 };
+            foreach (double original in originals)
+            {
+                double previous = original;
+                for (int step = 0; step <= 1000; step++)
+                {
+                    double scalar = AlarmVolumeRamp.EndpointLevelAtSeconds(original, step * .02);
+                    Check(!Double.IsNaN(scalar) && !Double.IsInfinity(scalar), "Endpoint level became nonfinite");
+                    Check(scalar >= original && scalar <= 1, "Endpoint level exceeded original/maximum bounds");
+                    Check(scalar >= previous, "Endpoint level decreased");
+                    previous = scalar;
+                }
+            }
+        });
+
+        Run("nonfinite ramp time and invalid endpoint levels rejected", delegate {
+            double[] invalidTimes = new double[] { Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity };
+            foreach (double time in invalidTimes)
+            {
+                ExpectException<ArgumentOutOfRangeException>(delegate { AlarmVolumeRamp.ProgressAtSeconds(time); });
+                ExpectException<ArgumentOutOfRangeException>(delegate { AlarmVolumeRamp.GainAtSeconds(time); });
+                ExpectException<ArgumentOutOfRangeException>(delegate { AlarmVolumeRamp.EndpointLevelAtSeconds(.25, time); });
+            }
+            double[] invalidLevels = new double[] { -.001, 1.001, Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity };
+            foreach (double original in invalidLevels)
+                ExpectException<ArgumentOutOfRangeException>(delegate { AlarmVolumeRamp.EndpointLevelAtSeconds(original, 0); });
+        });
+
+        Run("volume ramp rejects unsupported sample rates", delegate {
+            int[] invalid = new int[] { Int32.MinValue, -1, 0, 7999, 192001, Int32.MaxValue };
+            foreach (int rate in invalid)
+                ExpectException<ArgumentOutOfRangeException>(delegate { new AlarmVolumeRamp(rate); });
+        });
+
         Console.WriteLine(cases + " pure numeric tests, " + failures + " failures. No audio or speech engine access.");
         return failures == 0 ? 0 : 1;
     }

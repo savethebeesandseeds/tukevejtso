@@ -6,6 +6,65 @@ namespace ComputerAlarmAudio
 {
     public enum AlarmSegment { Siren, GapBeforeSpeech, Speech, GapAfterSpeech }
 
+    public sealed class AlarmVolumeRamp
+    {
+        public const double DurationSeconds = 15.0;
+        public const double InitialGain = 0.01;
+        private readonly int outputRate;
+        private readonly long fullVolumeFrame;
+        private long framePosition;
+
+        public long FramePosition { get { return framePosition; } }
+
+        public AlarmVolumeRamp(int outputRate)
+        {
+            if (outputRate < 8000 || outputRate > 192000)
+                throw new ArgumentOutOfRangeException("outputRate", "PCM sample rates must be from 8000 to 192000 Hz.");
+            this.outputRate = outputRate;
+            fullVolumeFrame = (long)(outputRate * DurationSeconds);
+        }
+
+        public double NextGain()
+        {
+            double gain = GainAtSeconds((double)framePosition / outputRate);
+            // This is an absolute per-run cursor, independent of speech/siren
+            // cycles. Saturation prevents overflow during indefinite playback.
+            if (framePosition < fullVolumeFrame) framePosition++;
+            return gain;
+        }
+
+        public void Reset() { framePosition = 0; }
+
+        public static double ProgressAtSeconds(double elapsedSeconds)
+        {
+            if (Double.IsNaN(elapsedSeconds) || Double.IsInfinity(elapsedSeconds))
+                throw new ArgumentOutOfRangeException("elapsedSeconds", "Ramp time must be finite.");
+            if (elapsedSeconds <= 0) return 0;
+            if (elapsedSeconds >= DurationSeconds) return 1;
+            return elapsedSeconds / DurationSeconds;
+        }
+
+        public static double GainAtSeconds(double elapsedSeconds)
+        {
+            double progress = ProgressAtSeconds(elapsedSeconds);
+            if (progress == 0) return InitialGain;
+            if (progress == 1) return 1;
+            // Equal time intervals produce equal increases in decibels.
+            return InitialGain * Math.Pow(1 / InitialGain, progress);
+        }
+
+        public static double EndpointLevelAtSeconds(double originalScalar, double elapsedSeconds)
+        {
+            if (Double.IsNaN(originalScalar) || Double.IsInfinity(originalScalar) ||
+                originalScalar < 0 || originalScalar > 1)
+                throw new ArgumentOutOfRangeException("originalScalar", "Endpoint volume must be a finite scalar from zero to one.");
+            double progress = ProgressAtSeconds(elapsedSeconds);
+            if (progress == 0) return originalScalar;
+            if (progress == 1) return 1;
+            return originalScalar + (1 - originalScalar) * progress;
+        }
+    }
+
     public sealed class AlarmSequence
     {
         public const double SirenAmplitude = 0.95;

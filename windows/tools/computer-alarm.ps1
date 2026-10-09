@@ -28,7 +28,8 @@ function Show-AlarmHelp {
     Write-Host 'Only AC availability is used. A genuine outage can also trigger it.'
     Write-Host 'The dashboard shows Enabled, Windows locked, AC online, Battery present, Countdown pending, and Alarm active flags.'
     Write-Host 'Opening the dashboard only reads power and lock state. It does not enable the alarm.'
-    Write-Host 'The alarm alternates siren bursts with a spoken instruction to reconnect power.'
+    Write-Host 'The alarm starts softly and rises to maximum over 15 seconds from playback starting.'
+    Write-Host 'The rise continues across siren bursts and speech, and restarts with each new trigger.'
     Write-Host 'The police-notification sentence is a deterrent message only; no call is made.'
     Write-Host 'Keep this monitor open. Q/Esc while unlocked, or Ctrl+C, disables it.'
     Write-Host 'The console is hidden by the Windows lock screen; inspect the event times after unlocking.'
@@ -245,7 +246,7 @@ function Start-ComputerAlarm {
                 $speaker = $endpoints[$choice - 1]
             }
             $speakerId = $speaker.Id
-            Write-Host ('Full-volume siren and spoken warning: ' + $speaker.Name) -ForegroundColor Yellow
+            Write-Host ('Soft-start siren and spoken warning; maximum after 15 seconds: ' + $speaker.Name) -ForegroundColor Yellow
             Write-Host 'A genuine power outage while locked can trigger this alarm.'
             Write-Host ([ComputerAlarmNative.Audio]::WarningText)
             Write-Host 'The police-notification sentence is a bluff; this tool does not contact anyone.' -ForegroundColor DarkGray

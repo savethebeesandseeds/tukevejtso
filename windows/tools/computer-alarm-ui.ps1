@@ -298,7 +298,7 @@ function Get-AlarmUiFrame {
     if ((ConvertTo-AlarmUiText $delayWithLast).Length -le $delayWidth) { $delay = $delayWithLast }
     if ($compact) {
         $lines.Add((Format-TuiAnsiText (Format-TuiFit (ConvertTo-AlarmUiText (' ' + $p.Label)) $Width) -Foreground $p.Color -Bold))
-        if ($Height -ge 12) { $lines.Add((Format-TuiFit ' Output: siren + spoken warning' $Width)) }
+        if ($Height -ge 12) { $lines.Add((Format-TuiFit ' Output: soft start; max in 15s' $Width)) }
         foreach ($row in @(Get-AlarmUiFlagRows $p ([Math]::Max(1, $Width - 1)))) {
             $lines.Add((Format-TuiFit (' ' + $row) $Width))
         }
@@ -331,7 +331,7 @@ function Get-AlarmUiFrame {
         $panel = New-Object 'System.Collections.Generic.List[string]'
         $panel.Add((Get-AlarmUiBorder $panelWidth 'Protection'))
         $panel.Add((Get-AlarmUiRow $panelWidth $p.Label $p.Color -Bold))
-        $panel.Add((Get-AlarmUiRow $panelWidth 'Output / full-volume siren + spoken warning'))
+        $panel.Add((Get-AlarmUiRow $panelWidth 'Output / soft start; max in 15s / siren + voice'))
         foreach ($row in @(Get-AlarmUiFlagRows $p ($panelWidth - 4))) {
             $panel.Add((Get-AlarmUiRow $panelWidth $row))
         }
@@ -374,7 +374,7 @@ function Get-AlarmUiFrame {
                 $prefix = if ($index -eq $Selected) { ' > ' } else { '   ' }
                 $lines.Add((Format-TuiAnsiText (Format-TuiFit ($prefix + $actions[$index]) $Width) -Foreground $(if ($index -eq $Selected) { '#e7be72' } else { '#cbd2da' }) -Bold:($index -eq $Selected)))
             }
-            $detail = @('Siren and voice require the typed confirmation.', 'Browse saved events without enabling the alarm.')[$Selected]
+            $detail = @('Soft start; max in 15s. Typed confirmation required.', 'Browse saved events without enabling the alarm.')[$Selected]
             $lines.Add((Format-TuiAnsiText (Format-TuiFit (' ' + $detail) $Width) -Foreground '#9aa4ae'))
         }
     }

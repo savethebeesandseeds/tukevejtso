@@ -502,14 +502,19 @@ namespace ComputerAlarmNative
                 byte[] buffer = new byte[checked((int)bufferFrames * format.BlockAlign)];
                 ComputerAlarmAudio.AlarmSequence sequence = new ComputerAlarmAudio.AlarmSequence(
                     current.VoiceClip.CopySamples(), SpeechClip.SampleRate, (int)format.SampleRate);
-                Fill(renderer, bufferFrames, buffer, format, floatSamples, validBits, sequence);
+                // A new envelope belongs to this playback run, not to the
+                // repeating siren/voice cycle. Primed samples begin at t = 0.
+                ComputerAlarmAudio.AlarmVolumeRamp envelope = new ComputerAlarmAudio.AlarmVolumeRamp((int)format.SampleRate);
+                Fill(renderer, bufferFrames, buffer, format, floatSamples, validBits, sequence, envelope);
                 // Audio initialization may take seconds. Recheck on the worker so
                 // unlock or restored AC during that wait cannot start an alarm.
                 if (!CanPlay(current)) { current.Cancelled = true; return; }
                 volumeChanged = true; // Partial volume-write failures also restore.
-                RaiseVolume(endpointVolume, sessionVolume, channelCount, ref context);
+                if (!ApplyVolumeRamp(current, endpointVolume, sessionVolume, originalMaster, originalChannels, originalMute, 0, ref context))
+                { current.Cancelled = true; return; }
                 if (!CanPlay(current)) { current.Cancelled = true; return; }
                 Check(client.Start());
+                Stopwatch playbackTimer = Stopwatch.StartNew();
                 streamStarted = true;
                 current.IsPlaying = true;
                 current.Ready.Set();
@@ -524,9 +529,13 @@ namespace ComputerAlarmNative
                         current.Cancelled = true;
                         break;
                     }
-                    if (Interlocked.Exchange(ref current.RequestVolume, 0) != 0 || volumeTimer.ElapsedMilliseconds >= 1000)
+                    if (Interlocked.Exchange(ref current.RequestVolume, 0) != 0 || volumeTimer.ElapsedMilliseconds >= 50)
                     {
-                        RaiseVolume(endpointVolume, sessionVolume, channelCount, ref context);
+                        // The refresh timer may restart; playback elapsed time
+                        // never does. Enforcement reapplies the current target.
+                        if (!ApplyVolumeRamp(current, endpointVolume, sessionVolume, originalMaster, originalChannels,
+                            originalMute, playbackTimer.Elapsed.TotalSeconds, ref context))
+                        { current.Cancelled = true; break; }
                         volumeTimer.Restart();
                     }
                     uint padding;
@@ -538,7 +547,7 @@ namespace ComputerAlarmNative
                         // COM volume/padding calls above can take time. Confirm
                         // the stop conditions again before submitting new audio.
                         if (!CanPlay(current)) { current.Cancelled = true; break; }
-                        Fill(renderer, available, buffer, format, floatSamples, validBits, sequence);
+                        Fill(renderer, available, buffer, format, floatSamples, validBits, sequence, envelope);
                     }
                 }
             }
@@ -552,6 +561,11 @@ namespace ComputerAlarmNative
                 // Hard process termination or removed hardware can defeat restoration.
                 if (volumeSaved && volumeChanged && endpointVolume != null)
                 {
+                    // If the endpoint was muted before triggering, mute first:
+                    // restoring its saved high volume must not briefly expose
+                    // other applications' audio during an early cancellation.
+                    if (originalMute)
+                        TryCleanup(current, delegate() { Check(endpointVolume.SetMute(true, ref context)); }, "restore mute before volume");
                     TryCleanup(current, delegate() { Check(endpointVolume.SetMasterVolumeLevelScalar(originalMaster, ref context)); }, "restore master volume");
                     for (uint i = 0; i < originalChannels.Length; i++)
                     {
@@ -571,22 +585,39 @@ namespace ComputerAlarmNative
             return !current.Stop.WaitOne(0) && current.Guard.State == LockState.Locked &&
                    current.Guard.UnlockGeneration == current.UnlockGeneration && Power.ReadAc() == AcState.Offline;
         }
-        private static void RaiseVolume(IAudioEndpointVolume endpoint, ISimpleAudioVolume session, uint channels, ref Guid context)
+        private static bool ApplyVolumeRamp(RunState current, IAudioEndpointVolume endpoint, ISimpleAudioVolume session,
+            float originalMaster, float[] originalChannels, bool originalMute, double elapsedSeconds, ref Guid context)
         {
+            // PCM carries the deterministic 1%-to-full alarm envelope. Keep
+            // this session at unity while the endpoint itself rises from its
+            // saved effective settings, avoiding a sudden boost to other apps.
+            if (!CanPlay(current)) return false;
             Check(session.SetMasterVolume(1.0f, ref context));
+            if (!CanPlay(current)) return false;
             Check(session.SetMute(false, ref context));
-            Check(endpoint.SetMasterVolumeLevelScalar(1.0f, ref context));
-            for (uint i = 0; i < channels; i++) Check(endpoint.SetChannelVolumeLevelScalar(i, 1.0f, ref context));
+            for (uint i = 0; i < originalChannels.Length; i++)
+            {
+                if (!CanPlay(current)) return false;
+                float level = (float)ComputerAlarmAudio.AlarmVolumeRamp.EndpointLevelAtSeconds(
+                    originalMute ? 0 : originalChannels[i], elapsedSeconds);
+                Check(endpoint.SetChannelVolumeLevelScalar(i, level, ref context));
+            }
+            float master = (float)ComputerAlarmAudio.AlarmVolumeRamp.EndpointLevelAtSeconds(
+                originalMute ? 0 : originalMaster, elapsedSeconds);
+            if (!CanPlay(current)) return false;
+            Check(endpoint.SetMasterVolumeLevelScalar(master, ref context));
+            if (!CanPlay(current)) return false;
             Check(endpoint.SetMute(false, ref context));
+            return true;
         }
         private static void Fill(IAudioRenderClient renderer, uint frames, byte[] buffer, WaveFormat format,
-            bool floating, ushort validBits, ComputerAlarmAudio.AlarmSequence sequence)
+            bool floating, ushort validBits, ComputerAlarmAudio.AlarmSequence sequence, ComputerAlarmAudio.AlarmVolumeRamp envelope)
         {
             int offset = 0;
             int bytesPerSample = format.BitsPerSample / 8;
             for (uint frame = 0; frame < frames; frame++)
             {
-                double sample = sequence.NextSample();
+                double sample = sequence.NextSample() * envelope.NextGain();
                 // Integer extensible PCM keeps valid bits left-aligned in its container.
                 long integer = floating ? 0 : (long)(sample * (Math.Pow(2, validBits - 1) - 1)) << (format.BitsPerSample - validBits);
                 byte[] floatBytes = floating ? BitConverter.GetBytes((float)sample) : null;

@@ -17,4 +17,4 @@ mono "$build_dir/AlarmLogicTests.exe"
 mcs -warnaserror+ -out:"$build_dir/AlarmAudioSequenceTests.exe" \
   "$source_dir/computer-alarm-audio-sequence.cs" "$source_dir/tests/test_computer_alarm_audio_sequence.cs"
 mono "$build_dir/AlarmAudioSequenceTests.exe"
-echo "Compiled Windows helper and completed silent decision/sample-data tests in Debian. No SAPI, native Windows monitoring, or audio playback code was executed."
+echo "Compiled Windows helper and completed data-only decision/sample-data tests in Debian. No SAPI, native Windows monitoring, or audio playback code was executed."
