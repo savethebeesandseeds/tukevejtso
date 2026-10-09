@@ -30,6 +30,11 @@ tk enhanced-typing
 tk openai-key
 tk robotics-learning
 tk terminal-transparency
+tk alarm
+tk alarm status
+tk alarm logs
+tk alarm preview
+tk alarm arm
 tk reboot
 tk reboot status
 tk reboot toggle
@@ -138,6 +143,16 @@ Run the automated checks from the repository root:
 py -m unittest discover -s windows/tools/tests -p test_pdf_compress.py
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/tools/tests/test_compress_pdf.ps1
 ```
+
+## Computer alarm
+
+`tk alarm` opens a terminal dashboard with six flags: Enabled, Windows locked, AC online, Battery present, Countdown pending, and Alarm active. Each is TRUE, FALSE, or UNKNOWN. A read-only watcher shows current lock and power hardware without enabling the alarm, creating audio or an alarm engine, or keeping Windows awake. Hardware sources are labeled live, saved, or sample; controller flags come from the live controller or a fresh saved report labeled reported. Stale controller flags are UNKNOWN. The padlock preserves the terminal's background, with a compact layout for narrow terminals.
+
+Up/Down and Enter select Enable alarm or Saved journal. A enables the alarm, L remains an alias, J opens the journal, R/S refreshes, H shows help, and Q/Esc returns. `tk alarm status` reads hardware once alongside saved controller flags. `tk alarm logs` browses up to 40 valid recent saved events without hardware queries: Up/Down scrolls, Home/End jumps to oldest/newest, R refreshes, and Q/Esc returns. Times display locally. `tk alarm preview` uses fixed sample data without native loading, hardware/audio queries, arming, or report writes.
+
+`tk alarm arm` offers the audible alarm and requires typing `ARM LOUD ALARM`; `-Output loud` is accepted for compatibility. Enabling requires AC and battery power. A new AC disconnection while the same Windows session is locked starts a two-second countdown, then the siren and spoken warning. Reconnecting AC or unlocking stops an active alarm or pending countdown. Keep the foreground controller running; there is no persistent enabled setting or automatic startup.
+
+The alarm alternates siren bursts with an English instruction to reconnect the charger and the requested police-notification deterrent line. That line is a bluff; the tool makes no call or notification. An installed English Windows voice prepares the warning in memory after confirmation. Windows' AC status also reacts to genuine outages; no motion signal is used. The user will try the finished alarm later; Codex has performed no audible tests and has no authorization to run them. See the [computer alarm guide](tools/computer-alarm.md) for controls, limitations, the container-only build, and 53 historical data-only checks.
 
 ## PDF joiner
 

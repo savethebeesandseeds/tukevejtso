@@ -26,6 +26,8 @@ goto done
 
 :args
 set "TOOLKIT_FROM_MENU="
+if /I "%~1"=="alarm" goto computer_alarm
+if /I "%~1"=="computer-alarm" goto computer_alarm
 if /I "%~1"=="password" goto password_manager
 if /I "%~1"=="robotics-learning" goto robotics_learning_dev
 if /I "%~1"=="linux" goto tukevejtso_linux
@@ -65,6 +67,21 @@ echo Unknown toolkit command: %~1
 echo.
 goto help
 
+:computer_alarm
+shift /1
+set "COMPUTER_ALARM_ACTION=%~1"
+if "%COMPUTER_ALARM_ACTION%"=="" set "COMPUTER_ALARM_ACTION=menu"
+if not "%~1"=="" shift /1
+set "COMPUTER_ALARM_ARGS="
+:computer_alarm_args
+if "%~1"=="" goto computer_alarm_run
+set COMPUTER_ALARM_ARGS=%COMPUTER_ALARM_ARGS% "%~1"
+shift /1
+goto computer_alarm_args
+:computer_alarm_run
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File "%ROOT%tools\computer-alarm.ps1" -Action "%COMPUTER_ALARM_ACTION%" %COMPUTER_ALARM_ARGS%
+set "COMPUTER_ALARM_EXIT=%ERRORLEVEL%"
+endlocal & exit /b %COMPUTER_ALARM_EXIT%
 :reboot_guard
 set "REBOOT_ACTION=%~2"
 if "%REBOOT_ACTION%"=="" powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\windows-update-reboots.ps1"
@@ -81,6 +98,11 @@ echo tukevejtso for Windows
 echo.
 echo Usage:
 echo   tk                         Open the interactive menu
+echo   tk alarm                   Open the computer alarm dashboard
+echo   tk alarm arm               Confirm and enable the siren and spoken warning
+echo   tk alarm status            Show current power/lock flags and alarm report
+echo   tk alarm logs              Browse the saved alarm journal
+echo   tk alarm preview           Preview the interface without monitoring
 echo   tk password                Generate passwords with length/complexity options
 echo   tk linux                   Prepare/open the tukevejtso Debian utility container
 echo   tk cutout INPUT [OUTPUT]   Remove image backgrounds into transparent PNGs

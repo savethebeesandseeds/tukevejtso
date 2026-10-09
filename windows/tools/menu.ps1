@@ -139,6 +139,7 @@ $items = @(
     @{ Group = 'Containers & services'; Label = 'Storage & sharing'; Detail = 'Manage the file-sharing service and check its status.'; Script = Join-Path $PSScriptRoot 'storage-and-sharing-services.ps1' },
     @{ Group = 'Containers & services'; Label = 'Open container shell'; Detail = 'Choose an existing Docker container and open its shell.'; Script = Join-Path $PSScriptRoot 'docker-bash.ps1' },
     @{ Group = 'Containers & services'; Label = 'Create container'; Detail = 'Choose an image, name, ports, and mounts for a new Docker container.'; Script = Join-Path $PSScriptRoot 'docker-new.ps1' },
+    @{ Group = 'System & security'; Label = 'Computer alarm'; Detail = 'Siren and voice after locked AC loss; inspect flags and enable the alarm.'; Script = Join-Path $PSScriptRoot 'computer-alarm.ps1' },
     @{ Group = 'System & security'; Label = 'Generate password'; Detail = 'Create a password locally without saving it.'; ExitCode = 25 },
     @{ Group = 'System & security'; Label = 'Review executables'; Detail = 'Review executable signatures, scripts, and startup entries.'; Script = Join-Path $PSScriptRoot 'review-executables.ps1' },
     @{ Group = 'System & security'; Label = 'Windows Update reboot guard'; Detail = 'Control automatic restarts while you are logged in.'; Script = Join-Path $PSScriptRoot 'windows-update-reboots.ps1' },
