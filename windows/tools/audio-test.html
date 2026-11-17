@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Audio lab · tukevejtso</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #201e19;
+  --sidebar: #26251f;
+  --panel: #2b2922;
+  --control: #343329;
+  --hover: #444536;
+  --line: #484538;
+  --muted: #b5af9c;
+  --text: #eee8d7;
+  --sage: #b2bc8b;
+  --ochre: #d7ae72;
+  --clay: #de9c82;
+}
+* { box-sizing: border-box; }
+html { height: 100%; }
+body {
+  margin: 0;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.45 'Segoe UI', system-ui, sans-serif;
+}
+button, input, select { font: inherit; }
+button, select, input[type=number] {
+  min-height: 32px;
+  border: 1px solid #595542;
+  border-radius: 5px;
+  background: var(--control);
+  color: var(--text);
+  padding: 6px 9px;
+}
+button { cursor: pointer; transition: background .15s; }
+button:hover:not(:disabled) { background: var(--hover); }
+button:focus-visible, select:focus-visible, input:focus-visible,
+a:focus-visible, summary:focus-visible { outline: 2px solid var(--sage); outline-offset: 2px; }
+button:disabled { opacity: .42; cursor: default; }
+button.primary { background: var(--sage); border-color: var(--sage); color: #22271b; font-weight: 700; }
+button.primary:hover:not(:disabled) { background: #c6cda6; }
+button.stop { border-color: #9c6f58; color: var(--clay); }
+button.small { min-height: 27px; padding: 4px 8px; font-size: 11px; }
+header {
+  flex: 0 0 auto;
+  min-height: 58px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #24221c;
+}
+.logo {
+  border: 1px solid #747958;
+  border-radius: 7px;
+  width: 31px;
+  height: 31px;
+  display: grid;
+  place-items: center;
+  color: var(--sage);
+  font-size: 21px;
+}
+h1 { font-size: 17px; line-height: 1.2; margin: 0; font-weight: 650; letter-spacing: -.35px; }
+header p { margin: 2px 0 0; color: var(--muted); font-size: 10px; }
+.badge {
+  margin-left: auto;
+  font: 9px/1.5 ui-monospace, Consolas, monospace;
+  letter-spacing: 1px;
+  color: var(--sage);
+  border: 1px solid #565d42;
+  border-radius: 5px;
+  padding: 4px 8px;
+}
+.layout {
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr);
+  overflow: hidden;
+}
+aside, main {
+  min-height: 0;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #77745d transparent;
+}
+aside:focus-visible, main:focus-visible { outline: 1px solid var(--sage); outline-offset: -2px; }
+aside { padding: 15px 14px; border-right: 1px solid var(--line); background: var(--sidebar); }
+main { padding: 14px 16px; }
+.eyebrow { font-size: 9px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase; color: var(--ochre); margin: 0 0 9px; }
+.section { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--line); }
+label { display: block; color: #d8d0bc; font-size: 11px; margin: 9px 0 4px; }
+select { width: 100%; text-overflow: ellipsis; }
+.row { display: flex; gap: 6px; align-items: center; }
+.row > * { min-width: 0; }
+.row button { flex: 1; }
+.hint { font-size: 10px; color: var(--muted); line-height: 1.5; margin: 6px 0 0; }
+.capture-buttons { margin-top: 12px; }
+.time { font: 27px/1.15 ui-monospace, Consolas, monospace; letter-spacing: -1px; margin-top: 12px; }
+.time small { font: 10px 'Segoe UI', sans-serif; letter-spacing: 0; color: var(--muted); margin-left: 8px; }
+.meter { height: 4px; background: #444638; border-radius: 3px; margin: 7px 0; overflow: hidden; }
+.meter span { display: block; width: 0; height: 100%; background: var(--sage); }
+.meter-label { display: flex; justify-content: space-between; color: var(--muted); font-size: 9px; }
+.file { width: 100%; margin-top: 6px; }
+#fileInput { display: none; }
+#status { font-size: 11px; color: var(--muted); padding: 8px 0 0; min-height: 38px; }
+#status.error { color: var(--clay); }
+.workspace-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.workspace-head > div { min-width: 0; }
+h2 { font-size: 20px; letter-spacing: -.4px; margin: 0 0 3px; font-weight: 600; }
+.subtitle { color: var(--muted); font-size: 11px; margin: 0; overflow-wrap: anywhere; }
+.live-tag { font-size: 10px; color: var(--muted); white-space: nowrap; padding-top: 6px; }
+.live-tag::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--sage); margin-right: 6px; }
+.live-tag.recording { color: var(--clay); }
+.live-tag.recording::before { background: var(--clay); }
+.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-bottom: 12px; }
+.metric { border: 1px solid var(--line); background: var(--panel); padding: 10px 12px; border-radius: 6px; }
+.metric .label { font-size: 9px; text-transform: uppercase; letter-spacing: .7px; color: var(--muted); }
+.metric .value { font: 23px/1.3 ui-monospace, Consolas, monospace; margin-top: 4px; letter-spacing: -.8px; }
+.unit { font: 10px 'Segoe UI', sans-serif; letter-spacing: 0; color: var(--muted); margin-left: 4px; }
+.metric .detail { font-size: 10px; color: var(--muted); margin-top: 2px; }
+.sage { color: var(--sage); }
+.ochre { color: var(--ochre); }
+.charts { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.panel { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.wide { grid-column: 1 / -1; }
+.panel-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; padding: 10px 12px 5px; gap: 6px; }
+.panel h3 { font-size: 12px; font-weight: 600; margin: 0; }
+.panel-note { color: var(--muted); font: 9px ui-monospace, Consolas, monospace; }
+.plot { position: relative; padding: 0 7px 3px; }
+canvas { display: block; width: 100%; height: clamp(160px, 23vh, 225px); }
+.wave canvas { height: clamp(110px, 16vh, 155px); }
+.empty { position: absolute; inset: 0; display: grid; place-content: center; padding: 15px; text-align: center; pointer-events: none; }
+.empty strong { font-size: 13px; font-weight: 500; color: #d8d0bc; }
+.empty span { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.selection { border-top: 1px solid var(--line); padding: 7px 12px; display: flex; gap: 12px; align-items: center; }
+.selection label { margin: 0; white-space: nowrap; }
+.selection input { width: 100%; min-width: 40px; margin: 0; accent-color: var(--sage); }
+.range-control { display: flex; gap: 6px; align-items: center; flex: 1; min-width: 0; }
+.range-control output { font: 10px ui-monospace, Consolas, monospace; min-width: 43px; color: var(--muted); }
+.below { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; margin-top: 10px; }
+.inner { padding: 0 12px 11px; }
+.noise-readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 10px 0 4px; }
+.noise-readout strong { display: block; font: 19px ui-monospace, Consolas, monospace; color: var(--ochre); }
+.noise-readout span { font-size: 9px; color: var(--muted); }
+#clearBaseline { margin-top: 7px; }
+.bands { width: 100%; border-collapse: collapse; font-size: 11px; }
+.bands td { padding: 5px 0; border-bottom: 1px solid var(--line); }
+.bands td:last-child { text-align: right; font-family: ui-monospace, Consolas, monospace; color: var(--sage); }
+.bands tr:last-child td { border: 0; }
+audio { width: 100%; height: 32px; margin: 8px 0; display: block; }
+.export { margin-top: 6px; }
+.export button { font-size: 10px; }
+.foot { font-size: 9px; color: var(--muted); display: flex; justify-content: space-between; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+.swatch { display: inline-block; width: 6px; height: 6px; background: var(--sage); border-radius: 50%; margin-right: 5px; }
+.legend { height: 5px; width: 65px; background: linear-gradient(90deg, #23201b, #585b3b, #a07b48, #ebd39c); display: inline-block; margin: 0 4px; }
+details { margin-top: 12px; color: var(--muted); font-size: 11px; }
+summary { cursor: pointer; }
+details p { margin-bottom: 0; }
+a { color: var(--sage); }
+@media (max-width: 1100px) {
+  .layout { grid-template-columns: 232px minmax(0, 1fr); }
+  aside { padding: 13px 12px; }
+  main { padding: 12px; }
+  .metric { padding: 9px; }
+  .metric .value { font-size: 21px; }
+}
+@media (max-width: 960px) {
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .charts, .below { grid-template-columns: minmax(0, 1fr); }
+  .selection { flex-wrap: wrap; }
+}
+@media (max-width: 620px) {
+  header { min-height: 51px; padding: 8px 12px; }
+  .badge { font-size: 8px; padding: 3px 5px; letter-spacing: .5px; }
+  .layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 40fr) minmax(0, 60fr); }
+  aside { border-right: 0; border-bottom: 1px solid var(--line); }
+  .workspace-head { gap: 8px; }
+  h2 { font-size: 18px; }
+  .live-tag { font-size: 9px; }
+  .range-control { flex-basis: 100%; }
+  canvas { height: 170px; }
+  .wave canvas { height: 120px; }
+}
+</style>
+</head>
+<body>
+<header><div class="logo" aria-hidden="true">≋</div><div><h1>Audio lab</h1><p>tukevejtso / testing tools</p></div><span class="badge">LOCAL AUDIO ENGINE</span></header>
+<div class="layout">
+<aside aria-label="Recording controls" tabindex="0">
+ <div class="section"><p class="eyebrow">01 / Capture</p>
+ <label for="source">Audio source</label><select id="source"><option value="mic">Microphone / audio input</option><option value="system">System / browser tab audio</option></select>
+ <div id="deviceGroup"><label for="device">Input device</label><select id="device"><option value="">System default input</option></select><button class="small file" id="devices">Find input devices</button></div>
+ <p class="hint" id="sourceHint">Raw input requested: echo, auto gain and noise suppression off.</p>
+ <label for="limit">Recording limit</label><select id="limit"><option value="10">10 seconds</option><option value="30" selected>30 seconds</option><option value="60">60 seconds</option><option value="180">3 minutes</option></select>
+ <div class="row capture-buttons"><button class="primary" id="record">● Record</button><button class="stop" id="stop" disabled>■ Stop</button></div>
+ <div class="time"><span id="timer">00:00.0</span><small id="limitLabel">/ 00:30</small></div>
+ <div class="meter" role="meter" aria-label="Live input RMS level" aria-valuemin="-90" aria-valuemax="0" aria-valuenow="-90"><span id="meter"></span></div><div class="meter-label"><span>INPUT LEVEL</span><span id="liveLevel">— dBFS</span></div>
+ <div id="status" role="status" aria-live="polite">Ready. Choose an input and record a test.</div>
+ </div>
+ <div class="section"><p class="eyebrow">02 / Inspect</p>
+ <button class="file" id="import">↥ Import audio file</button><input type="file" id="fileInput" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a,.webm">
+ <p class="hint">WAV, MP3, FLAC and more · up to 3 min / 100 MB.</p>
+ <label for="channel">Analysis channel</label><select id="channel" disabled><option value="0">Channel 1</option></select>
+ <label for="fft">FFT resolution</label><select id="fft"><option value="1024">1,024 samples · fast</option><option value="4096" selected>4,096 samples · balanced</option><option value="16384">16,384 samples · detailed</option></select>
+ <button class="file small" id="demo">Load synthetic test signal</button><p class="hint">8 s of noise, 1 kHz tone and 60 Hz hum. Playback is manual.</p>
+ </div>
+ <p class="eyebrow">03 / Keep</p><audio id="playback" controls preload="metadata" aria-label="Play full recording"></audio>
+ <button id="wav" class="file" disabled>↓ Save recording · WAV</button><div class="row export"><button id="csv" disabled>Spectrum CSV</button><button id="json" disabled>Report JSON</button></div>
+ <p class="hint">Audio stays in this tab until you save it. Closing the tab discards unsaved recordings.</p>
+</aside>
+<main aria-label="Signal analysis" tabindex="0">
+ <div class="workspace-head"><div><h2>Signal analysis</h2><p class="subtitle" id="fileMeta">Record an input or import a file to begin.</p></div><span class="live-tag" id="state">Ready to capture</span></div>
+ <div class="metrics">
+ <div class="metric"><div class="label">Peak level</div><div class="value sage"><span id="peak">—</span><span class="unit">dBFS</span></div><div class="detail" id="headroom">Sample peak / digital full scale</div></div>
+ <div class="metric"><div class="label">Average level</div><div class="value"><span id="rms">—</span><span class="unit">dBFS</span></div><div class="detail">RMS over selected region</div></div>
+ <div class="metric"><div class="label">Dominant frequency</div><div class="value ochre"><span id="dominant">—</span><span class="unit">Hz</span></div><div class="detail" id="resolution">Hann-windowed FFT</div></div>
+ <div class="metric"><div class="label">Near-full-scale samples</div><div class="value"><span id="clipping">—</span><span class="unit">%</span></div><div class="detail">Samples at or above −0.1 dBFS</div></div>
+ </div>
+ <div class="charts">
+ <section class="panel wide wave"><div class="panel-head"><h3>Waveform</h3><span class="panel-note"><span class="swatch"></span>AMPLITUDE / TIME</span></div><div class="plot"><canvas id="wave" aria-label="Recorded waveform with highlighted analysis region" role="img"></canvas><div class="empty" id="empty"><strong>Your recording, in detail.</strong><span>Capture a signal to explore its shape and frequency content.</span></div></div>
+ <div class="selection"><div class="range-control"><label for="start">From</label><input id="start" type="range" min="0" max="8" step=".001" value="0" disabled><output id="startLabel" for="start">0.00 s</output></div><div class="range-control"><label for="end">To</label><input id="end" type="range" min="0" max="8" step=".001" value="8" disabled><output id="endLabel" for="end">—</output></div><button class="small" id="reset" disabled>Full range</button></div></section>
+ <section class="panel"><div class="panel-head"><h3>Frequency spectrum</h3><span class="panel-note" id="spectrumNote">LOG Hz / dBFS</span></div><div class="plot"><canvas id="spectrum" aria-label="Average and maximum frequency spectrum of the selection" role="img"></canvas></div></section>
+ <section class="panel"><div class="panel-head"><h3>Spectrogram</h3><span class="panel-note">−100 <span class="legend"></span> 0 dBFS</span></div><div class="plot"><canvas id="spectrogram" aria-label="Time-frequency heat map of the selection" role="img"></canvas></div></section>
+ </div>
+ <div class="below"><section class="panel"><div class="panel-head"><h3>Noise inspection</h3><button class="small" id="baseline" disabled>Use selection as noise</button></div><div class="inner"><p class="hint" id="noiseHelp">Select a quiet section, then set it as your noise baseline. Select the signal region to compare.</p><div class="noise-readout"><div><strong id="noise">—</strong><span>BASELINE · dBFS</span></div><div><strong id="snr">—</strong><span>ESTIMATED SNR · dB</span></div><div><strong id="quiet">—</strong><span>QUIET P10 · dBFS</span></div></div><p class="hint">P10 is the 10th percentile of 50 ms RMS windows, not an isolated noise floor. SNR assumes stationary, independent noise.</p><button class="small" id="clearBaseline" disabled>Clear baseline</button></div></section>
+ <section class="panel"><div class="panel-head"><h3>Energy distribution</h3><span class="panel-note">SELECTED REGION</span></div><div class="inner"><table class="bands" aria-label="Frequency band power share"><tbody id="bands"><tr><td>Sub / bass · 20–250 Hz</td><td>—</td></tr><tr><td>Midrange · 250–2,000 Hz</td><td>—</td></tr><tr><td>Presence · 2–6 kHz</td><td>—</td></tr><tr><td>Air · 6 kHz–Nyquist</td><td>—</td></tr></tbody></table><p class="hint" id="technical">Digital measurements, without microphone calibration. Levels are dBFS, not acoustic dB SPL.</p></div></section></div>
+ <details><summary>How to run a useful input test</summary><p>Record a few seconds of room silence, then speak or play your test source. Stop, select the quiet interval with the From/To sliders, and click “Use selection as noise”. Select the signal interval to inspect its spectrum and estimated SNR. Charts and report use that region and the selected channel; playback and WAV contain the entire recording. The dotted ochre spectrum is the maximum across sampled frames; sage is their power average. Long recordings are sampled at up to 240 evenly spaced FFT windows, so very brief transients may be missed in the spectrum. Peaks and RMS use every selected sample. Browser/device resampling or hardware processing may still occur; capture settings appear in the JSON report. Shared audio availability depends on the browser and chosen surface; enable “Share audio” in the picker. See <a href="https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia" target="_blank" rel="noreferrer">browser capture details</a>.</p></details>
+ <div class="foot"><span>ALL PROCESSING ON YOUR DEVICE · NO UPLOADS</span><span id="footerMeta">PCM capture / Hann FFT / local export</span></div>
+</main></div>
+<script id="dsp">
+'use strict';
+const DSP = (() => {
+ const db = value => value > 0 ? 20 * Math.log10(value) : -Infinity;
+ function stats(data, rate, start=0, end=data.length) {
+  let peak=0,sum=0,square=0,clipped=0; const windows=[]; const windowSize=Math.max(1,Math.round(rate*.05)); let windowEnergy=0,windowCount=0;
+  for(let i=start;i<end;i++){const v=data[i];peak=Math.max(peak,Math.abs(v));sum+=v;square+=v*v;if(Math.abs(v)>=Math.pow(10,-.1/20))clipped++;windowEnergy+=v*v;windowCount++;if(windowCount===windowSize){windows.push(Math.sqrt(windowEnergy/windowCount));windowEnergy=0;windowCount=0;}}
+  if(windowCount)windows.push(Math.sqrt(windowEnergy/windowCount));windows.sort((a,b)=>a-b);
+  const n=Math.max(1,end-start);return {peak,rms:Math.sqrt(square/n),dc:sum/n,clipped,clipPercent:clipped/n*100,quiet:windows[Math.floor((windows.length-1)*.1)]||0,samples:end-start};
+ }
+ function fftPower(data, offset, size, end=data.length) {
+  const re=new Float64Array(size),im=new Float64Array(size);let weight=0;
+  // Normalize by the actual Hann weights for short, zero-padded selections.
+  for(let i=0;i<size && offset+i<end;i++){const w=.5-.5*Math.cos(2*Math.PI*i/(size-1));re[i]=data[offset+i]*w;weight+=w;}
+  for(let i=1,j=0;i<size;i++){let bit=size>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;if(i<j){const v=re[i];re[i]=re[j];re[j]=v;}}
+  for(let len=2;len<=size;len<<=1){const angle=-2*Math.PI/len,cr=Math.cos(angle),ci=Math.sin(angle);for(let base=0;base<size;base+=len){let wr=1,wi=0;for(let j=0;j<len/2;j++){const a=base+j,b=a+len/2;const tr=wr*re[b]-wi*im[b],ti=wr*im[b]+wi*re[b];re[b]=re[a]-tr;im[b]=im[a]-ti;re[a]+=tr;im[a]+=ti;const next=wr*cr-wi*ci;wi=wr*ci+wi*cr;wr=next;}}}
+  const power=new Float64Array(size/2+1);weight=Math.max(weight,1e-20);for(let i=0;i<power.length;i++){const scale=(i===0||i===size/2?1:2)/weight;power[i]=(re[i]*re[i]+im[i]*im[i])*scale*scale;}return power;
+ }
+ function wav(channels,rate){const count=channels.length,frames=channels[0].length;const buffer=new ArrayBuffer(44+frames*count*2),v=new DataView(buffer);const str=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};str(0,'RIFF');v.setUint32(4,buffer.byteLength-8,true);str(8,'WAVE');str(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,count,true);v.setUint32(24,rate,true);v.setUint32(28,rate*count*2,true);v.setUint16(32,count*2,true);v.setUint16(34,16,true);str(36,'data');v.setUint32(40,frames*count*2,true);let o=44;for(let i=0;i<frames;i++)for(const c of channels){const s=Math.max(-1,Math.min(1,c[i]));v.setInt16(o,Math.round(s*(s<0?32768:32767)),true);o+=2;}return buffer;}
+ function demo(){const rate=48000,a=new Float32Array(rate*8);let seed=47;for(let i=0;i<a.length;i++){seed=(Math.imul(seed,1664525)+1013904223)>>>0;const t=i/rate,noise=(seed/4294967296*2-1)*.004;const envelope=t<1.5?0:Math.min(1,(t-1.5)*20)*Math.min(1,(8-t)*10);a[i]=noise+envelope*(.25*Math.sin(2*Math.PI*1000*t)+.025*Math.sin(2*Math.PI*60*t));}return {channels:[a],rate};}
+ return {db,stats,fftPower,wav,demo};
+})();
+</script>
+<script id="capture">
+// File URLs have opaque origins in Chromium. They must not fetch worklet modules.
+// ScriptProcessor is retained only for local-file/unsupported-worklet compatibility.
+const workletCode=`class Capture extends AudioWorkletProcessor {
+ constructor(options){super();this.limit=options.processorOptions.limit;this.total=0;this.used=0;this.parts=null;this.done=false;this.port.onmessage=e=>{if(e.data==='stop')this.finish();};}
+ flush(){if(this.used&&this.parts){const parts=this.parts.map(a=>a.slice(0,this.used));this.port.postMessage({type:'data',parts},parts.map(a=>a.buffer));this.used=0;}}
+ finish(){if(this.done)return;this.flush();this.done=true;this.port.postMessage({type:'done',total:this.total});}
+ process(inputs){if(this.done)return false;const input=inputs[0];if(!input||!input.length)return true;if(!this.parts)this.parts=Array.from({length:Math.min(2,input.length)},()=>new Float32Array(2048));for(let i=0;i<input[0].length;i++){for(let ch=0;ch<this.parts.length;ch++)this.parts[ch][this.used]=input[Math.min(ch,input.length-1)][i];this.used++;this.total++;if(this.used===2048)this.flush();if(this.total>=this.limit){this.finish();return false;}}return true;}
+} registerProcessor('pcm-capture',Capture);`;
+async function createPCMCapture(context, options) {
+ const {limit, channels, onData, onDone, onError}=options;
+ const protocol=options.protocol ?? location.protocol;
+ let fallbackReason=protocol==='file:'?'local-file origin':'worklet unavailable';
+ if(protocol!=='file:' && context.audioWorklet && typeof AudioWorkletNode!=='undefined') {
+  let url;
+  try {
+   url=URL.createObjectURL(new Blob([workletCode],{type:'text/javascript'}));
+   await context.audioWorklet.addModule(url);
+   const node=new AudioWorkletNode(context,'pcm-capture',{processorOptions:{limit},channelCount:channels,channelCountMode:'explicit',channelInterpretation:'discrete'});
+   let done=false;
+   node.port.onmessage=event=>{if(done)return;const message=event.data;if(message.type==='data')onData(message.parts);else if(message.type==='done'){done=true;onDone();}};
+   node.onprocessorerror=()=>{if(!done){done=true;onError(Error('The audio worklet stopped unexpectedly.'));}};
+   return {node,backend:'audio-worklet',stop(){if(!done)node.port.postMessage('stop');},dispose(){done=true;node.onprocessorerror=null;node.port.onmessage=null;node.port.close();node.disconnect();}};
+  } catch(error) { fallbackReason=error.message||String(error); }
+  finally { if(url)URL.revokeObjectURL(url); }
+ }
+ if(typeof context.createScriptProcessor!=='function')throw Error('This browser cannot capture PCM from a local file. Use Edge or Chrome, or import an existing recording.');
+ const node=context.createScriptProcessor(4096,channels,1);
+ node.channelInterpretation='discrete';
+ let total=0,done=false;
+ const finish=()=>{if(done)return;done=true;node.onaudioprocess=null;onDone();};
+ node.onaudioprocess=event=>{
+  // Never route microphone samples to speakers, even before the downstream mute.
+  for(let ch=0;ch<event.outputBuffer.numberOfChannels;ch++)event.outputBuffer.getChannelData(ch).fill(0);
+  if(done)return;
+  try {
+   const input=event.inputBuffer,count=Math.min(input.length,limit-total);
+   if(count>0){
+    // Copy now: the browser reuses inputBuffer after this callback returns.
+    const parts=Array.from({length:channels},(_,ch)=>ch<input.numberOfChannels?input.getChannelData(ch).slice(0,count):new Float32Array(count));
+    total+=count;onData(parts);
+   }
+   if(total>=limit)finish();
+  } catch(error) {done=true;node.onaudioprocess=null;onError(error);}
+ };
+ return {node,backend:'inline-pcm',fallbackReason,bufferSize:4096,stop:finish,dispose(){done=true;node.onaudioprocess=null;node.disconnect();}};
+}
+</script>
+<script id="app">
+const $=id=>document.getElementById(id),yieldUI=()=>new Promise(r=>setTimeout(r,0));
+const app={channels:null,rate:48000,name:'',meta:{},data:null,result:null,baseline:null,busy:false,recording:false,session:null,analysisId:0,url:null};
+const formatDB=v=>v===-Infinity?'−∞':Number.isFinite(v)?v.toFixed(1):'—';
+const time=v=>`${String(Math.floor(v/60)).padStart(2,'0')}:${(v%60).toFixed(1).padStart(4,'0')}`;
+function status(message,error=false){$('status').textContent=message;$('status').classList.toggle('error',error);}
+function controls(){const locked=app.busy||app.recording;for(const id of ['source','device','devices','limit','import','demo','fft'])$(id).disabled=locked;$('record').disabled=locked;$('stop').disabled=!app.recording;for(const id of ['channel','start','end','reset','baseline','wav','csv','json'])$(id).disabled=locked||!app.channels;$('clearBaseline').disabled=locked||!app.baseline;$('state').textContent=app.recording?'Recording input':app.busy?'Processing':app.channels?'Recording loaded':'Ready to capture';$('state').classList.toggle('recording',app.recording);}
+function selection(){return {start:Math.max(0,Math.round(Number($('start').value)*app.rate)),end:Math.min(app.data.length,Math.round(Number($('end').value)*app.rate))};}
+function updateSelectionLabels(){$('startLabel').textContent=Number($('start').value).toFixed(2)+' s';$('endLabel').textContent=Number($('end').value).toFixed(2)+' s';}
+function selectedChannel(){app.data=app.channels[Number($('channel').value)];app.baseline=null;$('noiseHelp').textContent='Select a quiet section, then set it as your noise baseline. Select the signal region to compare.';}
+async function loadAudio(channels,rate,name,meta={}){
+ if(!channels.length||!channels[0].length)throw Error('The audio contains no samples.');
+ $('playback').pause();app.channels=channels;app.rate=rate;app.name=name;app.meta=meta;app.result=null;app.baseline=null;
+ $('channel').replaceChildren(...channels.map((c,i)=>new Option(channels.length===1?'Channel 1 · mono':`Channel ${i+1}`,String(i))));selectedChannel();
+ const duration=channels[0].length/rate;for(const id of ['start','end'])$(id).max=duration;$('start').value=0;$('end').value=duration;updateSelectionLabels();$('empty').hidden=true;$('empty').style.display='none';
+ $('fileMeta').textContent=`${name} · ${duration.toFixed(2)} s · ${(rate/1000).toFixed(1)} kHz · ${channels.length} channel${channels.length===1?'':'s'}`;
+ if(app.url)URL.revokeObjectURL(app.url);app.url=URL.createObjectURL(new Blob([DSP.wav(channels,rate)],{type:'audio/wav'}));$('playback').src=app.url;$('playback').volume=.5;
+ $('timer').textContent=time(duration);await analyse();
+}
+async function analyse(){
+ if(!app.data)return;const id=++app.analysisId;app.busy=true;controls();await yieldUI();
+ try{
+ const {start,end}=selection(),n=Number($('fft').value),count=Math.max(1,Math.min(240,1+Math.ceil(Math.max(0,end-start-n)/(n/2)))),avg=new Float64Array(n/2+1),max=new Float64Array(n/2+1),frames=[];
+ const measured=DSP.stats(app.data,app.rate,start,end);
+ for(let f=0;f<count;f++){const offset=start+Math.round(f/Math.max(1,count-1)*Math.max(0,end-start-n));const p=DSP.fftPower(app.data,offset,n,end);frames.push(p);for(let k=0;k<p.length;k++){avg[k]+=p[k]/count;max[k]=Math.max(max[k],p[k]);}if(f%16===0){await yieldUI();if(id!==app.analysisId)return;}}
+ let peakBin=0;for(let k=Math.max(1,Math.ceil(20*n/app.rate));k<avg.length;k++)if(avg[k]>avg[peakBin]||peakBin===0)peakBin=k;
+ const bandLimits=[[20,250],[250,2000],[2000,6000],[6000,app.rate/2+1]],bands=bandLimits.map(()=>0);let total=0;
+ for(let k=Math.max(1,Math.ceil(20*n/app.rate));k<avg.length;k++){total+=avg[k];const hz=k*app.rate/n;bandLimits.forEach(([lo,hi],b)=>{if(hz>=lo&&hz<hi)bands[b]+=avg[k];});}
+ app.result={...measured,start,end,n,avg,max,frames,bands:bands.map(v=>total?v/total*100:0),dominant:measured.rms>1e-10?peakBin*app.rate/n:null};renderResults();drawAll();
+ }finally{if(id===app.analysisId){app.busy=false;controls();}}
+}
+function renderResults(){const r=app.result;$('peak').textContent=formatDB(DSP.db(r.peak));$('rms').textContent=formatDB(DSP.db(r.rms));$('dominant').textContent=r.dominant===null?'—':r.dominant.toFixed(0);$('clipping').textContent=r.clipPercent.toFixed(3);$('headroom').textContent=r.peak>0?`${(-DSP.db(r.peak)).toFixed(1)} dB sample headroom`:'Digital silence';$('resolution').textContent=`${(app.rate/r.n).toFixed(2)} Hz / bin · ${r.frames.length} windows`;$('quiet').textContent=formatDB(DSP.db(r.quiet));$('technical').textContent=`DC offset ${r.dc.toFixed(5)} · ${r.samples.toLocaleString()} samples · ${((r.end-r.start)/app.rate).toFixed(2)} s selected. Uncalibrated dBFS.`;[...$('bands').rows].forEach((row,i)=>row.cells[1].textContent=r.bands[i].toFixed(1)+'%');$('noise').textContent=app.baseline?formatDB(DSP.db(app.baseline.rms)):'—';let snr=null;if(app.baseline&&app.baseline.rms>0&&r.rms>app.baseline.rms)snr=10*Math.log10((r.rms*r.rms-app.baseline.rms**2)/app.baseline.rms**2);$('snr').textContent=snr===null?'—':snr.toFixed(1);$('footerMeta').textContent=`${app.meta.synthetic?'SYNTHETIC REFERENCE':'LOCAL RECORDING'} · ${app.channels.length} CH · ${app.rate.toLocaleString()} Hz`;}
+function plot(id){const canvas=$(id),dpr=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);c.font='10px Consolas, monospace';return {c,w,h,left:45,right:w-15,top:16,bottom:h-28};}
+function axes(p,ys,xs){const {c,left,right,top,bottom}=p;c.lineWidth=1;c.strokeStyle='#494638';c.fillStyle='#b5af9c';for(const [f,label]of ys){const y=bottom-f*(bottom-top);c.beginPath();c.moveTo(left,y);c.lineTo(right,y);c.stroke();c.textAlign='right';c.fillText(label,left-8,y+3);}for(const [f,label]of xs){const x=left+f*(right-left);c.beginPath();c.moveTo(x,top);c.lineTo(x,bottom);c.stroke();c.textAlign='center';c.fillText(label,x,bottom+18);}}
+function drawWave(){const p=plot('wave'),{c,left,right,top,bottom}=p,duration=app.data?app.data.length/app.rate:8;axes(p,[[0,'−1'],[.5,'0'],[1,'+1']],Array.from({length:5},(_,i)=>[i/4,(duration*i/4).toFixed(1)+'s']));if(!app.data)return;const len=app.data.length,width=right-left,mid=(top+bottom)/2,scale=(bottom-top)/2;const a=Number($('start').value)/duration,b=Number($('end').value)/duration;c.fillStyle='#b2bc8b16';c.fillRect(left+a*width,top,(b-a)*width,bottom-top);c.strokeStyle='#b2bc8b';c.beginPath();for(let x=0;x<width;x++){const begin=Math.floor(x/width*len),end=Math.min(len,Math.max(begin+1,Math.floor((x+1)/width*len)));let lo=1,hi=-1;for(let i=begin;i<end;i++){lo=Math.min(lo,app.data[i]);hi=Math.max(hi,app.data[i]);}c.moveTo(left+x,mid-Math.max(-1,Math.min(1,hi))*scale);c.lineTo(left+x,mid-Math.max(-1,Math.min(1,lo))*scale);}c.stroke();c.strokeStyle='#d7ae72';for(const f of [a,b]){c.beginPath();c.moveTo(left+f*width,top);c.lineTo(left+f*width,bottom);c.stroke();}}
+function drawSpectrum(){const p=plot('spectrum'),{c,left,right,top,bottom}=p,nyquist=app.rate/2,logMax=Math.log10(nyquist/20),x=hz=>left+Math.log10(hz/20)/logMax*(right-left);axes(p,[[0,'−100'],[.25,'−75'],[.5,'−50'],[.75,'−25'],[1,'0']],[[20,'20'],[100,'100'],[1000,'1k'],[10000,'10k']].filter(t=>t[0]<=nyquist).map(([hz,l])=>[Math.log10(hz/20)/logMax,l]));if(!app.result)return;const r=app.result;for(const [series,color,dash]of [[r.max,'#d7ae72',[3,3]],[r.avg,'#b2bc8b',[]]]){c.strokeStyle=color;c.setLineDash(dash);c.beginPath();let started=false;for(let k=1;k<series.length;k++){const hz=k*app.rate/r.n;if(hz<20)continue;const y=bottom-Math.max(0,Math.min(1,(10*Math.log10(Math.max(1e-20,series[k]))+100)/100))*(bottom-top);if(!started)c.moveTo(x(hz),y);else c.lineTo(x(hz),y);started=true;}c.stroke();}c.setLineDash([]);}
+function heat(t){const stops=[[35,32,27],[88,91,59],[160,123,72],[235,211,156]];t=Math.max(0,Math.min(.9999,t))*3;const a=Math.floor(t),f=t-a;return stops[a].map((v,i)=>Math.round(v+(stops[a+1][i]-v)*f));}
+function drawSpectrogram(){const p=plot('spectrogram'),{c,left,right,top,bottom}=p,r=app.result,nyquist=app.rate/2;if(r){const cols=r.frames.length,rows=128,off=document.createElement('canvas');off.width=cols;off.height=rows;const ctx=off.getContext('2d'),pixels=ctx.createImageData(cols,rows);for(let y=0;y<rows;y++){const hz=20*Math.pow(nyquist/20,1-y/(rows-1)),bin=Math.min(r.n/2,Math.max(1,Math.round(hz*r.n/app.rate)));for(let x=0;x<cols;x++){const value=10*Math.log10(Math.max(1e-20,r.frames[x][bin])),rgb=heat((value+100)/100),i=(y*cols+x)*4;pixels.data[i]=rgb[0];pixels.data[i+1]=rgb[1];pixels.data[i+2]=rgb[2];pixels.data[i+3]=255;}}ctx.putImageData(pixels,0,0);c.imageSmoothingEnabled=false;c.drawImage(off,left,top,right-left,bottom-top);}axes(p,[[20,'20'],[100,'100'],[1000,'1k'],[10000,'10k']].filter(t=>t[0]<=nyquist).map(([hz,l])=>[Math.log10(hz/20)/Math.log10(nyquist/20),l]),[0,.25,.5,.75,1].map(f=>[f,r?((r.start+f*(r.end-r.start))/app.rate).toFixed(1)+'s':(f*8).toFixed(0)+'s']));}
+function drawAll(){if(app.recording)return;drawWave();drawSpectrum();drawSpectrogram();}
+async function listDevices(request=false){let stream;try{if(!navigator.mediaDevices)throw Error('Audio capture requires a supported browser. Open this file in Edge or Chrome.');if(request){app.busy=true;controls();status('Allow microphone access to list device names.');stream=await navigator.mediaDevices.getUserMedia({audio:true});}const selected=$('device').value,devices=await navigator.mediaDevices.enumerateDevices();$('device').replaceChildren(new Option('System default input',''),...devices.filter(d=>d.kind==='audioinput'&&d.deviceId!=='default').map((d,i)=>new Option(d.label||`Audio input ${i+1}`,d.deviceId)));if([...$('device').options].some(o=>o.value===selected))$('device').value=selected;if(request)status('Inputs refreshed. Select a device, then record.');}catch(e){if(request)status(friendlyError(e),true);}finally{stream?.getTracks().forEach(t=>t.stop());if(request){app.busy=false;controls();}}}
+function friendlyError(e){const names={NotAllowedError:'Permission was denied or the picker was cancelled. Allow microphone access in the browser, then try again.',NotFoundError:'No audio input was found. Connect a device and refresh the input list.',NotReadableError:'The audio device is unavailable or in use. Check its connection and try again.',OverconstrainedError:'That input is no longer available. Refresh the input list.'};return names[e.name]||e.message||String(e);}
+async function startRecording(){
+ if(app.busy||app.recording)return;app.busy=true;controls();$('playback').pause();status('Waiting for audio permission…');let stream,context,capture,session;
+ try{
+ if(!navigator.mediaDevices)throw Error('Open this local file in Edge or Chrome to record audio.');
+ const system=$('source').value==='system';
+ stream=system?await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:'include'}):await navigator.mediaDevices.getUserMedia({audio:{deviceId:$('device').value?{exact:$('device').value}:undefined,channelCount:{ideal:2},echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+ if(!stream.getAudioTracks().length)throw Error('No audio was shared. Try again and enable “Share audio” in the picker.');
+ context=new AudioContext();await context.resume();
+ const source=context.createMediaStreamSource(stream),analyser=context.createAnalyser();analyser.fftSize=2048;
+ const settings=stream.getAudioTracks()[0].getSettings(),channels=Math.max(1,Math.min(2,settings.channelCount||2));
+ session={stream,context,source,analyser,parts:[],frames:0,ending:false,meta:{source:system?'shared audio':'microphone',settings,recordedAt:new Date().toISOString()},name:stream.getAudioTracks()[0].label||'Input recording'};
+ capture=await createPCMCapture(context,{limit:Math.round(Number($('limit').value)*context.sampleRate),channels,
+  onData(parts){if(session.ending)return;session.parts.push(parts);session.frames+=parts[0].length;$('timer').textContent=time(session.frames/context.sampleRate);},
+  onDone(){finishRecording(session);},
+  onError(error){session.captureError=error.message||String(error);finishRecording(session);}
+ });
+ session.capture=capture;session.meta.captureBackend=capture.backend;session.meta.captureBufferFrames=capture.bufferSize||2048;
+ if(capture.fallbackReason)session.meta.captureFallbackReason=capture.fallbackReason;
+ const mute=context.createGain();mute.gain.value=0;session.mute=mute;
+ source.connect(analyser);analyser.connect(capture.node);capture.node.connect(mute);mute.connect(context.destination);
+ app.session=session;app.recording=true;app.busy=false;controls();$('timer').textContent=time(0);
+ status(capture.backend==='inline-pcm'?'Recording locally. Keep this tab visible for reliable capture. Speaker monitoring is muted.':'Recording. Input monitoring is silent to avoid feedback.');
+ stream.getTracks().forEach(t=>t.addEventListener('ended',()=>stopRecording(),{once:true}));
+ const levels=new Float32Array(analyser.fftSize);session.tick=setInterval(()=>{analyser.getFloatTimeDomainData(levels);const rms=DSP.stats(levels,context.sampleRate).rms,db=DSP.db(rms);$('liveLevel').textContent=formatDB(db)+' dBFS';$('meter').style.width=Math.max(0,Math.min(100,(db+90)/90*100))+'%';document.querySelector('[role=meter]').setAttribute('aria-valuenow',String(Math.max(-90,Math.min(0,db))));},100);
+ session.watchdog=setTimeout(()=>{session.captureError='Capture timed out; received samples were preserved.';finishRecording(session);},(Number($('limit').value)+5)*1000);
+ }catch(e){if(session){session.ending=true;clearInterval(session.tick);clearTimeout(session.watchdog);}capture?.dispose();stream?.getTracks().forEach(t=>t.stop());if(context&&context.state!=='closed')await context.close();app.recording=false;app.busy=false;app.session=null;controls();status(friendlyError(e),true);}
+}
+function stopRecording(){const s=app.session;if(!s||s.ending||s.stopping)return;s.stopping=true;$('stop').disabled=true;s.stopTimeout=setTimeout(()=>finishRecording(s),1500);s.capture.stop();}
+async function finishRecording(s){
+ if(s.ending)return;s.ending=true;clearInterval(s.tick);clearTimeout(s.watchdog);clearTimeout(s.stopTimeout);
+ app.recording=false;app.busy=true;$('meter').style.width='0';$('liveLevel').textContent='— dBFS';document.querySelector('[role=meter]').setAttribute('aria-valuenow','-90');controls();
+ try{
+  s.stream.getTracks().forEach(t=>t.stop());s.capture.dispose();s.source.disconnect();s.analyser.disconnect();s.mute.disconnect();
+  if(s.context.state!=='closed')await s.context.close();app.session=null;
+  if(!s.frames)throw Error('No audio samples were captured. Check the input and try again.');
+  const channels=Array.from({length:s.parts[0].length},()=>new Float32Array(s.frames));let offset=0;
+  for(const part of s.parts){channels.forEach((c,i)=>c.set(part[i],offset));offset+=part[0].length;}
+  if(s.captureError)s.meta.captureWarning=s.captureError;
+  await loadAudio(channels,s.context.sampleRate,s.name,s.meta);
+  status(s.captureError?`Recording saved with a warning: ${s.captureError}`:'Recording complete. Select a region to inspect or save the full recording.',!!s.captureError);
+ }catch(e){status(friendlyError(e),true);}finally{app.session=null;app.busy=false;controls();}
+}
+async function importFile(file){if(!file||app.busy||app.recording)return;app.busy=true;controls();status('Decoding audio locally…');try{if(file.size>100*1024*1024)throw Error('Choose an audio file smaller than 100 MB.');const offline=new OfflineAudioContext(1,1,48000),buffer=await offline.decodeAudioData(await file.arrayBuffer());if(buffer.duration>180)throw Error('Choose a recording of 3 minutes or less.');if(buffer.numberOfChannels>8)throw Error('Choose a file with no more than 8 channels.');const channels=Array.from({length:buffer.numberOfChannels},(_,i)=>buffer.getChannelData(i).slice());await loadAudio(channels,buffer.sampleRate,file.name,{source:'import',analysisResampledTo:buffer.sampleRate});status('File loaded. Decoded at 48 kHz for analysis; exports use that rate.');}catch(e){status(e.name==='EncodingError'?'This audio format could not be decoded. Try WAV, MP3 or FLAC.':friendlyError(e),true);}finally{app.busy=false;controls();$('fileInput').value='';}}
+function download(blob,suffix){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='audio-lab-'+new Date().toISOString().replace(/[:.]/g,'-')+suffix;a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);}
+function report(){const r=app.result;return {version:1,name:app.name,source:app.meta,sampleRate:app.rate,channels:app.channels.length,channel:Number($('channel').value)+1,durationSeconds:app.channels[0].length/app.rate,selectionSeconds:{start:r.start/app.rate,end:r.end/app.rate},peakDBFS:DSP.db(r.peak),rmsDBFS:DSP.db(r.rms),dcOffset:r.dc,nearFullScaleSamples:r.clipped,nearFullScalePercent:r.clipPercent,dominantHz:r.dominant,quietP10DBFS:DSP.db(r.quiet),noiseBaseline:app.baseline,estimatedSNRdB:app.baseline&&app.baseline.rms>0&&r.rms>app.baseline.rms?10*Math.log10((r.rms**2-app.baseline.rms**2)/app.baseline.rms**2):null,fft:{size:r.n,window:'Hann',windows:r.frames.length,sampling:'up to 240 evenly spaced windows',binWidthHz:app.rate/r.n},bandPowerPercent:r.bands,notes:'Uncalibrated dBFS, not dB SPL. JSON null represents unavailable or negative-infinity levels. SNR assumes stationary independent noise. WAV is full-length 16-bit PCM.'};}
+$('record').onclick=startRecording;$('stop').onclick=stopRecording;$('devices').onclick=()=>listDevices(true);$('source').onchange=()=>{const system=$('source').value==='system';$('deviceGroup').hidden=system;$('sourceHint').textContent=system?'Choose a tab or screen and enable “Share audio”. Only audio is recorded; availability depends on the browser.':'Raw input requested: echo, auto gain and noise suppression off.';};$('limit').onchange=()=>{$('limitLabel').textContent='/ '+time(Number($('limit').value)).slice(0,-2);};
+$('import').onclick=()=>$('fileInput').click();$('fileInput').onchange=e=>importFile(e.target.files[0]);$('demo').onclick=async()=>{if(app.busy||app.recording)return;app.busy=true;controls();try{const d=DSP.demo();await loadAudio(d.channels,d.rate,'Synthetic reference · noise + 1 kHz + 60 Hz',{source:'synthetic',synthetic:true});status('Synthetic reference loaded. The first 1.5 seconds contain only noise.');}catch(e){status(friendlyError(e),true);}finally{app.busy=false;controls();}};
+$('channel').onchange=async()=>{selectedChannel();await analyse();};$('fft').onchange=analyse;
+for(const id of ['start','end']){$(id).oninput=()=>{const duration=app.data.length/app.rate,min=Math.min(.02,duration);if(id==='start')$('start').value=Math.max(0,Math.min(Number($('start').value),Number($('end').value)-min));else $('end').value=Math.min(duration,Math.max(Number($('end').value),Number($('start').value)+min));updateSelectionLabels();drawWave();for(const key of ['baseline','csv','json'])$(key).disabled=true;};$(id).onchange=analyse;}
+$('reset').onclick=()=>{$('start').value=0;$('end').value=app.data.length/app.rate;updateSelectionLabels();analyse();};$('baseline').onclick=()=>{const r=app.result;app.baseline={rms:r.rms,dbfs:DSP.db(r.rms),startSeconds:r.start/app.rate,endSeconds:r.end/app.rate,channel:Number($('channel').value)+1};$('noiseHelp').textContent=`Noise baseline: ${(r.start/app.rate).toFixed(2)}–${(r.end/app.rate).toFixed(2)} s. Now select a signal region to compare.`;renderResults();controls();};$('clearBaseline').onclick=()=>{app.baseline=null;$('noiseHelp').textContent='Select a quiet section, then set it as your noise baseline. Select the signal region to compare.';renderResults();controls();};$('wav').onclick=()=>download(new Blob([DSP.wav(app.channels,app.rate)],{type:'audio/wav'}),'.wav');$('json').onclick=()=>download(new Blob([JSON.stringify(report(),null,2)],{type:'application/json'}),'.json');$('csv').onclick=()=>{const r=app.result,lines=['frequency_hz,average_dbfs,maximum_dbfs'];for(let k=0;k<r.avg.length;k++)lines.push([k*app.rate/r.n,10*Math.log10(r.avg[k]),10*Math.log10(r.max[k])].join(','));download(new Blob([lines.join('\r\n')],{type:'text/csv'}),'-spectrum.csv');};
+window.addEventListener('beforeunload',e=>{if(app.recording){e.preventDefault();e.returnValue='';}});window.addEventListener('pagehide',()=>{app.session?.stream.getTracks().forEach(t=>t.stop());if(app.url)URL.revokeObjectURL(app.url);});new ResizeObserver(drawAll).observe(document.querySelector('main'));controls();drawAll();listDevices();
+</script>
+</body>
+</html>

@@ -21,6 +21,7 @@ if "%TOOLKIT_CHOICE%"=="27" goto tukevejtso_linux
 if "%TOOLKIT_CHOICE%"=="28" goto cutout_backgrounds
 if "%TOOLKIT_CHOICE%"=="29" goto pdf_join
 if "%TOOLKIT_CHOICE%"=="30" goto pdf_compress
+if "%TOOLKIT_CHOICE%"=="31" goto enchanted_reader
 
 goto done
 
@@ -28,6 +29,9 @@ goto done
 set "TOOLKIT_FROM_MENU="
 if /I "%~1"=="alarm" goto computer_alarm
 if /I "%~1"=="computer-alarm" goto computer_alarm
+if /I "%~1"=="audio-test" goto audio_test
+if /I "%~1"=="audio" goto audio_test
+if /I "%~1"=="audio-lab" goto audio_test
 if /I "%~1"=="password" goto password_manager
 if /I "%~1"=="robotics-learning" goto robotics_learning_dev
 if /I "%~1"=="linux" goto tukevejtso_linux
@@ -50,6 +54,8 @@ if /I "%~1"=="transcription" goto enchanted_transcription
 if /I "%~1"=="typing" goto enhanced_typing
 if /I "%~1"=="enhanced-typing" goto enhanced_typing
 if /I "%~1"=="enchanted-typing" goto enhanced_typing
+if /I "%~1"=="enchanted-reader" goto enchanted_reader
+if /I "%~1"=="reader" goto enchanted_reader
 if /I "%~1"=="reboot" goto reboot_guard
 if /I "%~1"=="auto-reboot" goto reboot_guard
 if /I "%~1"=="reboots" goto reboot_guard
@@ -66,6 +72,11 @@ if /I "%~1"=="-h" goto help
 echo Unknown toolkit command: %~1
 echo.
 goto help
+
+:audio_test
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\audio-test.ps1"
+set "AUDIO_TEST_EXIT=%ERRORLEVEL%"
+endlocal & exit /b %AUDIO_TEST_EXIT%
 
 :computer_alarm
 shift /1
@@ -98,6 +109,7 @@ echo tukevejtso for Windows
 echo.
 echo Usage:
 echo   tk                         Open the interactive menu
+echo   tk audio-test              Open the local audio recording and analysis lab
 echo   tk alarm                   Open the computer alarm dashboard
 echo   tk alarm arm               Confirm and enable the siren and spoken warning
 echo   tk alarm status            Show current power/lock flags and alarm report
@@ -117,6 +129,7 @@ echo   tk openai-key -Status      Show whether the OpenAI API key is stored
 echo   tk transcription           Start the local Whisper transcription agent
 echo   tk enchanted-transcription Start the Enchanted transcription agent
 echo   tk enhanced-typing         Dictate, refine, and copy text with OpenAI
+echo   tk enchanted-reader       Send a screenshot and an instruction file to OpenAI
 echo   tk demo                    Show terminal interface primitives
 echo   tk reboot                  Open the reboot guard toggle
 echo   tk reboot status           Show Windows Update auto-reboot guard state
@@ -291,6 +304,12 @@ shift /1
 goto typing_args
 :typing_run
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%agents\enhanced-typing\run.ps1" %TYPING_ARGS%
+goto done
+
+:enchanted_reader
+if /I "%~1"=="reader" shift /1
+if /I "%~1"=="enchanted-reader" shift /1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ROOT%agents\enchanted-reader\run.ps1"
 goto done
 
 :done

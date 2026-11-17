@@ -27,6 +27,8 @@ tk compress-pdf "C:\Work\documents\report.pdf" -Preset Balanced
 tk transcription
 tk enchanted-transcription
 tk enhanced-typing
+tk enchanted-reader
+tk reader
 tk openai-key
 tk robotics-learning
 tk terminal-transparency
@@ -66,6 +68,8 @@ tk storage stop
 `tk transcription` starts Enchanted Transcription: local Whisper capture for microphone and system output with an optional OpenAI-powered Agent Insights pane. F9 provides transcription, agent, reference-context, transparency, and API-safety settings. Language/model and reference-context selection are session-only, starting at English `medium.en` and no context; the other settings remain persistent. Local capture and context buffering continue when API requests are paused. See the [Enchanted Transcription guide](agents/enchanted-transcription/README.md) for controls, defaults, privacy behavior, and private `.md`, `.txt`, `.json`, or `.csv` reference documents.
 
 `tk enhanced-typing` starts the separate enhanced typing agent in `agents\enhanced-typing`. Whisper captures from microphone or system output, the OpenAI agent refines completed phrases when intelligence is available, and the tool appends them into an on-screen draft. It uses English by default with `ggml-medium.en.bin`; pass `-Language auto` or another language code to use `ggml-medium.bin`. Press F1 to show the terminal when it is hidden, or flush the draft when the terminal is focused; Ctrl+Alt+F1 is also registered as a backup show shortcut when Windows allows it. Flush mode can copy to clipboard, type into the last target app, or discard the draft. Press F9 for settings; settings pauses listening and lets you change input source, intelligence, flush mode, transparency, and refiner model.
+
+`tk enchanted-reader` starts Enchanted Reader in `agents\enchanted-reader`. It asks for an instruction file, a screen portion, and a shortcut, then sends that screenshot and the instruction to OpenAI when the shortcut is pressed. `tk reader` is the same command. It does not capture audio or download a Whisper model. See the [Enchanted Reader guide](agents/enchanted-reader/README.md).
 
 `tk openai-key` stores or updates an OpenAI API key encrypted with Windows DPAPI for tools that need OpenAI access. `tk openai-key -Status` shows whether a key is configured without printing it.
 
@@ -215,14 +219,67 @@ py -m unittest discover -s windows/tools/tests -p test_pdf_join.py
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/tools/tests/test_join_pdfs.ps1
 ```
 
+## Audio testing lab
+
+Run `tk audio-test` (aliases: `tk audio`, `tk audio-lab`) or choose **Audio testing lab**
+under **Files & media**. The launcher opens `tools/audio-test.html` in your default
+browser. Use Edge or Chrome for microphone and shared-audio capture.
+
+The compact earth-tone interface keeps the recording controls and signal workspace
+in independently scrolling panes, with the app header fixed above them. Focus either
+pane to scroll it with the keyboard. Narrow screens stack the two scrollable panes.
+
+The engine is a standalone HTML file with inline JavaScript and CSS. It requires
+no Rust, Node, Python, server, package installation, CDN, or network connection.
+The PowerShell launcher only opens the file. Everything is processed in the tab.
+
+Local `file:` pages use inline PCM capture without loading a worklet module, avoiding
+Chromium's opaque-origin `blob:null` module failure. On served pages, a worklet is
+preferred and module-load failures automatically fall back to inline PCM. The inline
+compatibility path uses the browser's deprecated but still-supported ScriptProcessor
+API with 4,096-frame buffers. Keep the tab visible and avoid heavy UI work while
+recording; main-thread stalls can cause capture gaps. Manual Stop preserves completed
+buffers, so up to one buffer of the latest input may be omitted. JSON includes the
+capture backend, buffer size and any capture warning. No additional packages are needed.
+
+Choose an input device and record up to 3 minutes of PCM audio, or import an audio
+file (maximum 100 MB / 3 minutes / 8 channels). System/tab capture uses the browser's
+sharing picker; enable **Share audio**. Availability depends on browser and surface.
+No screen images are recorded or saved. Microphone capture requests echo cancellation,
+automatic gain and noise suppression off; actual track settings are in the JSON report.
+There is no live speaker monitoring. Playback is explicit and starts at 50% volume.
+
+Charts show the waveform, averaged and maximum Hann-windowed FFT, spectrogram, and
+frequency-band power. Use the From/To sliders to analyze a region and select individual
+channels without cancellation from a mono mix. Select room silence and choose
+**Use selection as noise**, then select the active signal for an estimated SNR.
+The quiet P10 statistic is a percentile of 50 ms RMS windows, not a measured noise floor.
+SNR assumes stationary, independent noise; levels are uncalibrated dBFS, not acoustic SPL.
+The clipping indicator counts samples at or above -0.1 dBFS; it is not true-peak detection.
+FFT analysis samples up to 240 evenly spaced windows, which can miss brief transients;
+RMS, DC, sample peaks, and the clipping count use every selected sample.
+
+WAV and playback contain the full recording, while CSV and JSON describe the selected
+region/channel. WAV is 16-bit PCM. Imports are decoded/resampled to 48 kHz. New captures
+replace the current recording only after successful capture. Save recordings before
+closing the tab. **Load synthetic test signal** provides a clearly labeled reference
+with 1.5 seconds of quiet noise followed by 1 kHz tone and 60 Hz hum; it never auto-plays.
+
+Browser-only numerical checks are included under `tools/tests`. Prepare a local
+check page with `powershell.exe -NoProfile -File windows/tools/tests/prepare-audio-test-checks.ps1`,
+then open the returned HTML path in Edge. This checks silence, sine-wave RMS and FFT
+calibration, clipping, DC, selection boundaries, stereo WAV encoding and the reference
+signal against known numerical expectations. It installs nothing and accesses no devices.
+
 ## Layout
 
 - `tk.cmd` is the stable command name.
 - `toolkit.cmd` routes direct commands and opens the interactive menu.
 - `agents\enchanted-transcription` contains the transcription agent.
 - `agents\enhanced-typing` contains the enhanced typing agent.
-- `agents\speech-agent-core` contains their shared Rust capture, Whisper, API, and terminal runtime.
-- `models\whisper` contains the shared local Whisper model cache used by both agents.
+- `agents\enchanted-reader` contains the screenshot reader.
+- `agents\speech-agent-core` contains the shared Rust capture, Whisper, API, and terminal runtime for transcription and typing.
+- `models\whisper` contains the shared local Whisper model cache used by transcription and typing.
 - `tools/*.ps1` contains the real utilities.
 - `tools/ui.ps1` contains shared terminal rendering helpers.
 - `tools/pdf-runtime.ps1` shares Python discovery and JSON transport between the PDF tools.
